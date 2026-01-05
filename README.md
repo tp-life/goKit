@@ -1,4 +1,4 @@
-# Nexus - High Performance Go DDD Scaffolding
+# GoKit - High Performance Go DDD Scaffolding
 
 ![Go Version](https://img.shields.io/badge/go-1.21+-00ADD8.svg)
 ![Fiber](https://img.shields.io/badge/fiber-v2.52-green)
@@ -6,7 +6,7 @@
 ![Fx](https://img.shields.io/badge/uber--fx-v1.20-blueviolet)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-**Nexus** 是一个基于 **Golang 1.21+** 构建的现代化微服务脚手架。它融合了 **领域驱动设计 (DDD)**、**整洁架构 (Clean Architecture)** 与 **依赖注入 (DI)** 的最佳实践。
+**GoKit** 是一个基于 **Golang 1.21+** 构建的现代化微服务脚手架。它融合了 **领域驱动设计 (DDD)**、**整洁架构 (Clean Architecture)** 与 **依赖注入 (DI)** 的最佳实践。
 
 核心目标：**让基础设施代码标准化，让业务逻辑纯粹化。**
 
@@ -39,7 +39,7 @@
 database:
   driver: "mysql"
   # 修改为你的账号密码和数据库名
-  dsn: "root:root@tcp(127.0.0.1:3306)/nexus_db?charset=utf8mb4&parseTime=True&loc=Local"
+  dsn: "root:root@tcp(127.0.0.1:3306)/GoKit_db?charset=utf8mb4&parseTime=True&loc=Local"
 ```
 
 ### 3. 启动服务
@@ -73,7 +73,7 @@ INFO grpc_server_start addr=:9090
 ```bash
 curl -X POST http://localhost:8080/api/v1/users \
   -H "Content-Type: application/json" \
-  -d '{"name": "Nexus Developer", "email": "dev@nexus.com"}'
+  -d '{"name": "GoKit Developer", "email": "dev@GoKit.com"}'
 ```
 *响应:* `{"id": 1}`
 
@@ -81,14 +81,14 @@ curl -X POST http://localhost:8080/api/v1/users \
 ```bash
 curl http://localhost:8080/api/v1/users/1
 ```
-*响应:* `{"id": 1, "name": "Nexus Developer", "email": "dev@nexus.com"}`
+*响应:* `{"id": 1, "name": "GoKit Developer", "email": "dev@GoKit.com"}`
 
 ---
 
 ## 📂 目录结构
 
 ```text
-nexus/
+GoKit/
 ├── cmd/server/main.go           # 程序入口 (Fx 组装)
 ├── configs/                     # 配置文件
 ├── internal/                    # 🔒 业务代码
@@ -180,4 +180,4 @@ CMD ["./server"]
 
 ## 📄 License
 
-MIT © 2024 Nexus Team
+MIT © 2024 GoKit Team
