@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/bytedance/sonic v1.14.2
 	github.com/gofiber/fiber/v2 v2.52.10
+	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.3
 	github.com/spf13/viper v1.21.0
 	go.opentelemetry.io/otel/trace v1.38.0
 	go.uber.org/fx v1.24.0

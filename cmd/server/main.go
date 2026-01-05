@@ -47,13 +47,9 @@ func main() {
 		}),
 		fx.Provide(LoadConfig),
 		fx.Provide(
-			fx.Annotate(
-				func() fiber.Handler {
-					return cors.New() // 使用 fiber/middleware/cors
-				},
-				// 关键：打上标签，使其被 NewServer 自动识别
-				fx.ResultTags(`group:"http_global_middleware"`),
-			),
+			web.AsMiddlewares(func() fiber.Handler {
+				return cors.New() // 使用 fiber/middleware/cors
+			}),
 		),
 		fx.Provide(func(cfg *AppConfig) web.Config { return cfg.Web }),
 		fx.Provide(func(cfg *AppConfig) rpc.Config { return cfg.RPC }),

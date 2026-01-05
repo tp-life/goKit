@@ -60,3 +60,8 @@ func StartLifecycle(lc fx.Lifecycle, app *fiber.App, cfg Config, l *slog.Logger)
 		},
 	})
 }
+
+// AsMiddlewares 注册流式拦截器
+func AsMiddlewares(f any) any {
+	return fx.Annotate(f, fx.ResultTags(`group:"http_global_middleware"`))
+}
