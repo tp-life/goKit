@@ -1,0 +1,22 @@
+app:
+  name: "my-high-perf-service"
+  version: "v1.0.0"
+
+web:
+  port: ":8080"
+  app_name: "MyAPI"
+  prefork: false
+
+rpc:
+  port: ":9090"
+  max_connection_idle: 300s
+  timeout: 5s
+
+database:
+  driver: "mysql"
+  # 请修改为你的实际数据库地址
+  dsn: "root:root@tcp(127.0.0.1:3306)/my_db?charset=utf8mb4&parseTime=True&loc=Local"
+  replicas: []
+  max_idle_conns: 10
+  max_open_conns: 100
+  log_mode: "info"
