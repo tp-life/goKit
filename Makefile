@@ -21,9 +21,20 @@ run:
 	go run $(MAIN_FILE)
 
 ## build: 编译二进制文件
-build:
+build: prepare-web
 	@echo "Building $(APP_NAME)..."
 	go build -o bin/$(APP_NAME) $(MAIN_FILE)
+
+## prepare-web: 准备 Web 文件用于 embed
+prepare-web:
+	@echo "准备 Web 文件用于 embed..."
+	@mkdir -p cmd/server/web
+	@if [ -d "web/dist" ]; then \
+		cp -r web/dist cmd/server/web/; \
+		echo "Web 文件已复制到 cmd/server/web/dist"; \
+	else \
+		echo "警告: web/dist 目录不存在，请先构建前端 (cd web && npm run build)"; \
+	fi
 
 ## test: 运行单元测试
 test:
@@ -36,4 +47,5 @@ docker-build:
 ## clean: 清理编译产物
 clean:
 	rm -rf bin/
+	rm -rf cmd/server/web/
 	rm -f coverage.out

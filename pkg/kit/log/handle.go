@@ -14,6 +14,11 @@ type TraceHandler struct {
 
 // Handle 重写 Handle 方法，自动注入 TraceID
 func (h *TraceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if h.Handler == nil {
+		// 如果 Handler 为 nil，直接返回（不应该发生，但防御性编程）
+		return nil
+	}
+
 	// 假设你的 TraceID Key 是 "trace_id" 或者 "request_id"
 	// 这里适配 Fiber 的 requestid 中间件通常使用的 key，或者你自定义的 key
 	if traceID, ok := ctx.Value("requestid").(string); ok && traceID != "" {
