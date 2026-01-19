@@ -38,4 +38,4 @@ configs/config.yaml
 tmp/
 cmd/server/web/
 
-web/node_modules/
+web/node_modules/*
