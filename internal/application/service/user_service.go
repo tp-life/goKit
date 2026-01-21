@@ -24,7 +24,6 @@ func (s *UserService) CreateUser(ctx context.Context, req dto.CreateUserReq) (ui
 	// 事务演示
 	err := s.tx.WithTx(ctx, func(ctx context.Context) error {
 		user := &entity.User{
-			Name:  req.Name,
 			Email: req.Email,
 		}
 		if err := s.repo.Create(ctx, user); err != nil {
@@ -44,5 +43,5 @@ func (s *UserService) GetUser(ctx context.Context, id uint64) (*dto.UserResp, er
 	if u == nil {
 		return nil, errors.New("user not found")
 	}
-	return &dto.UserResp{ID: u.ID, Name: u.Name, Email: u.Email}, nil
+	return &dto.UserResp{ID: u.ID, Email: u.Email}, nil
 }

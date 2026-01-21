@@ -1,22 +1,38 @@
 app:
-  name: "my-high-perf-service"
+  name: "notion-lite"
   version: "v1.0.0"
 
 web:
   port: ":8080"
-  app_name: "MyAPI"
+  app_name: "NotionLite API"
   prefork: false
-
-rpc:
-  port: ":9090"
-  max_connection_idle: 300s
-  timeout: 5s
 
 database:
   driver: "mysql"
   # 请修改为你的实际数据库地址
-  dsn: "root:root@tcp(127.0.0.1:3306)/my_db?charset=utf8mb4&parseTime=True&loc=Local"
+  dsn: "root:root@tcp(127.0.0.1:3306)/notion_lite?charset=utf8mb4&parseTime=True&loc=Local"
   replicas: []
   max_idle_conns: 10
   max_open_conns: 100
   log_mode: "info"
+
+# 七牛云存储配置
+storage:
+  access_key: "YOUR_ACCESS_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+  bucket: "YOUR_BUCKET_NAME"
+  domain: "YOUR_CDN_DOMAIN"  # 例如: "cdn.example.com" 或 "your-bucket.qiniucdn.com"
+  zone: "huanan"  # 区域: z0(华东), z1(华北), z2(华南), na0(北美), as0(东南亚)
+  use_https: true
+
+# 日志配置
+log:
+  level: "info"   # debug, info, warn, error
+  format: "json"  # json, text
+  source: false   # 是否打印文件行号
+
+# 鉴权配置
+auth:
+  jwt_secret: "YOUR_JWT_SECRET_KEY_MIN_32_CHARS"  # 至少32字符的密钥
+  jwt_expiry: 168h  # Access Token 过期时间 (7天，默认值)
+  refresh_expiry: 720h  # Refresh Token 过期时间 (30天)

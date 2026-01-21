@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-white text-gray-900 antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  }
+  
+  * {
+    @apply border-gray-200;
+  }
+}
+
+@layer components {
+  /* 按钮样式 - HeroUI 风格 */
+  .btn {
+    @apply inline-flex items-center justify-center px-4 py-2 text-sm font-medium transition-all duration-200;
+    @apply focus:outline-none focus:ring-2 focus:ring-offset-2;
+  }
+  
+  .btn-primary {
+    @apply bg-gray-900 text-white hover:bg-gray-800 focus:ring-gray-500;
+    @apply active:scale-95;
+  }
+  
+  .btn-secondary {
+    @apply bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 focus:ring-gray-500;
+    @apply active:scale-95;
+  }
+  
+  .btn-ghost {
+    @apply text-gray-600 hover:text-gray-900 hover:bg-gray-100 focus:ring-gray-500;
+    @apply active:scale-95;
+  }
+  
+  /* 输入框样式 - 扁平化 */
+  .input {
+    @apply w-full px-0 py-2 bg-transparent border-0 border-b border-gray-300;
+    @apply focus:outline-none focus:border-gray-900 focus:ring-0;
+    @apply transition-colors duration-200;
+  }
+  
+  .input-flat {
+    @apply w-full px-0 py-2 bg-transparent border-0;
+    @apply focus:outline-none focus:ring-0;
+    @apply placeholder:text-gray-400;
+  }
+  
+  /* 卡片样式 - 更简洁 */
+  .card {
+    @apply bg-white rounded-lg border border-gray-200;
+    @apply hover:border-gray-300 transition-colors duration-200;
+  }
+  
+  /* Notion 风格的块容器 */
+  .notion-block {
+    @apply relative px-0 py-1;
+    @apply hover:bg-gray-50 rounded transition-colors duration-150;
+  }
+  
+  .notion-block:hover .notion-block-menu {
+    @apply opacity-100;
+  }
+  
+  /* 标题输入 - Notion 风格 */
+  .notion-title {
+    @apply text-4xl font-bold text-gray-900;
+    @apply w-full px-0 py-2 border-0 bg-transparent;
+    @apply focus:outline-none focus:ring-0;
+    @apply placeholder:text-gray-400 placeholder:font-normal;
+  }
+}

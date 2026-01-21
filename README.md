@@ -1,4 +1,4 @@
-# GoKit - High Performance Go DDD Scaffolding
+# Notion-Lite Backend (基于 GoKit)
 
 ![Go Version](https://img.shields.io/badge/go-1.21+-00ADD8.svg)
 ![Fiber](https://img.shields.io/badge/fiber-v2.52-green)
@@ -6,64 +6,67 @@
 ![Fx](https://img.shields.io/badge/uber--fx-v1.20-blueviolet)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-**GoKit** 是一个基于 **Golang 1.21+** 构建的现代化微服务脚手架。它融合了 **领域驱动设计 (DDD)**、**整洁架构 (Clean Architecture)** 与 **依赖注入 (DI)** 的最佳实践。
+**Notion-Lite** 是一个轻量级的笔记应用后端，基于 **GoKit** 脚手架构建。它实现了移动端极速录入、PC端块编辑、统一时间轴等核心功能。
 
-核心目标：**让基础设施代码标准化，让业务逻辑纯粹化。**
+**核心理念:** "移动端快写 (Memo) + PC端慢读 (Block) + 统一时间轴 (Timeline)"
 
 ---
 
 ## ✨ 核心特性
 
-- **🏗 标准 DDD 分层**: 严格隔离 Domain / Application / Infrastructure / Interface。
-- **🧩 依赖注入**: 基于 **Uber Fx** 实现全自动组件装配与生命周期管理。
-- **🚀 极致性能**: **Fiber v2** + **Sonic** (JSON) + **Gorm** (读写分离/预编译) + **gRPC** (KeepAlive)。
-- **🛡 健壮性**: 闭包式事务管理 (`WithTx`)，支持 Context 自动传播。
-- **📝 可观测性**: 基于 **slog** 封装，自动注入 TraceID，支持 Text/JSON 切换。
-- **🔌 插件化**: 为 HTTP/gRPC 预留了基于 Fx Group 的中间件插槽。
+- **📱 移动端极速录入**: 1秒内完成闪念记录，支持图片上传
+- **💻 PC端块编辑**: 基于 Editor.js 的结构化编辑，所见即所得
+- **📊 统一时间轴**: 聚合 Memos 和 Pages，按时间倒序展示
+- **🔐 双Token鉴权**: JWT Access Token + Refresh Token，支持持久登录
+- **☁️ 七牛云存储**: 图片自动上传到七牛云，返回 CDN URL
+- **🔗 公开分享**: 支持页面分享，生成唯一 ShareID，访客可只读访问
+
+## 🏗️ 技术架构
+
+- **标准 DDD 分层**: 严格隔离 Domain / Application / Infrastructure / Interface
+- **依赖注入**: 基于 **Uber Fx** 实现全自动组件装配与生命周期管理
+- **极致性能**: **Fiber v2** + **Sonic** (JSON) + **Gorm** (事务/预编译)
+- **健壮性**: 闭包式事务管理 (`WithTx`)，支持 Context 自动传播
+- **可观测性**: 基于 **slog** 封装，支持 JSON 日志输出
 
 ---
 
-## 🚀 快速开始 (Quick Start)
+## 🚀 快速开始
 
 ### 1. 环境准备
 确保本地已安装：
 - **Go**: 1.21+
-- **MySQL**: 5.7+
-- **Make** (可选，推荐)
+- **MySQL**: 8.0+ (必须支持 JSON 字段)
+- **七牛云账号**: 用于对象存储
 
-### 2. 初始化配置
-项目默认读取 `configs/local.yaml`。请根据实际情况修改数据库连接：
-
-```yaml
-# configs/local.yaml
-database:
-  driver: "mysql"
-  # 修改为你的账号密码和数据库名
-  dsn: "root:root@tcp(127.0.0.1:3306)/GoKit_db?charset=utf8mb4&parseTime=True&loc=Local"
-```
-
-### 3. 启动服务
-
-**方式 A: 使用 Makefile (推荐)**
-```bash
-# 下载依赖
-make tidy
-
-# 运行服务
-make run
-```
-
-**方式 B: 使用 Go 命令**
+### 2. 安装依赖
 ```bash
 go mod tidy
+```
+
+### 3. 初始化数据库
+```bash
+mysql -u root -p < docs/migrations/001_initial_schema.sql
+```
+
+### 4. 配置应用
+```bash
+cp configs/config.yaml.example configs/config.yaml
+```
+
+编辑 `configs/config.yaml`，填入：
+- 数据库连接信息
+- 七牛云 AccessKey、SecretKey、Bucket、Domain
+- JWT 密钥（至少32字符）
+
+### 5. 启动服务
+```bash
 go run cmd/server/main.go
 ```
 
-启动成功后，你将看到以下日志：
-```text
-INFO http_server_start addr=:8080
-INFO grpc_server_start addr=:9090
-```
+服务将在 `http://localhost:8080` 启动。
+
+详细部署说明请参考：[部署指南](docs/NOTION_LITE_SETUP.md)
 
 ### 4. 接口测试
 
