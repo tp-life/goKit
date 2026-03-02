@@ -36,3 +36,4 @@ configs/config.yaml
 
 # Temporary
 tmp/
+*/node_modules
