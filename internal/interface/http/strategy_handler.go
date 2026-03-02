@@ -14,26 +14,24 @@ func NewStrategyHandler(svc *service.StrategyService) *StrategyHandler {
 	return &StrategyHandler{svc: svc}
 }
 
-func (h *StrategyHandler) RegisterRoutes(app *fiber.App) {
-	g := app.Group("/api/v1/strategy")
-	g.Get("/golden-pit", h.GetGoldenPit)
-}
-
 func (h *StrategyHandler) GetGoldenPit(c *fiber.Ctx) error {
-	// 获取查询参数，这里可以使用默认值作为测试
-	reportDate := c.Query("report_date", "2023-09-30")
+	reportDate := c.Query("report_date")
+	if reportDate == "" {
+		// 缺少核心参数，直接阻断
+		return BadRequest(c, "report_date 参数不能为空")
+	}
+
 	quarterStart := c.Query("quarter_start", "2023-07-01")
 	quarterEnd := c.Query("quarter_end", "2023-09-30")
 
 	data, err := h.svc.FindGoldenPitStocks(c.UserContext(), reportDate, quarterStart, quarterEnd)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		// 数据库异常或策略引擎报错
+		return InternalServer(c, "策略引擎计算异常: "+err.Error())
 	}
 
-	return c.JSON(fiber.Map{
-		"code":    0,
-		"message": "success",
-		"data":    data,
-		"total":   len(data),
+	return Success(c, fiber.Map{
+		"list":  data,
+		"total": len(data),
 	})
 }

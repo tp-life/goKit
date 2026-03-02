@@ -12,7 +12,7 @@ type Router struct {
 
 type RouterIn struct {
 	fx.In
-	UserHandler *UserHandler
+	StrategyHandler *StrategyHandler
 }
 
 // NewRouter 通过 Fx 依赖注入所有的 Handler
@@ -30,10 +30,8 @@ func (r *Router) Register(app *fiber.App) {
 	// ==========================================
 	// 1. User 模块路由
 	// ==========================================
-	userGroup := v1.Group("/users")
+	strategyGroup := v1.Group("/strategy")
 	{
-		userGroup.Post("/", r.params.UserHandler.Create)
-		userGroup.Get("/:id", r.params.UserHandler.Get)
+		strategyGroup.Get("/golden-pit", r.params.StrategyHandler.GetGoldenPit)
 	}
-
 }
