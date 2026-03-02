@@ -9,8 +9,6 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
 
-	"goKit/internal/application/service"
-	"goKit/internal/infrastructure/persistence"
 	httpInterface "goKit/internal/interface/http"
 
 	"goKit/pkg/kit"
@@ -56,11 +54,6 @@ func main() {
 		fx.Provide(func(cfg *AppConfig) db.Config { return cfg.Database }),
 
 		kit.Module,
-
-		// === 2. Strategy 模块 (新增) ===
-		fx.Provide(persistence.NewStrategyRepo),
-		fx.Provide(service.NewStrategyService),
-		fx.Provide(httpInterface.NewStrategyHandler),
 
 		// === 3. 统一路由管理器 ===
 		fx.Provide(httpInterface.NewRouter),
