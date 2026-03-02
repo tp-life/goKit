@@ -57,12 +57,17 @@ func main() {
 
 		kit.Module,
 
-		fx.Provide(persistence.NewUserRepo),
-		fx.Provide(service.NewUserService),
-		fx.Provide(httpInterface.NewUserHandler),
+		// === 2. Strategy 模块 (新增) ===
+		fx.Provide(persistence.NewStrategyRepo),
+		fx.Provide(service.NewStrategyService),
+		fx.Provide(httpInterface.NewStrategyHandler),
 
-		fx.Invoke(func(app *fiber.App, h *httpInterface.UserHandler) {
-			h.RegisterRoutes(app)
+		// 注册所有路由
+		fx.Invoke(func(
+			app *fiber.App,
+			strategyH *httpInterface.StrategyHandler, // 注入新的 Handler
+		) {
+			strategyH.RegisterRoutes(app) // 注册黄金坑策略路由
 		}),
 	).Run()
 }
