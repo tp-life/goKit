@@ -1,10 +1,11 @@
-package http
+package handler
 
 import (
 	"strconv"
 
 	"goKit/internal/application/dto"
 	"goKit/internal/application/service"
+	"goKit/internal/interface/http/response"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -21,16 +22,16 @@ func (h *UserHandler) Create(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		// 以前: return Error(c, 400, 40001, "invalid request")
 		// 现在: 极其清晰的语义
-		return BadRequest(c, "JSON解析失败，请检查请求体格式")
+		return response.ErrBadRequest("JSON解析失败，请检查请求体格式")
 	}
 
 	id, err := h.svc.CreateUser(c.UserContext(), req)
 	if err != nil {
 		// 统一走 500 内部错误
-		return InternalServer(c, err.Error())
+		return response.ErrInternal(err, "")
 	}
 
-	return Success(c, fiber.Map{"id": id})
+	return response.Success(c, fiber.Map{"id": id})
 }
 
 func (h *UserHandler) Get(c *fiber.Ctx) error {
@@ -40,10 +41,10 @@ func (h *UserHandler) Get(c *fiber.Ctx) error {
 	if err != nil {
 		if err.Error() == "user not found" {
 			// 直接丢出一个 NotFound
-			return NotFound(c, "您要查找的用户不存在")
+			return response.ErrNotFound("您要查找的用户不存在")
 		}
-		return InternalServer(c, "获取用户信息失败")
+		return response.ErrInternal(nil, "获取用户信息失败")
 	}
 
-	return Success(c, user)
+	return response.Success(c, user)
 }

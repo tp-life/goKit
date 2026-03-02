@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
 
-	httpInterface "goKit/internal/interface/http"
+	httpInterface "goKit/internal/interface/http/router"
 
 	"goKit/pkg/kit"
 	"goKit/pkg/kit/db"
