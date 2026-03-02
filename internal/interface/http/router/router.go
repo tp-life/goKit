@@ -1,6 +1,8 @@
-package http
+package router
 
 import (
+	"goKit/internal/interface/http/handler"
+
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/fx"
 )
@@ -12,7 +14,7 @@ type Router struct {
 
 type RouterIn struct {
 	fx.In
-	StrategyHandler *StrategyHandler
+	StrategyHandler *handler.StrategyHandler
 }
 
 // NewRouter 通过 Fx 依赖注入所有的 Handler

@@ -1,7 +1,8 @@
-package http
+package handler
 
 import (
 	"goKit/internal/application/service"
+	"goKit/internal/interface/http/response"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -18,7 +19,7 @@ func (h *StrategyHandler) GetGoldenPit(c *fiber.Ctx) error {
 	reportDate := c.Query("report_date")
 	if reportDate == "" {
 		// 缺少核心参数，直接阻断
-		return BadRequest(c, "report_date 参数不能为空")
+		return response.ErrBadRequest("report_date 参数不能为空")
 	}
 
 	quarterStart := c.Query("quarter_start", "2023-07-01")
@@ -27,10 +28,10 @@ func (h *StrategyHandler) GetGoldenPit(c *fiber.Ctx) error {
 	data, err := h.svc.FindGoldenPitStocks(c.UserContext(), reportDate, quarterStart, quarterEnd)
 	if err != nil {
 		// 数据库异常或策略引擎报错
-		return InternalServer(c, "策略引擎计算异常: "+err.Error())
+		return response.ErrInternal(err, "策略引擎计算异常: "+err.Error())
 	}
 
-	return Success(c, fiber.Map{
+	return response.Success(c, fiber.Map{
 		"list":  data,
 		"total": len(data),
 	})
