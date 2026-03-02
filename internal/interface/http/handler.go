@@ -3,9 +3,10 @@ package http
 import (
 	"strconv"
 
-	"github.com/gofiber/fiber/v2"
 	"goKit/internal/application/dto"
 	"goKit/internal/application/service"
+
+	"github.com/gofiber/fiber/v2"
 )
 
 type UserHandler struct {
@@ -15,30 +16,34 @@ type UserHandler struct {
 func NewUserHandler(svc *service.UserService) *UserHandler {
 	return &UserHandler{svc: svc}
 }
-
-func (h *UserHandler) RegisterRoutes(app *fiber.App) {
-	g := app.Group("/api/v1")
-	g.Post("/users", h.Create)
-	g.Get("/users/:id", h.Get)
-}
-
 func (h *UserHandler) Create(c *fiber.Ctx) error {
 	var req dto.CreateUserReq
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+		// 以前: return Error(c, 400, 40001, "invalid request")
+		// 现在: 极其清晰的语义
+		return BadRequest(c, "JSON解析失败，请检查请求体格式")
 	}
+
 	id, err := h.svc.CreateUser(c.UserContext(), req)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		// 统一走 500 内部错误
+		return InternalServer(c, err.Error())
 	}
-	return c.Status(201).JSON(fiber.Map{"id": id})
+
+	return Success(c, fiber.Map{"id": id})
 }
 
 func (h *UserHandler) Get(c *fiber.Ctx) error {
 	id, _ := strconv.ParseUint(c.Params("id"), 10, 64)
 	user, err := h.svc.GetUser(c.UserContext(), id)
+
 	if err != nil {
-		return c.Status(404).JSON(fiber.Map{"error": err.Error()})
+		if err.Error() == "user not found" {
+			// 直接丢出一个 NotFound
+			return NotFound(c, "您要查找的用户不存在")
+		}
+		return InternalServer(c, "获取用户信息失败")
 	}
-	return c.JSON(user)
+
+	return Success(c, user)
 }

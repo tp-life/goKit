@@ -62,12 +62,13 @@ func main() {
 		fx.Provide(service.NewStrategyService),
 		fx.Provide(httpInterface.NewStrategyHandler),
 
-		// 注册所有路由
-		fx.Invoke(func(
-			app *fiber.App,
-			strategyH *httpInterface.StrategyHandler, // 注入新的 Handler
-		) {
-			strategyH.RegisterRoutes(app) // 注册黄金坑策略路由
+		// === 3. 统一路由管理器 ===
+		fx.Provide(httpInterface.NewRouter),
+
+		// === 4. 启动时执行路由注册 ===
+		fx.Invoke(func(app *fiber.App, router *httpInterface.Router) {
+			// 一键注册所有路由，Main 函数不再关心具体有哪些业务 Handler
+			router.Register(app)
 		}),
 	).Run()
 }
