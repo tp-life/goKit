@@ -11,7 +11,8 @@ import (
 
 	"goKit/internal/application/service"
 	"goKit/internal/infrastructure/persistence"
-	httpInterface "goKit/internal/interface/http"
+	"goKit/internal/interface/http/handler"
+	"goKit/internal/interface/http/router"
 
 	"goKit/pkg/kit"
 	"goKit/pkg/kit/db"
@@ -60,13 +61,13 @@ func main() {
 		// === 2. Strategy 模块 (新增) ===
 		fx.Provide(persistence.NewStrategyRepo),
 		fx.Provide(service.NewStrategyService),
-		fx.Provide(httpInterface.NewStrategyHandler),
+		fx.Provide(handler.NewStrategyHandler),
 
 		// === 3. 统一路由管理器 ===
-		fx.Provide(httpInterface.NewRouter),
+		fx.Provide(router.NewRouter),
 
 		// === 4. 启动时执行路由注册 ===
-		fx.Invoke(func(app *fiber.App, router *httpInterface.Router) {
+		fx.Invoke(func(app *fiber.App, router *router.Router) {
 			// 一键注册所有路由，Main 函数不再关心具体有哪些业务 Handler
 			router.Register(app)
 		}),

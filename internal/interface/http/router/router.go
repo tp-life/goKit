@@ -2,6 +2,8 @@ package router
 
 import (
 	"goKit/internal/interface/http/handler"
+	"goKit/internal/interface/http/middleware"
+	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/fx"
@@ -15,6 +17,7 @@ type Router struct {
 type RouterIn struct {
 	fx.In
 	StrategyHandler *handler.StrategyHandler
+	Logger          *slog.Logger
 }
 
 // NewRouter 通过 Fx 依赖注入所有的 Handler
@@ -29,9 +32,8 @@ func (r *Router) Register(app *fiber.App) {
 	// 全局 API 分组
 	v1 := app.Group("/api/v1")
 
-	// ==========================================
-	// 1. User 模块路由
-	// ==========================================
+	v1.Use(middleware.ErrorHandler(r.params.Logger))
+
 	strategyGroup := v1.Group("/strategy")
 	{
 		strategyGroup.Get("/golden-pit", r.params.StrategyHandler.GetGoldenPit)
