@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
 
 	"goKit/internal/application/service"
-	"goKit/internal/domain/entity"
 	"goKit/pkg/kit/db"
 	"goKit/pkg/kit/log"
 )
@@ -35,52 +35,57 @@ func LoadConfig() (*AppConfig, error) {
 	return &cfg, nil
 }
 
+// getLatestReportDate 自动推算 A 股最新有效财报期
+func getLatestReportDate() string {
+	now := time.Now()
+	year := now.Year()
+	month := now.Month()
+
+	// 财报披露规则推导：
+	// 5月以后，一季报肯定披露完了 (3-31)
+	// 9月以后，中报肯定披露完了 (6-30)
+	// 11月以后，三季报肯定披露完了 (9-30)
+	// 1-4月，使用去年的年报 (12-31)
+	if month >= 11 {
+		return fmt.Sprintf("%d-09-30", year)
+	} else if month >= 9 {
+		return fmt.Sprintf("%d-06-30", year)
+	} else if month >= 5 {
+		return fmt.Sprintf("%d-03-31", year)
+	}
+	return fmt.Sprintf("%d-12-31", year-1)
+}
+
 func main() {
 	app := fx.New(
-		// 1. 基础配置提供
 		fx.Provide(LoadConfig),
 		fx.Provide(func(cfg *AppConfig) db.Config { return cfg.Database }),
 		fx.Provide(func(cfg *AppConfig) log.Config { return cfg.Log }),
-
-		// 2. 核心组件库
 		fx.Provide(log.NewLogger),
 		fx.Provide(db.NewClient),
-
-		// 3. 业务逻辑服务
 		fx.Provide(service.NewCrawlerService),
-		// fx.Provide(service.NewStrategyService), // 策略模块如需可开放
 
-		// 4. 生命周期管理
 		fx.Invoke(func(lc fx.Lifecycle, dbClient *db.Client, crawler *service.CrawlerService, logger *slog.Logger) {
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
 					go func() {
 						logger.Info("==== 🚀 GoKit 量化爬虫引擎启动 ====")
 
-						// 第一步：自动迁移数据库表结构，确保表存在
-						gormDB := dbClient.GetDB(context.Background())
-						gormDB.AutoMigrate(
-							&entity.StockInfo{},
-							&entity.InstitutionInfo{},
-							&entity.StockHoldingRecord{},
-							&entity.StockDailyQuote{},
-						)
-						logger.Info("数据库表结构校验完毕")
-
-						// 第二步：同步基础信息与行业 (新浪 + 腾讯)
+						// 第二步：同步基础信息与行业 (新浪)
 						if err := crawler.SyncStockBasics(context.Background()); err != nil {
 							logger.Error("基础信息同步异常", slog.Any("err", err))
 						}
 
-						// 第三步：抓取最新一期财报 (东方财富)
-						reportDate := "2024-09-30" // 示例为 2024 年三季报，可改为动态入参
+						// 第三步：【动态计算】抓取最新一期财报 (东方财富)
+						reportDate := getLatestReportDate()
+						logger.Info("推算出最新财报期", slog.String("reportDate", reportDate))
 						if err := crawler.SyncHoldings(context.Background(), reportDate); err != nil {
 							logger.Error("持仓流水同步异常", slog.Any("err", err))
 						}
 
-						// 第四步：抓取核心标的 K 线 (以茅台为例，仅做演示，策略可全量遍历)
-						if err := crawler.SyncDailyQuotes(context.Background(), "600519", 250); err != nil {
-							logger.Error("K 线同步异常", slog.Any("err", err))
+						// 第四步：【全量同步】拉取全市场所有股票最近 250 天的 K 线
+						if err := crawler.SyncAllDailyQuotes(context.Background(), 250); err != nil {
+							logger.Error("全量 K 线同步异常", slog.Any("err", err))
 						}
 
 						logger.Info("==== ✅ 所有爬虫任务执行完毕 ====")
@@ -91,6 +96,5 @@ func main() {
 			})
 		}),
 	)
-
 	app.Run()
 }

@@ -22,14 +22,13 @@ import (
 // 1. 结构体与初始化
 // =========================================================================
 
-// EastMoneyHoldingItem 东方财富持仓数据节点
 type EastMoneyHoldingItem struct {
 	SecurityCode     string   `json:"SECURITY_CODE"`
 	SecurityNameAbbr string   `json:"SECURITY_NAME_ABBR"`
 	EndDate          string   `json:"END_DATE"`
 	HolderName       string   `json:"HOLDER_NAME"`
-	HoldNum          *float64 `json:"HOLD_NUM"`           // 指针防空指针崩溃
-	FreeHoldnumRatio *float64 `json:"FREE_HOLDNUM_RATIO"` // 指针防空指针崩溃
+	HoldNum          *float64 `json:"HOLD_NUM"`
+	FreeHoldnumRatio *float64 `json:"FREE_HOLDNUM_RATIO"`
 	HoldNumChange    any      `json:"HOLD_NUM_CHANGE"`
 }
 
@@ -43,51 +42,68 @@ func NewCrawlerService(dbClient *db.Client, logger *slog.Logger) *CrawlerService
 	return &CrawlerService{
 		dbClient: dbClient,
 		logger:   logger,
-		// 全局复用 HTTP 客户端，配置防拥塞超时
-		client: &http.Client{Timeout: 15 * time.Second},
+		client:   &http.Client{Timeout: 20 * time.Second},
 	}
 }
 
 // =========================================================================
-// 2. 基础数据抓取 (新浪全量快照 + 新浪行业分类)
+// 2. 基础数据抓取 (新浪全市场真实分页扫描)
 // =========================================================================
 
 func (s *CrawlerService) SyncStockBasics(ctx context.Context) error {
 	s.logger.Info("开始同步全市场股票列表及行业分类...")
 
-	// 1. 获取行业映射字典 (Code -> Industry)
 	industryMap := s.fetchSinaIndustryMap(ctx)
 
-	// 2. 获取全量 A 股列表
-	apiURL := "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?node=hs_a&pageSize=6000"
-	body, err := s.httpGet(ctx, apiURL, "")
-	if err != nil {
-		return fmt.Errorf("拉取基础列表失败: %v", err)
-	}
-
-	var rawData []struct {
+	var allRawData []struct {
 		Symbol string `json:"symbol"`
 		Name   string `json:"name"`
 	}
-	if err := json.Unmarshal(body, &rawData); err != nil {
-		return fmt.Errorf("解析基础列表失败: %v", err)
+
+	nodes := []string{"hs_a", "bjs_a"}
+	for _, node := range nodes {
+		page := 1
+		for {
+			apiURL := fmt.Sprintf("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=%d&num=100&sort=symbol&asc=1&node=%s", page, node)
+			body, err := s.httpGet(ctx, apiURL, "")
+			if err != nil {
+				break
+			}
+
+			var pageData []struct {
+				Symbol string `json:"symbol"`
+				Name   string `json:"name"`
+			}
+			if err := json.Unmarshal(body, &pageData); err != nil || len(pageData) == 0 {
+				break
+			}
+
+			allRawData = append(allRawData, pageData...)
+
+			if len(pageData) < 100 {
+				break
+			}
+			page++
+			time.Sleep(30 * time.Millisecond)
+		}
 	}
 
-	// 3. 批量写入数据库
+	s.logger.Info("成功从新浪拉取到全量股票代码", slog.Int("count", len(allRawData)))
+
 	return s.dbClient.WithTx(ctx, func(txCtx context.Context) error {
 		tx := s.dbClient.GetDB(txCtx)
 		var batch []entity.StockInfo
 
-		for _, item := range rawData {
+		for _, item := range allRawData {
 			if len(item.Symbol) < 8 {
 				continue
 			}
-			code := item.Symbol[2:] // 截取 sh600519 -> 600519
+			code := item.Symbol[2:]
 			batch = append(batch, entity.StockInfo{
 				StockCode: code,
 				StockName: item.Name,
-				Exchange:  strings.ToUpper(item.Symbol[:2]), // 提取 SH/SZ
-				Industry:  industryMap[code],                // 匹配行业
+				Exchange:  strings.ToUpper(item.Symbol[:2]),
+				Industry:  industryMap[code],
 			})
 		}
 
@@ -95,7 +111,6 @@ func (s *CrawlerService) SyncStockBasics(ctx context.Context) error {
 			return nil
 		}
 
-		// 冲突时更新名称和行业
 		return tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "stock_code"}},
 			DoUpdates: clause.AssignmentColumns([]string{"stock_name", "industry", "exchange", "updated_at"}),
@@ -104,53 +119,96 @@ func (s *CrawlerService) SyncStockBasics(ctx context.Context) error {
 }
 
 // =========================================================================
-// 3. 行情数据抓取 (腾讯极速 K 线源)
+// 3. 行情数据抓取 (全面替换为：东方财富行情源)
 // =========================================================================
 
-func (s *CrawlerService) SyncDailyQuotes(ctx context.Context, code string, limit int) error {
-	symbol := s.toTencentSymbol(code)
-	// 腾讯接口：web.ifzq.gtimg.cn，速度极快且不封海外 IP
-	apiURL := fmt.Sprintf("https://web.ifzq.gtimg.cn/app/kline/get?_var=kline_day&symbol=%s&type=last&n=%d", symbol, limit)
+func (s *CrawlerService) SyncAllDailyQuotes(ctx context.Context, limit int) error {
+	s.logger.Info("开始全量同步 A 股 K 线数据 (数据源: 东方财富)...")
 
-	body, err := s.httpGet(ctx, apiURL, "https://gu.qq.com")
+	var stocks []entity.StockInfo
+	if err := s.dbClient.GetDB(ctx).Select("stock_code").Find(&stocks).Error; err != nil {
+		return fmt.Errorf("查询股票列表失败: %v", err)
+	}
+
+	total := len(stocks)
+	successCount := 0
+
+	for i, stock := range stocks {
+		err := s.SyncDailyQuotes(ctx, stock.StockCode, limit)
+		if err == nil {
+			successCount++
+		} else {
+			s.logger.Debug("单只股票 K 线同步跳过", slog.String("code", stock.StockCode), slog.Any("err", err))
+		}
+
+		if (i+1)%500 == 0 {
+			s.logger.Info("K 线全量同步进度", slog.Int("current", i+1), slog.Int("total", total), slog.Int("success", successCount))
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	s.logger.Info("全量 K 线同步彻底完成", slog.Int("成功数量", successCount), slog.Int("总数", total))
+	return nil
+}
+
+func (s *CrawlerService) SyncDailyQuotes(ctx context.Context, code string, limit int) error {
+	secid := s.toEastMoneySecID(code)
+
+	// 东方财富 K 线接口
+	// klt=101 (日线), fqt=1 (前复权), lmt=获取条数
+	apiURL := fmt.Sprintf("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&end=20500101&lmt=%d", secid, limit)
+
+	body, err := s.httpGet(ctx, apiURL, "")
 	if err != nil {
 		return err
 	}
 
-	// 腾讯返回的是纯文本附带 JSON： kline_day=[{"data":{"day":[["2024-03-01","10.0","10.5"...]]}}]
-	content := string(body)
-	start := strings.Index(content, "=[")
-	if start == -1 {
-		return fmt.Errorf("腾讯 K 线数据格式异常")
-	}
-
 	var resp struct {
 		Data struct {
-			Day [][]string `json:"day"`
+			Klines []string `json:"klines"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal([]byte(content[start+1:]), &resp); err != nil {
-		return fmt.Errorf("解析腾讯 K 线失败: %v", err)
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("JSON解析失败: %v", err)
 	}
 
-	// 批量写入
+	if len(resp.Data.Klines) == 0 {
+		return fmt.Errorf("暂无有效 K 线数据")
+	}
+
 	return s.dbClient.WithTx(ctx, func(txCtx context.Context) error {
 		tx := s.dbClient.GetDB(txCtx)
 		var batch []entity.StockDailyQuote
 
-		for _, q := range resp.Data.Day {
-			if len(q) < 6 {
+		for _, line := range resp.Data.Klines {
+			// 东财格式: "日期,开盘,收盘,最高,最低,成交量(手),成交额"
+			// 例如: "2024-03-01,10.00,10.50,10.60,9.90,123456,123456789.00"
+			parts := strings.Split(line, ",")
+			if len(parts) < 6 {
 				continue
 			}
-			t, _ := time.Parse("2006-01-02", q[0])
-			open, _ := strconv.ParseFloat(q[1], 64)
-			closeVal, _ := strconv.ParseFloat(q[2], 64)
-			high, _ := strconv.ParseFloat(q[3], 64)
-			low, _ := strconv.ParseFloat(q[4], 64)
-			vol, _ := strconv.ParseInt(q[5], 10, 64)
+
+			t, err := time.Parse("2006-01-02", parts[0])
+			if err != nil {
+				continue
+			}
+
+			open, _ := strconv.ParseFloat(parts[1], 64)
+			closeVal, _ := strconv.ParseFloat(parts[2], 64)
+			high, _ := strconv.ParseFloat(parts[3], 64)
+			low, _ := strconv.ParseFloat(parts[4], 64)
+			vol, _ := strconv.ParseFloat(parts[5], 64)
 
 			batch = append(batch, entity.StockDailyQuote{
-				StockCode: code, TradeDate: t, Open: open, Close: closeVal, High: high, Low: low, Volume: vol,
+				StockCode: code,
+				TradeDate: t,
+				Open:      open,
+				Close:     closeVal,
+				High:      high,
+				Low:       low,
+				Volume:    int64(vol),
 			})
 		}
 
@@ -163,70 +221,71 @@ func (s *CrawlerService) SyncDailyQuotes(ctx context.Context, code string, limit
 }
 
 // =========================================================================
-// 4. 持仓数据抓取 (东方财富数据中心)
+// 4. 持仓数据抓取 (东方财富 - 按股票遍历规避截断问题)
 // =========================================================================
 
 func (s *CrawlerService) SyncHoldings(ctx context.Context, reportDate string) error {
-	s.logger.Info("开始分页同步全市场持仓流水...", slog.String("date", reportDate))
-	page := 1
+	var stocks []string
+	if err := s.dbClient.GetDB(ctx).Model(&entity.StockInfo{}).Pluck("stock_code", &stocks).Error; err != nil {
+		return err
+	}
+
+	s.logger.Info("开始按个股循环同步持仓 (修复防盗链与排序校验)...", slog.Int("stockCount", len(stocks)))
 	totalRecords := 0
 
-	for {
+	for i, code := range stocks {
 		apiURL := "https://datacenter-web.eastmoney.com/api/data/v1/get"
 		params := url.Values{}
-		params.Add("pageSize", "500") // 每次拉取 500 条
-		params.Add("pageNumber", strconv.Itoa(page))
+		params.Add("pageSize", "50")
+		params.Add("pageNumber", "1")
 		params.Add("reportName", "RPT_F10_EH_FREEHOLDERS")
 		params.Add("columns", "SECURITY_CODE,SECURITY_NAME_ABBR,END_DATE,HOLDER_NAME,HOLD_NUM,FREE_HOLDNUM_RATIO,HOLD_NUM_CHANGE")
-		params.Add("filter", fmt.Sprintf(`(END_DATE='%s')`, reportDate))
+		params.Add("filter", fmt.Sprintf(`(SECURITY_CODE="%s")(END_DATE='%s')`, code, reportDate))
 
-		body, err := s.httpGet(ctx, apiURL+"?"+params.Encode(), "")
+		// 【修复点 1】：强行增加排序字段（按持股数倒序），东财接口不传此参数通常会返回 Null
+		params.Add("sortColumns", "HOLD_NUM")
+		params.Add("sortTypes", "-1")
+		// 【修复点 2】：增加终端标识，模拟真实网页请求
+		params.Add("source", "WEB")
+		params.Add("client", "WEB")
+
+		// 【修复点 3】：必须加上东方财富的专属 Referer，否则触发防盗链机制返回空数据！
+		referer := "https://data.eastmoney.com/"
+		body, err := s.httpGet(ctx, apiURL+"?"+params.Encode(), referer)
 		if err != nil {
-			s.logger.Error("拉取持仓失败", slog.Int("page", page), slog.Any("err", err))
-			break
+			continue
 		}
 
 		var emResp struct {
 			Result struct {
-				Pages int                    `json:"pages"`
-				Data  []EastMoneyHoldingItem `json:"data"`
+				Data []EastMoneyHoldingItem `json:"data"`
 			} `json:"result"`
 			Success bool `json:"success"`
 		}
 
-		if err := json.Unmarshal(body, &emResp); err != nil {
-			break
+		if err := json.Unmarshal(body, &emResp); err == nil && emResp.Success && emResp.Result.Data != nil && len(emResp.Result.Data) > 0 {
+			if err := s.saveHoldingsBatch(ctx, emResp.Result.Data); err == nil {
+				totalRecords += len(emResp.Result.Data)
+			}
+		}
+		s.logger.Info("saveHoldingsBatch xxxx", slog.String("code", code), slog.Int("records", len(emResp.Result.Data)))
+		// 打印进度
+		if (i+1)%500 == 0 {
+			s.logger.Info("持仓同步进度", slog.Int("current", i+1), slog.Int("total", len(stocks)), slog.Int("savedRecords", totalRecords))
 		}
 
-		if !emResp.Success || len(emResp.Result.Data) == 0 {
-			break
-		}
-
-		// 执行批量存储核心逻辑
-		if err := s.saveHoldingsBatch(ctx, emResp.Result.Data); err != nil {
-			s.logger.Error("入库失败", slog.Int("page", page), slog.Any("err", err))
-		} else {
-			totalRecords += len(emResp.Result.Data)
-			s.logger.Info("持仓分页拉取完成", slog.Int("page", page), slog.Int("totalPages", emResp.Result.Pages))
-		}
-
-		if page >= emResp.Result.Pages {
-			break
-		}
-		page++
-		time.Sleep(300 * time.Millisecond) // 防封控缓冲
+		// 稍微延长一点休眠，东方财富对单 IP 频率限制比腾讯严苛一点
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	s.logger.Info("持仓同步彻底完成", slog.Int("总新增流水记录", totalRecords))
+	s.logger.Info("全市场持仓同步彻底完成", slog.Int("总流水", totalRecords))
 	return nil
 }
 
-// saveHoldingsBatch 持仓批量存储核心逻辑 (完全无 N+1 查询)
 func (s *CrawlerService) saveHoldingsBatch(ctx context.Context, data []EastMoneyHoldingItem) error {
 	return s.dbClient.WithTx(ctx, func(txCtx context.Context) error {
 		tx := s.dbClient.GetDB(txCtx)
 
-		// 1. 抽取当前批次中所有独特的机构名称
 		uniqueInstNames := make(map[string]bool)
 		var instBatch []entity.InstitutionInfo
 
@@ -238,19 +297,15 @@ func (s *CrawlerService) saveHoldingsBatch(ctx context.Context, data []EastMoney
 				uniqueInstNames[item.HolderName] = true
 				instBatch = append(instBatch, entity.InstitutionInfo{
 					InstName: item.HolderName,
-					InstType: s.identifyInstType(item.HolderName), // 自动识别国家队
+					InstType: s.identifyInstType(item.HolderName),
 				})
 			}
 		}
 
-		// 2. 批量 UPSERT 机构数据 (忽略已存在的)
 		if len(instBatch) > 0 {
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&instBatch, len(instBatch)).Error; err != nil {
-				return fmt.Errorf("批量写入机构维度表失败: %v", err)
-			}
+			tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&instBatch, len(instBatch))
 		}
 
-		// 3. 将机构名和对应的自增 ID 映射到内存中 (消除逐条查询的 N+1 性能瓶颈)
 		var namesList []string
 		for name := range uniqueInstNames {
 			namesList = append(namesList, name)
@@ -263,7 +318,6 @@ func (s *CrawlerService) saveHoldingsBatch(ctx context.Context, data []EastMoney
 			instIDMap[inst.InstName] = inst.InstID
 		}
 
-		// 4. 构建持仓流水批次
 		var recordBatch []entity.StockHoldingRecord
 		for _, item := range data {
 			instID, exists := instIDMap[item.HolderName]
@@ -286,9 +340,7 @@ func (s *CrawlerService) saveHoldingsBatch(ctx context.Context, data []EastMoney
 			})
 		}
 
-		// 5. 批量写入持仓流水 (相同股票、同一天、同一机构，则忽略)
 		if len(recordBatch) > 0 {
-			// 明确告诉 GORM 我们的联合唯一键是哪三个字段，MySQL 遇到冲突时会优雅地 Ignore
 			err := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{
 					{Name: "stock_code"},
@@ -299,7 +351,7 @@ func (s *CrawlerService) saveHoldingsBatch(ctx context.Context, data []EastMoney
 			}).CreateInBatches(&recordBatch, len(recordBatch)).Error
 
 			if err != nil {
-				return fmt.Errorf("批量写入持仓流水失败: %v", err)
+				return err
 			}
 		}
 
@@ -311,7 +363,6 @@ func (s *CrawlerService) saveHoldingsBatch(ctx context.Context, data []EastMoney
 // 5. 原子化底层辅助方法
 // =========================================================================
 
-// httpGet 统一网络请求封装
 func (s *CrawlerService) httpGet(ctx context.Context, targetURL, referer string) ([]byte, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0")
@@ -327,14 +378,10 @@ func (s *CrawlerService) httpGet(ctx context.Context, targetURL, referer string)
 	return io.ReadAll(resp.Body)
 }
 
-// fetchSinaIndustryMap 获取新浪行业板块映射
 func (s *CrawlerService) fetchSinaIndustryMap(ctx context.Context) map[string]string {
 	resultMap := make(map[string]string)
-
-	// 1. 获取行业大类节点
 	nodeResp, err := s.httpGet(ctx, "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodes", "")
 	if err != nil {
-		s.logger.Warn("获取新浪行业节点失败", slog.Any("err", err))
 		return resultMap
 	}
 
@@ -343,10 +390,9 @@ func (s *CrawlerService) fetchSinaIndustryMap(ctx context.Context) map[string]st
 		return resultMap
 	}
 
-	// 2. 遍历大类获取内部股票
 	for _, node := range nodes {
 		nodeID, nodeName := node[0], node[1]
-		if !strings.HasPrefix(nodeID, "hangye_") { // 仅筛选纯行业
+		if !strings.HasPrefix(nodeID, "hangye_") {
 			continue
 		}
 
@@ -366,13 +412,11 @@ func (s *CrawlerService) fetchSinaIndustryMap(ctx context.Context) map[string]st
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond) // 防止并发过高
+		time.Sleep(50 * time.Millisecond)
 	}
-
 	return resultMap
 }
 
-// identifyInstType 核心打标器：识别国家队
 func (s *CrawlerService) identifyInstType(name string) string {
 	keywords := []string{"中央汇金", "证金公司", "中国证券金融", "社保基金", "基本养老", "梧桐树"}
 	for _, k := range keywords {
@@ -383,18 +427,16 @@ func (s *CrawlerService) identifyInstType(name string) string {
 	return "普通机构"
 }
 
-// toTencentSymbol A 股代码转腾讯格式
-func (s *CrawlerService) toTencentSymbol(code string) string {
-	if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "9") {
-		return "sh" + code
+// toEastMoneySecID 转换股票代码为东方财富的市场ID格式 (1=沪, 0=深/北)
+func (s *CrawlerService) toEastMoneySecID(code string) string {
+	// 沪市 A 股、科创板通常是 6 开头
+	if strings.HasPrefix(code, "6") {
+		return "1." + code
 	}
-	if strings.HasPrefix(code, "4") || strings.HasPrefix(code, "8") {
-		return "bj" + code
-	}
-	return "sz" + code
+	// 深市(0, 3开头) 和 北交所(4, 8, 92开头) 在东财的标号中均算作 0
+	return "0." + code
 }
 
-// derefFloat 安全解引用浮点指针
 func (s *CrawlerService) derefFloat(f *float64) float64 {
 	if f == nil {
 		return 0
