@@ -36,6 +36,8 @@ func (r *Router) Register(app *fiber.App) {
 
 	strategyGroup := v1.Group("/strategy")
 	{
-		strategyGroup.Get("/golden-pit", r.params.StrategyHandler.GetGoldenPit)
+		// 挂载具体的 GET 接口
+		strategyGroup.Get("/national-team/heavy", r.params.StrategyHandler.HandleHeavyHoldings)
+		strategyGroup.Get("/national-team/golden-pit", r.params.StrategyHandler.HandleGoldenPit)
 	}
 }

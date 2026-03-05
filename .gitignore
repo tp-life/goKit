@@ -38,3 +38,4 @@ configs/config.yaml
 tmp/
 */node_modules
 .cursor
+.venv

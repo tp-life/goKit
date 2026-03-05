@@ -1,38 +1,65 @@
 package handler
 
 import (
+	"github.com/gofiber/fiber/v2"
+
 	"goKit/internal/application/service"
 	"goKit/internal/interface/http/response"
-
-	"github.com/gofiber/fiber/v2"
 )
 
+// StrategyHandler 策略接口处理器
 type StrategyHandler struct {
-	svc *service.StrategyService
+	strategyService *service.StrategyService
 }
 
-func NewStrategyHandler(svc *service.StrategyService) *StrategyHandler {
-	return &StrategyHandler{svc: svc}
-}
-
-func (h *StrategyHandler) GetGoldenPit(c *fiber.Ctx) error {
-	reportDate := c.Query("report_date")
-	if reportDate == "" {
-		// 缺少核心参数，直接阻断
-		return response.ErrBadRequest("report_date 参数不能为空")
+// NewStrategyHandler 构造函数
+func NewStrategyHandler(strategyService *service.StrategyService) *StrategyHandler {
+	return &StrategyHandler{
+		strategyService: strategyService,
 	}
+}
 
-	quarterStart := c.Query("quarter_start", "2023-07-01")
-	quarterEnd := c.Query("quarter_end", "2023-09-30")
+// =========================================================================
+// API 1: 获取国家队重仓股
+// GET /api/strategy/national-team/heavy?min_ratio=5.0&limit=50
+// =========================================================================
 
-	data, err := h.svc.FindGoldenPitStocks(c.UserContext(), reportDate, quarterStart, quarterEnd)
+func (h *StrategyHandler) HandleHeavyHoldings(c *fiber.Ctx) error {
+	// 1. 使用 Fiber 内置方法解析参数并赋默认值
+	// QueryFloat 和 QueryInt 会自动处理空值或解析失败的情况，直接返回默认值
+	minRatio := c.QueryFloat("min_ratio", 5.0)
+	limit := c.QueryInt("limit", 50)
+
+	// 2. 获取标准 context (Fiber 中传递给 GORM 等底层库应使用 UserContext)
+	ctx := c.UserContext()
+
+	// 3. 调用底层 Service
+	results, err := h.strategyService.GetNationalTeamHeavyHoldings(ctx, minRatio, limit)
 	if err != nil {
-		// 数据库异常或策略引擎报错
-		return response.ErrInternal(err, "策略引擎计算异常: "+err.Error())
+		// 采用统一 response 包构建错误返回
+		return response.ErrInternal(err, "获取国家队重仓股失败: ")
 	}
 
-	return response.Success(c, fiber.Map{
-		"list":  data,
-		"total": len(data),
-	})
+	// 4. 采用统一 response 包构建成功返回
+	return response.Success(c, results)
+}
+
+// =========================================================================
+// API 2: 获取国家队“黄金坑” (持仓高 + 股价低)
+// GET /api/strategy/national-team/golden-pit?min_ratio=2.0
+// =========================================================================
+
+func (h *StrategyHandler) HandleGoldenPit(c *fiber.Ctx) error {
+	// 1. 解析参数
+	minRatio := c.QueryFloat("min_ratio", 2.0)
+
+	// 2. 调用底层 Service
+	ctx := c.UserContext()
+	results, err := h.strategyService.GetNationalTeamGoldenPit(ctx, minRatio)
+	if err != nil {
+		return response.ErrInternal(err, "分析黄金坑标的失败: ")
+	}
+
+	// 3. 返回成功响应
+	return response.Success(c, results)
 }
