@@ -60,11 +60,25 @@ basisBps = |shortBid - longAsk| / longAsk * 10000
 5. 状态判定顺序：
 - 数据是否过期；
 - funding carry 是否正；
-- basis 是否超阈值；
+- basis 是否超过“动态阈值”（基础阈值按持有时长可放宽）；
 - net pnl 是否过最小门槛；
 - 是否在 entry window。
 
 ---
+
+
+## 3.1 动态 Basis 阈值（持有越久，允许略大价差）
+
+为贴合 carry 策略，系统将 basis 阈值从固定值升级为动态值：
+
+```text
+allowedBasisBps = max_spread_bps * (1 + (dynamic_max_spread_multiplier - 1) * clamp(funding_window_hours / dynamic_max_spread_reference_hours, 0, 1))
+```
+
+含义：
+- 短窗口机会接近基础阈值 `max_spread_bps`；
+- 持有窗口越长，阈值可线性放宽；
+- 但不会超过 `max_spread_bps * dynamic_max_spread_multiplier`。
 
 ## 4. 方向选择逻辑（bestFundingDirection）
 

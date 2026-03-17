@@ -85,8 +85,13 @@ strategy:
 
   # 行情最大允许延迟（超过则判为 stale）。
   max_data_age: 15s
-  # 跨所 basis 超过该阈值则不做（bps）。
+  # 跨所 basis 基础阈值（bps）。
+  # 注意：实际可用阈值会按持有时长做动态放宽（见下面两个参数）。
   max_spread_bps: 12
+  # 动态阈值最大放大倍数：最终阈值不会超过 max_spread_bps * 该倍数。
+  dynamic_max_spread_multiplier: 1.5
+  # 动态阈值参考持有时长（小时）：funding_window_hours 达到该值时放大到上限。
+  dynamic_max_spread_reference_hours: 24
 
   # 开仓窗口上边界：距离 required_entry_by 最多提前多久允许开仓。
   entry_lead_time: 180s
