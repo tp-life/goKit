@@ -257,9 +257,15 @@ function strategyTargetNotional() {
   return Number(state.system?.strategy?.effective_notional || 0);
 }
 
+function maxAllowedBasisForItem(item) {
+  const dynamic = Number(item?.max_allowed_basis_bps || 0);
+  if (Number.isFinite(dynamic) && dynamic > 0) return dynamic;
+  return strategyMaxSpreadBps();
+}
+
 function basisDecisionText(item) {
   const basis = Number(item?.basis_bps || 0);
-  const maxSpread = strategyMaxSpreadBps();
+  const maxSpread = maxAllowedBasisForItem(item);
   if (!Number.isFinite(maxSpread) || maxSpread <= 0) {
     return `当前 Basis=${fmtSignedBps(basis, 2)}（未配置阈值）`;
   }
@@ -942,6 +948,7 @@ function renderOpportunityDetail(items) {
         ${detailMetric("资金费率差", fmtPctRatio(fundingDelta, 5), classForNumber(fundingDelta))}
         ${detailMetric("事件化时均 edge", fmtPctRatio(hourlyDelta, 5), classForNumber(hourlyDelta))}
         ${detailMetric("Basis", fmtSignedBps(item.basis_bps, 2))}
+        ${detailMetric("动态价差阈值", fmtSignedBps(maxAllowedBasisForItem(item), 2))}
         ${detailMetric("资金收益", fmtMoney(item.gross_funding_pnl), classForNumber(item.gross_funding_pnl))}
         ${detailMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${detailMetric("预计投入资金", matchedPlan ? fmtMoney(planCapitalAllocated(matchedPlan), 2) : "--")}
@@ -992,7 +999,7 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">Short 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planShortNotional(matchedPlan), 2) : "--"}</span></div>
             <div class="detail-item"><span class="detail-k">机会拒绝原因</span><span class="detail-v">${item.reject_reason || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">跨所价差判定</span><span class="detail-v">${basisDecisionText(item)}</span></div>
-            <div class="detail-item"><span class="detail-k">跨所价差阈值</span><span class="detail-v">${fmtSignedBps(strategyMaxSpreadBps(), 2)}</span></div>
+            <div class="detail-item"><span class="detail-k">跨所价差阈值</span><span class="detail-v">${fmtSignedBps(maxAllowedBasisForItem(item), 2)}</span></div>
             <div class="detail-item"><span class="detail-k">是否可执行</span><span class="detail-v">${item.eligible_for_execution ? "是" : "否"}</span></div>
             <div class="detail-item"><span class="detail-k">最早结算时间</span><span class="detail-v">${fmtTime(item.earliest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">最晚结算时间</span><span class="detail-v">${fmtTime(item.latest_funding_time_ms)}</span></div>
@@ -1003,7 +1010,7 @@ function renderOpportunityDetail(items) {
           </div>
           <div class="insight-box">
             <div class="insight-title">怎么看这组机会</div>
-            <div class="insight-text">方向不是固定死的。系统会在每次刷新时，把“Long A / Short B”和“Long B / Short A”两个方向都完整计算一遍，再选当前更优的方向展示。Funding 收益也不再按统一小时平均外推，而是按当前已知的真实 funding 结算事件逐腿估算。状态里“跨所价差过大”表示当前 Basis（shortBid 与 longAsk 的相对偏离）超过策略阈值 \`max_spread_bps\`，为避免入场成本吞噬 funding 收益会被拦截。若后续 funding 或 basis 变化导致反方向更优，下一轮机会就会切换成反方向。</div>
+            <div class="insight-text">方向不是固定死的。系统会在每次刷新时，把“Long A / Short B”和“Long B / Short A”两个方向都完整计算一遍，再选当前更优的方向展示。Funding 收益也不再按统一小时平均外推，而是按当前已知的真实 funding 结算事件逐腿估算。状态里“跨所价差过大”表示当前 Basis（shortBid 与 longAsk 的相对偏离）超过动态阈值（基础阈值 \`max_spread_bps\` 按持有时长可放宽），为避免入场成本吞噬 funding 收益会被拦截。若后续 funding 或 basis 变化导致反方向更优，下一轮机会就会切换成反方向。</div>
           </div>
         </div>
       </div>

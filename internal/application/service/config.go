@@ -35,6 +35,8 @@ type Config struct {
 	ExitMode                       string        `mapstructure:"exit_mode"`
 	MaxDataAge                     time.Duration `mapstructure:"max_data_age"`
 	MaxSpreadBps                   float64       `mapstructure:"max_spread_bps"`
+	DynamicMaxSpreadMultiplier     float64       `mapstructure:"dynamic_max_spread_multiplier"`
+	DynamicMaxSpreadReferenceHours float64       `mapstructure:"dynamic_max_spread_reference_hours"`
 	EntryLeadTime                  time.Duration `mapstructure:"entry_lead_time"`
 	EntryCutoffTime                time.Duration `mapstructure:"entry_cutoff_time"`
 	SnapshotPersistInterval        time.Duration `mapstructure:"snapshot_persist_interval"`
@@ -149,6 +151,12 @@ func (c Config) normalize() Config {
 	}
 	if c.MaxSpreadBps <= 0 {
 		c.MaxSpreadBps = 12
+	}
+	if c.DynamicMaxSpreadMultiplier < 1 {
+		c.DynamicMaxSpreadMultiplier = 1.5
+	}
+	if c.DynamicMaxSpreadReferenceHours <= 0 {
+		c.DynamicMaxSpreadReferenceHours = c.HoldHours
 	}
 	if c.EntryLeadTime <= 0 {
 		c.EntryLeadTime = 3 * time.Minute

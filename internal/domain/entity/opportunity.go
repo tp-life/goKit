@@ -32,14 +32,15 @@ type Opportunity struct {
 	LongMarkPrice  float64 `json:"long_mark_price"`
 	ShortMarkPrice float64 `json:"short_mark_price"`
 
-	GrossFundingPNL float64 `json:"gross_funding_pnl"`
-	EntryFeePNL     float64 `json:"entry_fee_pnl"`
-	ExitFeePNL      float64 `json:"exit_fee_pnl"`
-	SlippagePNL     float64 `json:"slippage_pnl"`
-	SafetyBufferPNL float64 `json:"safety_buffer_pnl"`
-	NetExpectedPNL  float64 `json:"net_expected_pnl"`
-	NetExpectedBps  float64 `json:"net_expected_bps"`
-	BasisBps        float64 `json:"basis_bps"`
+	GrossFundingPNL    float64 `json:"gross_funding_pnl"`
+	EntryFeePNL        float64 `json:"entry_fee_pnl"`
+	ExitFeePNL         float64 `json:"exit_fee_pnl"`
+	SlippagePNL        float64 `json:"slippage_pnl"`
+	SafetyBufferPNL    float64 `json:"safety_buffer_pnl"`
+	NetExpectedPNL     float64 `json:"net_expected_pnl"`
+	NetExpectedBps     float64 `json:"net_expected_bps"`
+	BasisBps           float64 `json:"basis_bps"`
+	MaxAllowedBasisBps float64 `json:"max_allowed_basis_bps"`
 
 	Score float64 `json:"score"`
 

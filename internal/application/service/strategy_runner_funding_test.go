@@ -111,3 +111,24 @@ func TestFundingRateEventMultiplier_Decay(t *testing.T) {
 		t.Fatalf("expected no-decay multiplier 5, got %.8f", noDecay)
 	}
 }
+
+func TestAllowedBasisThresholdBps_GrowsWithWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{MaxSpreadBps: 10, DynamicMaxSpreadMultiplier: 2, DynamicMaxSpreadReferenceHours: 20}}
+	shortWindow := r.allowedBasisThresholdBps(fundingProjection{FundingWindowHours: 2})
+	if shortWindow <= 10 || shortWindow >= 12 {
+		t.Fatalf("expected short window threshold around 11, got %.4f", shortWindow)
+	}
+	longWindow := r.allowedBasisThresholdBps(fundingProjection{FundingWindowHours: 20})
+	if longWindow != 20 {
+		t.Fatalf("expected long window threshold at cap 20, got %.4f", longWindow)
+	}
+}
+
+func TestAllowedPlanBasisThresholdBps_UsesOpportunityValue(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{MaxSpreadBps: 10, DynamicMaxSpreadMultiplier: 2, DynamicMaxSpreadReferenceHours: 20}}
+	opp := entity.Opportunity{MaxAllowedBasisBps: 18, FundingWindowHours: 2}
+	got := r.allowedPlanBasisThresholdBps(opp)
+	if got != 18 {
+		t.Fatalf("expected plan threshold to respect opportunity value 18, got %.4f", got)
+	}
+}

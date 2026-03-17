@@ -579,7 +579,8 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 				if longBook.AskPrice > 0 {
 					basisBps = absFloat(shortBook.BidPrice-longBook.AskPrice) / longBook.AskPrice * 10000
 				}
-				status, reason, eligible := r.evaluateOpportunity(now, projection, netExpectedPNL, basisBps, longFunding, shortFunding, longBook, shortBook)
+				maxAllowedBasisBps := r.allowedBasisThresholdBps(projection)
+				status, reason, eligible := r.evaluateOpportunity(now, projection, netExpectedPNL, basisBps, maxAllowedBasisBps, longFunding, shortFunding, longBook, shortBook)
 				items = append(items, entity.Opportunity{
 					BatchID:                      "",
 					AsOfTimeMs:                   now.UnixMilli(),
@@ -611,6 +612,7 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					NetExpectedPNL:               netExpectedPNL,
 					NetExpectedBps:               netExpectedBps,
 					BasisBps:                     basisBps,
+					MaxAllowedBasisBps:           maxAllowedBasisBps,
 					Score:                        r.scoreOpportunity(netExpectedPNL, grossEdgeHourly, basisBps),
 					EarliestFundingTimeMs:        minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
 					LatestFundingTimeMs:          maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
@@ -635,6 +637,36 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 	return items
 }
 
+func (r *StrategyRunner) allowedBasisThresholdBps(projection fundingProjection) float64 {
+	base := r.cfg.MaxSpreadBps
+	if base <= 0 {
+		base = 12
+	}
+	multiplier := r.cfg.DynamicMaxSpreadMultiplier
+	if multiplier < 1 {
+		multiplier = 1
+	}
+	refHours := r.cfg.DynamicMaxSpreadReferenceHours
+	if refHours <= 0 {
+		refHours = r.cfg.HoldHours
+	}
+	if refHours <= 0 {
+		return base
+	}
+	windowHours := projection.FundingWindowHours
+	if windowHours < 0 {
+		windowHours = 0
+	}
+	ratio := windowHours / refHours
+	if ratio > 1 {
+		ratio = 1
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	return base * (1 + (multiplier-1)*ratio)
+}
+
 // evaluateOpportunity 将“收益估算”转成“可执行状态”。
 //
 // 判定顺序是刻意设计的：
@@ -643,15 +675,15 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 // 3) basis 限制：避免靠 funding 赚的钱被入场基差吞掉；
 // 4) min net pnl：统一门槛；
 // 5) entry window：确保在计划结算前仍有可执行性。
-func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingProjection, netExpectedPNL float64, basisBps float64, longFunding, shortFunding entity.FundingSnapshot, longBook, shortBook entity.BookTopSnapshot) (string, string, bool) {
+func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingProjection, netExpectedPNL float64, basisBps float64, maxAllowedBasisBps float64, longFunding, shortFunding entity.FundingSnapshot, longBook, shortBook entity.BookTopSnapshot) (string, string, bool) {
 	if r.isSnapshotStale(now, longFunding.EventTimeMs) || r.isSnapshotStale(now, shortFunding.EventTimeMs) || r.isSnapshotStale(now, longBook.EventTimeMs) || r.isSnapshotStale(now, shortBook.EventTimeMs) {
 		return OpportunityStatusStaleData, "market data is stale", false
 	}
 	if projection.CarryRate <= 0 {
 		return OpportunityStatusSpreadTooSmall, "event-based funding carry is not positive", false
 	}
-	if basisBps > r.cfg.MaxSpreadBps {
-		return OpportunityStatusBasisTooWide, fmt.Sprintf("basis %.4f bps > max %.4f bps", basisBps, r.cfg.MaxSpreadBps), false
+	if basisBps > maxAllowedBasisBps {
+		return OpportunityStatusBasisTooWide, fmt.Sprintf("basis %.4f bps > dynamic max %.4f bps", basisBps, maxAllowedBasisBps), false
 	}
 	if netExpectedPNL < r.cfg.MinNetPNL {
 		return OpportunityStatusNotProfitable, fmt.Sprintf("net pnl %.4f < min %.4f", netExpectedPNL, r.cfg.MinNetPNL), false
