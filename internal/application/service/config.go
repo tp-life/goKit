@@ -44,6 +44,13 @@ type Config struct {
 	BookSnapshotMinPriceChangeBps  float64       `mapstructure:"book_snapshot_min_price_change_bps"`
 	BookSnapshotMinQtyChangeRatio  float64       `mapstructure:"book_snapshot_min_qty_change_ratio"`
 	OpportunityCalcInterval        time.Duration `mapstructure:"opportunity_calc_interval"`
+	// FundingRateContinuationDecay 控制“在同一持仓窗口内，对同一腿未来第2次及以后 funding 事件”的费率衰减。
+	//
+	// 取值建议：
+	//   = 1.0 : 不衰减（线性外推，激进）
+	//   (0,1): 几何衰减（更保守，降低对当前极值费率的过拟合）
+	//   <=0 或 >1: 使用默认值
+	FundingRateContinuationDecay float64 `mapstructure:"funding_rate_continuation_decay"`
 	// DynamicCandidateLimit 控制“动态候选深扫池”的大小。
 	//
 	// 取值约定：
@@ -116,6 +123,9 @@ func (c Config) normalize() Config {
 	}
 	if c.OpportunityCalcInterval <= 0 {
 		c.OpportunityCalcInterval = 5 * time.Second
+	}
+	if c.FundingRateContinuationDecay <= 0 || c.FundingRateContinuationDecay > 1 {
+		c.FundingRateContinuationDecay = 0.6
 	}
 	// DynamicCandidateLimit = 0 表示“全量候选都允许进入深扫池”，
 	// 因此这里不能再把 0 自动改写成 30。
