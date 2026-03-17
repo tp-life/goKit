@@ -60,7 +60,9 @@ async function apiGet(path, fallback = null) {
     const res = await fetch(path, { headers: { Accept: "application/json" } });
     if (!res.ok) return fallback;
     const json = await res.json();
-    return json && typeof json === "object" && "data" in json ? json.data : json;
+    return json && typeof json === "object" && "data" in json
+      ? json.data
+      : json;
   } catch (err) {
     console.warn("api get failed", path, err);
     return fallback;
@@ -148,8 +150,10 @@ function classForNumber(value) {
 
 function statusClass(status) {
   const st = String(status || "").toLowerCase();
-  if (["eligible", "ready", "opened", "dry_run_opened"].includes(st)) return "good";
-  if (["watching", "outside_entry_window", "stale_data"].includes(st)) return "warn";
+  if (["eligible", "ready", "opened", "dry_run_opened"].includes(st))
+    return "good";
+  if (["watching", "outside_entry_window", "stale_data"].includes(st))
+    return "warn";
   return "bad";
 }
 
@@ -160,7 +164,8 @@ function boolText(value) {
 function midpoint(bid, ask) {
   const b = Number(bid);
   const a = Number(ask);
-  if (!Number.isFinite(b) || !Number.isFinite(a) || b <= 0 || a <= 0) return null;
+  if (!Number.isFinite(b) || !Number.isFinite(a) || b <= 0 || a <= 0)
+    return null;
   return (b + a) / 2;
 }
 
@@ -202,7 +207,9 @@ function opportunityDirection(item) {
 }
 
 function fundingSpread(item) {
-  return Number(item.short_funding_rate || 0) - Number(item.long_funding_rate || 0);
+  return (
+    Number(item.short_funding_rate || 0) - Number(item.long_funding_rate || 0)
+  );
 }
 
 function fundingSpreadHourly(item) {
@@ -211,7 +218,8 @@ function fundingSpreadHourly(item) {
 
 function fundingModeText(item) {
   const mode = String(item?.funding_computation_mode || "").toLowerCase();
-  if (mode === "event_based_known_next_funding") return "按真实已知 funding 事件计算";
+  if (mode === "event_based_known_next_funding")
+    return "按真实已知 funding 事件计算";
   return mode || "--";
 }
 
@@ -220,7 +228,6 @@ function fundingEventsText(item) {
   const shortCount = Number(item?.short_funding_event_count || 0);
   return `Long ${longCount} 次 / Short ${shortCount} 次`;
 }
-
 
 function holdingDurationText(item) {
   if (!item || typeof item !== "object") return "--";
@@ -235,7 +242,6 @@ function holdingDurationText(item) {
   }
   return "--";
 }
-
 
 function fundingIntervalText(hours) {
   const h = Number(hours || 0);
@@ -257,15 +263,21 @@ function basisDecisionText(item) {
   if (!Number.isFinite(maxSpread) || maxSpread <= 0) {
     return `当前 Basis=${fmtSignedBps(basis, 2)}（未配置阈值）`;
   }
-  return `当前 Basis=${fmtSignedBps(basis, 2)}，阈值=${fmtSignedBps(maxSpread, 2)}，${basis > maxSpread ? '已超限' : '未超限'}`;
+  return `当前 Basis=${fmtSignedBps(basis, 2)}，阈值=${fmtSignedBps(maxSpread, 2)}，${basis > maxSpread ? "已超限" : "未超限"}`;
 }
 
 function targetNotionalText(item, matchedPlan) {
-  const planNotional = Number(matchedPlan?.target_notional_usdt || matchedPlan?.rounded_notional_usdt || 0);
-  if (Number.isFinite(planNotional) && planNotional > 0) return fmtMoney(planNotional, 2);
+  const planNotional = Number(
+    matchedPlan?.target_notional_usdt ||
+      matchedPlan?.rounded_notional_usdt ||
+      0,
+  );
+  if (Number.isFinite(planNotional) && planNotional > 0)
+    return fmtMoney(planNotional, 2);
   const fallback = strategyTargetNotional();
-  if (Number.isFinite(fallback) && fallback > 0) return `${fmtMoney(fallback, 2)}（策略配置）`;
-  return '--';
+  if (Number.isFinite(fallback) && fallback > 0)
+    return `${fmtMoney(fallback, 2)}（策略配置）`;
+  return "--";
 }
 
 // ------------------------------------------------------------
@@ -278,16 +290,18 @@ function matchingPlansForOpportunity(item) {
   return (state.plans || []).filter((plan) => {
     if (!plan) return false;
     const sameCore =
-      String(plan.symbol || '') === String(item.symbol || '') &&
-      String(plan.long_exchange || '') === String(item.long_exchange || '') &&
-      String(plan.short_exchange || '') === String(item.short_exchange || '') &&
-      String(plan.long_venue_symbol || '') === String(item.long_venue_symbol || '') &&
-      String(plan.short_venue_symbol || '') === String(item.short_venue_symbol || '');
+      String(plan.symbol || "") === String(item.symbol || "") &&
+      String(plan.long_exchange || "") === String(item.long_exchange || "") &&
+      String(plan.short_exchange || "") === String(item.short_exchange || "") &&
+      String(plan.long_venue_symbol || "") ===
+        String(item.long_venue_symbol || "") &&
+      String(plan.short_venue_symbol || "") ===
+        String(item.short_venue_symbol || "");
     if (!sameCore) return false;
 
     // 如果后端同时返回了机会批次和计划关联批次，则优先按批次收紧匹配。
-    const oppBatch = String(item.batch_id || '');
-    const planOppBatch = String(plan.opportunity_batch_id || '');
+    const oppBatch = String(item.batch_id || "");
+    const planOppBatch = String(plan.opportunity_batch_id || "");
     if (oppBatch && planOppBatch) return oppBatch === planOppBatch;
     return true;
   });
@@ -297,7 +311,8 @@ function bestPlanForOpportunity(item) {
   const plans = matchingPlansForOpportunity(item);
   if (!plans.length) return null;
   plans.sort((a, b) => {
-    if (Boolean(b.ready_now) !== Boolean(a.ready_now)) return Number(Boolean(b.ready_now)) - Number(Boolean(a.ready_now));
+    if (Boolean(b.ready_now) !== Boolean(a.ready_now))
+      return Number(Boolean(b.ready_now)) - Number(Boolean(a.ready_now));
     return Number(b.net_expected_pnl || 0) - Number(a.net_expected_pnl || 0);
   });
   return plans[0];
@@ -307,20 +322,24 @@ function matchingOpportunityForPlan(plan) {
   if (!plan) return null;
   const matches = (state.opportunities || []).filter((item) => {
     const sameCore =
-      String(plan.symbol || '') === String(item.symbol || '') &&
-      String(plan.long_exchange || '') === String(item.long_exchange || '') &&
-      String(plan.short_exchange || '') === String(item.short_exchange || '') &&
-      String(plan.long_venue_symbol || '') === String(item.long_venue_symbol || '') &&
-      String(plan.short_venue_symbol || '') === String(item.short_venue_symbol || '');
+      String(plan.symbol || "") === String(item.symbol || "") &&
+      String(plan.long_exchange || "") === String(item.long_exchange || "") &&
+      String(plan.short_exchange || "") === String(item.short_exchange || "") &&
+      String(plan.long_venue_symbol || "") ===
+        String(item.long_venue_symbol || "") &&
+      String(plan.short_venue_symbol || "") ===
+        String(item.short_venue_symbol || "");
     if (!sameCore) return false;
 
-    const oppBatch = String(item.batch_id || '');
-    const planOppBatch = String(plan.opportunity_batch_id || '');
+    const oppBatch = String(item.batch_id || "");
+    const planOppBatch = String(plan.opportunity_batch_id || "");
     if (oppBatch && planOppBatch) return oppBatch === planOppBatch;
     return true;
   });
   if (!matches.length) return null;
-  matches.sort((a, b) => Number(b.net_expected_pnl || 0) - Number(a.net_expected_pnl || 0));
+  matches.sort(
+    (a, b) => Number(b.net_expected_pnl || 0) - Number(a.net_expected_pnl || 0),
+  );
   return matches[0];
 }
 
@@ -340,15 +359,31 @@ function opportunityPriority(item) {
 function opportunityPlanStatus(item) {
   const plan = bestPlanForOpportunity(item);
   if (plan && plan.ready_now) {
-    return { text: '已进入执行计划', cls: 'good', reason: `planKey=${plan.plan_key} · 已就绪` };
+    return {
+      text: "已进入执行计划",
+      cls: "good",
+      reason: `planKey=${plan.plan_key} · 已就绪`,
+    };
   }
   if (plan) {
-    return { text: '已生成计划', cls: 'warn', reason: `planKey=${plan.plan_key} · status=${plan.status || '--'}` };
+    return {
+      text: "已生成计划",
+      cls: "warn",
+      reason: `planKey=${plan.plan_key} · status=${plan.status || "--"}`,
+    };
   }
   if (item.eligible_for_execution) {
-    return { text: '可进入计划', cls: 'good', reason: '满足机会筛选，但最新计划批次中暂未命中。' };
+    return {
+      text: "可进入计划",
+      cls: "good",
+      reason: "满足机会筛选，但最新计划批次中暂未命中。",
+    };
   }
-  return { text: '未进入计划', cls: 'bad', reason: item.reject_reason || explainStatus(item.status) };
+  return {
+    text: "未进入计划",
+    cls: "bad",
+    reason: item.reject_reason || explainStatus(item.status),
+  };
 }
 
 function explainStatus(status) {
@@ -377,7 +412,9 @@ function explainStatus(status) {
 
 function selectedOpportunity(items) {
   if (!items.length) return null;
-  const found = items.find((item) => opportunityKey(item) === state.selectedOpportunityKey);
+  const found = items.find(
+    (item) => opportunityKey(item) === state.selectedOpportunityKey,
+  );
   if (found) {
     syncSelectedPlanFromOpportunity(found);
     return found;
@@ -410,32 +447,49 @@ function renderOverview() {
 
   els.strategySummary.innerHTML = [
     infoCell("策略开关", boolText(strategy.enabled)),
-    infoCell("总资金", `${fmtNumber(strategy.capital_total_usdt || 0, 2)} USDT`),
+    infoCell(
+      "总资金",
+      `${fmtNumber(strategy.capital_total_usdt || 0, 2)} USDT`,
+    ),
     infoCell("资金利用率", fmtPctRatio(strategy.capital_utilization || 0, 2)),
-    infoCell("有效名义价值", `${fmtNumber(strategy.effective_notional || 0, 2)} USDT`),
+    infoCell(
+      "有效名义价值",
+      `${fmtNumber(strategy.effective_notional || 0, 2)} USDT`,
+    ),
     infoCell("杠杆", `${fmtNumber(strategy.leverage || 0, 2)}x`),
     infoCell("最小净收益", `${fmtNumber(strategy.min_net_pnl || 0, 3)} USDT`),
     infoCell("最大价差", fmtSignedBps(strategy.max_spread_bps || 0, 2)),
     infoCell("最大数据年龄", strategy.max_data_age || "--"),
     infoCell("入场提前", strategy.entry_lead_time || "--"),
-    infoCell("入场截止", strategy.entry_cutoff_time || "--")
+    infoCell("入场截止", strategy.entry_cutoff_time || "--"),
   ].join("");
 
   els.executionSummary.innerHTML = [
-    infoCell("实盘开关", boolText(execution.live_trading_enabled), execution.live_trading_enabled ? "warn" : "good"),
+    infoCell(
+      "实盘开关",
+      boolText(execution.live_trading_enabled),
+      execution.live_trading_enabled ? "warn" : "good",
+    ),
     infoCell("自动开仓", boolText(execution.auto_entry)),
     infoCell("自动平仓", boolText(execution.auto_close)),
     infoCell("轮询间隔", execution.loop_interval || "--"),
     infoCell("平仓保护期", execution.close_grace_period || "--"),
-    infoCell("最新计划窗口", String(execution.max_latest_plans || 0))
+    infoCell("最新计划窗口", String(execution.max_latest_plans || 0)),
   ].join("");
 }
 
 function renderMetrics() {
   els.metricOpps.textContent = String(state.opportunities.length || 0);
-  els.metricReady.textContent = String(state.opportunities.filter((item) => item.eligible_for_execution).length || 0);
-  els.metricFunding.textContent = String(state.stats?.funding_count_24h ?? state.stats?.funding_snapshots_24h ?? 0);
-  els.metricBook.textContent = String(state.stats?.book_top_count_24h ?? state.stats?.book_top_snapshots_24h ?? 0);
+  els.metricReady.textContent = String(
+    state.opportunities.filter((item) => item.eligible_for_execution).length ||
+      0,
+  );
+  els.metricFunding.textContent = String(
+    state.stats?.funding_count_24h ?? state.stats?.funding_snapshots_24h ?? 0,
+  );
+  els.metricBook.textContent = String(
+    state.stats?.book_top_count_24h ?? state.stats?.book_top_snapshots_24h ?? 0,
+  );
 }
 
 function renderSystem() {
@@ -457,7 +511,8 @@ function renderSystem() {
           </div>
         `;
       })
-      .join("") || '<div class="empty-state show">当前还没有 connector 状态。</div>';
+      .join("") ||
+    '<div class="empty-state show">当前还没有 connector 状态。</div>';
 }
 
 // ------------------------------------------------------------
@@ -467,7 +522,9 @@ function renderSystem() {
 function renderMarket(snapshot) {
   const funding = normalizeFundingMap(snapshot);
   const bookTop = normalizeBookMap(snapshot);
-  const exchanges = Array.from(new Set([...Object.keys(funding), ...Object.keys(bookTop)])).sort();
+  const exchanges = Array.from(
+    new Set([...Object.keys(funding), ...Object.keys(bookTop)]),
+  ).sort();
   els.activeSymbolLabel.textContent = state.activeSymbol;
 
   els.marketCards.innerHTML =
@@ -489,7 +546,8 @@ function renderMarket(snapshot) {
           </div>
         `;
       })
-      .join("") || '<div class="empty-state show">当前交易对还没有市场快照。</div>';
+      .join("") ||
+    '<div class="empty-state show">当前交易对还没有市场快照。</div>';
 }
 
 // ------------------------------------------------------------
@@ -499,7 +557,12 @@ function renderMarket(snapshot) {
 // 前端这里统一做兼容和兜底，避免页面显示为空。
 // ------------------------------------------------------------
 function planCapitalAllocated(plan) {
-  return Number(plan?.capital_allocated_usdt ?? plan?.estimated_margin_usdt ?? plan?.margin_required_usdt ?? 0);
+  return Number(
+    plan?.capital_allocated_usdt ??
+      plan?.estimated_margin_usdt ??
+      plan?.margin_required_usdt ??
+      0,
+  );
 }
 
 function planTargetLeverage(plan) {
@@ -507,11 +570,15 @@ function planTargetLeverage(plan) {
 }
 
 function planLongLeverage(plan) {
-  return Number(plan?.long_leverage ?? plan?.target_leverage ?? plan?.leverage ?? 0);
+  return Number(
+    plan?.long_leverage ?? plan?.target_leverage ?? plan?.leverage ?? 0,
+  );
 }
 
 function planShortLeverage(plan) {
-  return Number(plan?.short_leverage ?? plan?.target_leverage ?? plan?.leverage ?? 0);
+  return Number(
+    plan?.short_leverage ?? plan?.target_leverage ?? plan?.leverage ?? 0,
+  );
 }
 
 function planLongNotional(plan) {
@@ -537,7 +604,7 @@ function planPositionSkewBps(plan) {
   const shortNotional = planShortNotional(plan);
   const avg = (Math.abs(longNotional) + Math.abs(shortNotional)) / 2;
   if (!avg) return null;
-  return Math.abs(longNotional - shortNotional) / avg * 10000;
+  return (Math.abs(longNotional - shortNotional) / avg) * 10000;
 }
 
 // ------------------------------------------------------------
@@ -545,8 +612,17 @@ function planPositionSkewBps(plan) {
 // ------------------------------------------------------------
 function renderExecutionControls(planKey, status) {
   const st = String(status || "").toLowerCase();
-  const openDisabled = ["opened", "dry_run_opened", "closed", "dry_run_closed"].includes(st) ? "disabled" : "";
-  const closeDisabled = ["closed", "dry_run_closed"].includes(st) ? "disabled" : "";
+  const openDisabled = [
+    "opened",
+    "dry_run_opened",
+    "closed",
+    "dry_run_closed",
+  ].includes(st)
+    ? "disabled"
+    : "";
+  const closeDisabled = ["closed", "dry_run_closed"].includes(st)
+    ? "disabled"
+    : "";
   return `
     <div class="hero-actions compact-actions">
       <button class="btn btn-secondary" data-action="open" data-plan-key="${planKey}" ${openDisabled}>手动开仓</button>
@@ -560,38 +636,44 @@ function renderPlans() {
     els.plansEmpty.style.display = "block";
     els.plansEmpty.textContent = state.currentOpportunityBatchId
       ? `当前机会批次（${state.currentOpportunityBatchId}）下没有可展示的执行计划。`
-      : '当前没有执行计划。';
+      : "当前没有执行计划。";
     els.plansList.innerHTML = "";
     return;
   }
 
   const sortedPlans = [...state.plans].sort((a, b) => {
-    const aSelected = String(a.plan_key || '') === String(state.selectedPlanKey || '');
-    const bSelected = String(b.plan_key || '') === String(state.selectedPlanKey || '');
+    const aSelected =
+      String(a.plan_key || "") === String(state.selectedPlanKey || "");
+    const bSelected =
+      String(b.plan_key || "") === String(state.selectedPlanKey || "");
     if (aSelected !== bSelected) return Number(bSelected) - Number(aSelected);
-    if (Boolean(b.ready_now) !== Boolean(a.ready_now)) return Number(Boolean(b.ready_now)) - Number(Boolean(a.ready_now));
+    if (Boolean(b.ready_now) !== Boolean(a.ready_now))
+      return Number(Boolean(b.ready_now)) - Number(Boolean(a.ready_now));
     return Number(b.net_expected_pnl || 0) - Number(a.net_expected_pnl || 0);
   });
 
   els.plansEmpty.style.display = "none";
   const batchBanner = state.currentOpportunityBatchId
     ? `<div class="plan-batch-banner">当前执行计划已按机会批次对齐：<strong>${state.currentOpportunityBatchId}</strong></div>`
-    : '';
-  els.plansList.innerHTML = batchBanner + sortedPlans
-    .map((item) => {
-      const selected = String(item.plan_key || '') === String(state.selectedPlanKey || '');
-      const linkedOpp = matchingOpportunityForPlan(item);
-      const linkedOppKey = linkedOpp ? opportunityKey(linkedOpp) : '';
-      const positionSkew = planPositionSkewBps(item);
-      const capitalAllocated = planCapitalAllocated(item);
-      const targetLeverage = planTargetLeverage(item);
-      const longLeverage = planLongLeverage(item);
-      const shortLeverage = planShortLeverage(item);
-      const longNotional = planLongNotional(item);
-      const shortNotional = planShortNotional(item);
+    : "";
+  els.plansList.innerHTML =
+    batchBanner +
+    sortedPlans
+      .map((item) => {
+        const selected =
+          String(item.plan_key || "") === String(state.selectedPlanKey || "");
+        const linkedOpp = matchingOpportunityForPlan(item);
+        const linkedOppKey = linkedOpp ? opportunityKey(linkedOpp) : "";
+        const positionSkew = planPositionSkewBps(item);
+        const capitalAllocated = planCapitalAllocated(item);
+        const targetLeverage = planTargetLeverage(item);
+        const longLeverage = planLongLeverage(item);
+        const shortLeverage = planShortLeverage(item);
+        const longNotional = planLongNotional(item);
+        const shortNotional = planShortNotional(item);
 
-      return `
-        <div class="plan-card clickable ${selected ? 'active' : ''}" data-plan-select="1" data-plan-key="${item.plan_key}" data-opportunity-key="${linkedOppKey}">
+        return `
+        <div class="plan-card clickable ${selected ? "active" : ""}" data-plan-select="1" data-plan-key="${item.plan_key}" data-opportunity-key="${linkedOppKey}">
           <div class="plan-head">
             <div>
               <div class="plan-title">${item.symbol} · ${item.long_exchange} long / ${item.short_exchange} short</div>
@@ -608,13 +690,13 @@ function renderPlans() {
             <div><span>目标杠杆</span><strong>${fmtNumber(targetLeverage, 2)}x</strong></div>
             <div><span>Long 仓位名义</span><strong>${fmtMoney(longNotional, 2)}</strong></div>
             <div><span>Short 仓位名义</span><strong>${fmtMoney(shortNotional, 2)}</strong></div>
-            <div><span>仓位指标</span><strong>${positionSkew == null ? '--' : fmtSignedBps(positionSkew, 2)}</strong></div>
+            <div><span>仓位指标</span><strong>${positionSkew == null ? "--" : fmtSignedBps(positionSkew, 2)}</strong></div>
             <div><span>Basis</span><strong>${fmtNumber(item.cross_venue_basis_bps, 4)} bps</strong></div>
             <div><span>预计 funding 兑现点</span><strong>${fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)}</strong></div>
             <div><span>最晚入场时间</span><strong>${fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms)}</strong></div>
             <div><span>计划退出时间</span><strong>${fmtTime(item.target_close_time_ms)}</strong></div>
-            <div><span>Ready</span><strong>${item.ready_now ? 'YES' : 'NO'}</strong></div>
-            <div><span>关联机会</span><strong>${linkedOpp ? '点击可跳转' : '--'}</strong></div>
+            <div><span>Ready</span><strong>${item.ready_now ? "YES" : "NO"}</strong></div>
+            <div><span>关联机会</span><strong>${linkedOpp ? "点击可跳转" : "--"}</strong></div>
             <div><span>Funding 事件</span><strong>${fundingEventsText(item)}</strong></div>
             <div><span>计算模式</span><strong>${fundingModeText(item)}</strong></div>
             <div><span>目标收益</span><strong class="${classForNumber(item.net_expected_pnl)}">${fmtMoney(item.net_expected_pnl)}</strong></div>
@@ -622,8 +704,8 @@ function renderPlans() {
           ${renderExecutionControls(item.plan_key, item.status)}
         </div>
       `;
-    })
-    .join("");
+      })
+      .join("");
 }
 
 function renderExecutions() {
@@ -698,8 +780,12 @@ function filteredOpportunities() {
     const priorityDiff = opportunityPriority(b) - opportunityPriority(a);
     if (priorityDiff !== 0) return priorityDiff;
 
-    if (sortMode === "score") return Number(b.score || 0) - Number(a.score || 0);
-    if (sortMode === "edge") return Number(b.gross_edge_hourly || 0) - Number(a.gross_edge_hourly || 0);
+    if (sortMode === "score")
+      return Number(b.score || 0) - Number(a.score || 0);
+    if (sortMode === "edge")
+      return (
+        Number(b.gross_edge_hourly || 0) - Number(a.gross_edge_hourly || 0)
+      );
     return Number(b.net_expected_pnl || 0) - Number(a.net_expected_pnl || 0);
   });
 
@@ -748,7 +834,8 @@ function renderOpportunityList(items) {
   els.opportunitiesList.innerHTML = items
     .map((item) => {
       const active = opportunityKey(item) === state.selectedOpportunityKey;
-      const earliestDelta = Number(item.earliest_funding_time_ms || 0) - Date.now();
+      const earliestDelta =
+        Number(item.earliest_funding_time_ms || 0) - Date.now();
       const planStatus = opportunityPlanStatus(item);
       return `
         <button class="opportunity-item ${active ? "active" : ""}" data-opportunity-key="${opportunityKey(item)}" type="button">
@@ -785,7 +872,18 @@ function detailMetric(label, value, extraClass = "") {
   `;
 }
 
-function legCard(title, exchange, venueSymbol, fundingRate, hourlyRate, fundingTimeMs, fundingIntervalHours, bidPrice, askPrice, markPrice) {
+function legCard(
+  title,
+  exchange,
+  venueSymbol,
+  fundingRate,
+  hourlyRate,
+  fundingTimeMs,
+  fundingIntervalHours,
+  bidPrice,
+  askPrice,
+  markPrice,
+) {
   const mid = midpoint(bidPrice, askPrice);
   return `
     <div class="detail-section">
@@ -810,7 +908,8 @@ function legCard(title, exchange, venueSymbol, fundingRate, hourlyRate, fundingT
 function renderOpportunityDetail(items) {
   const item = selectedOpportunity(items);
   if (!item) {
-    els.opportunityDetail.innerHTML = '<div class="empty-state show">当前没有可查看的套利机会。</div>';
+    els.opportunityDetail.innerHTML =
+      '<div class="empty-state show">当前没有可查看的套利机会。</div>';
     return;
   }
 
@@ -904,7 +1003,7 @@ function renderOpportunityDetail(items) {
           </div>
           <div class="insight-box">
             <div class="insight-title">怎么看这组机会</div>
-            <div class="insight-text">方向不是固定死的。系统会在每次刷新时，把“Long A / Short B”和“Long B / Short A”两个方向都完整计算一遍，再选当前更优的方向展示。Funding 收益也不再按统一小时平均外推，而是按当前已知的真实 funding 结算事件逐腿估算。状态里“跨所价差过大”表示当前 Basis（shortBid 与 longAsk 的相对偏离）超过策略阈值 `max_spread_bps`，为避免入场成本吞噬 funding 收益会被拦截。若后续 funding 或 basis 变化导致反方向更优，下一轮机会就会切换成反方向。</div>
+            <div class="insight-text">方向不是固定死的。系统会在每次刷新时，把“Long A / Short B”和“Long B / Short A”两个方向都完整计算一遍，再选当前更优的方向展示。Funding 收益也不再按统一小时平均外推，而是按当前已知的真实 funding 结算事件逐腿估算。状态里“跨所价差过大”表示当前 Basis（shortBid 与 longAsk 的相对偏离）超过策略阈值 \`max_spread_bps\`，为避免入场成本吞噬 funding 收益会被拦截。若后续 funding 或 basis 变化导致反方向更优，下一轮机会就会切换成反方向。</div>
           </div>
         </div>
       </div>
@@ -918,8 +1017,8 @@ function syncOpportunityHeights() {
   const detailEl = els.opportunityDetail;
   if (!listEl || !detailEl) return;
 
-  listEl.style.minHeight = '';
-  listEl.style.maxHeight = '';
+  listEl.style.minHeight = "";
+  listEl.style.maxHeight = "";
 
   if (window.innerWidth <= 1080) return;
 
@@ -929,7 +1028,6 @@ function syncOpportunityHeights() {
   listEl.style.minHeight = `${detailHeight}px`;
   listEl.style.maxHeight = `${detailHeight}px`;
 }
-
 
 function renderOpportunities() {
   const items = filteredOpportunities();
@@ -952,10 +1050,15 @@ function renderOpportunities() {
 // watchlist 直接来自后端，前端不自行推断。
 // ------------------------------------------------------------
 function syncSelectors() {
-  const symbols = Array.isArray(state.system?.watchlist) ? state.system.watchlist : [];
+  const symbols = Array.isArray(state.system?.watchlist)
+    ? state.system.watchlist
+    : [];
   state.symbols = symbols;
-  if (!symbols.includes(state.activeSymbol) && symbols.length) state.activeSymbol = symbols[0];
-  els.marketSelect.innerHTML = symbols.map((item) => `<option value="${item}">${item}</option>`).join("");
+  if (!symbols.includes(state.activeSymbol) && symbols.length)
+    state.activeSymbol = symbols[0];
+  els.marketSelect.innerHTML = symbols
+    .map((item) => `<option value="${item}">${item}</option>`)
+    .join("");
   els.marketSelect.value = state.activeSymbol;
 
   const pairs = normalizePairs();
@@ -983,8 +1086,12 @@ async function refreshAll() {
     apiGet("/api/v1/snapshot-stats", {}),
   ]);
 
-  const normalizedOpportunities = Array.isArray(opportunities) ? opportunities : [];
-  const currentBatchId = normalizedOpportunities.length ? String(normalizedOpportunities[0].batch_id || "") : "";
+  const normalizedOpportunities = Array.isArray(opportunities)
+    ? opportunities
+    : [];
+  const currentBatchId = normalizedOpportunities.length
+    ? String(normalizedOpportunities[0].batch_id || "")
+    : "";
 
   // 只请求“当前机会批次”对应的 plans，避免 plans 和 opportunities 不是同一批。
   const plansPath = currentBatchId
@@ -1000,7 +1107,10 @@ async function refreshAll() {
   state.stats = stats || {};
 
   syncSelectors();
-  const market = await apiGet(`/api/v1/market/${encodeURIComponent(state.activeSymbol)}`, {});
+  const market = await apiGet(
+    `/api/v1/market/${encodeURIComponent(state.activeSymbol)}`,
+    {},
+  );
 
   renderOverview();
   renderMetrics();
@@ -1009,7 +1119,9 @@ async function refreshAll() {
   renderPlans();
   renderExecutions();
   renderOpportunities();
-  els.lastRefreshLabel.textContent = new Date().toLocaleString("zh-CN", { hour12: false });
+  els.lastRefreshLabel.textContent = new Date().toLocaleString("zh-CN", {
+    hour12: false,
+  });
 }
 
 // ------------------------------------------------------------
@@ -1041,7 +1153,7 @@ async function handleActionClick(event) {
   const planCard = event.target.closest("[data-plan-select='1']");
   if (planCard) {
     state.selectedPlanKey = planCard.dataset.planKey || null;
-    const oppKey = planCard.dataset.opportunityKey || '';
+    const oppKey = planCard.dataset.opportunityKey || "";
     if (oppKey) {
       state.selectedOpportunityKey = oppKey;
       renderOpportunities();
@@ -1063,7 +1175,10 @@ function bindEvents() {
 
   els.marketSelect.addEventListener("change", async (event) => {
     state.activeSymbol = event.target.value;
-    const market = await apiGet(`/api/v1/market/${encodeURIComponent(state.activeSymbol)}`, {});
+    const market = await apiGet(
+      `/api/v1/market/${encodeURIComponent(state.activeSymbol)}`,
+      {},
+    );
     renderMarket(market || {});
   });
 
@@ -1074,7 +1189,9 @@ function bindEvents() {
     renderOpportunities();
   });
 
-  window.addEventListener("resize", () => requestAnimationFrame(syncOpportunityHeights));
+  window.addEventListener("resize", () =>
+    requestAnimationFrame(syncOpportunityHeights),
+  );
   document.body.addEventListener("click", handleActionClick);
 }
 
