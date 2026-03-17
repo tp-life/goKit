@@ -1,13 +1,158 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>套利监控系统</title>
+    <title>Funding Arbitrage Monitor</title>
+    <link rel="stylesheet" href="/assets/styles.css?v=20260316-frontend-2" />
   </head>
   <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.js"></script>
+    <div class="app-shell">
+      <section class="hero">
+        <section class="hero-left">
+          <div class="eyebrow">Funding Arbitrage · Multi Venue</div>
+          <h1>多交易所资金费率套利控制台</h1>
+          <p class="hero-desc">
+            用于同时观察 Binance、Aster、Hyperliquid 的市场数据、套利机会、执行计划与系统健康状态。页面默认按净收益展示最强机会，并支持点击查看两腿详情。
+          </p>
+          <div class="hero-actions">
+            <button id="manual-refresh-btn" class="btn btn-primary">立即刷新</button>
+          </div>
+        </section>
+        <section class="hero-right">
+          <div class="hero-meta-card">
+            <div class="meta-row"><span class="meta-label">系统状态</span><strong id="health-label">--</strong></div>
+            <div class="meta-row"><span class="meta-label">最近刷新</span><strong id="last-refresh-label">--</strong></div>
+            <div class="meta-row"><span class="meta-label">当前交易对</span><strong id="active-symbol-label">BTC</strong></div>
+          </div>
+        </section>
+      </section>
+
+      <section class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">套利机会</div>
+          <div id="metric-opps" class="metric-value">0</div>
+          <div class="metric-sub">当前候选数量</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Ready Plans</div>
+          <div id="metric-ready" class="metric-value">0</div>
+          <div class="metric-sub">当前可执行计划</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Funding 快照</div>
+          <div id="metric-funding-snapshots" class="metric-value">0</div>
+          <div class="metric-sub">近 24h 写入量</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">盘口快照</div>
+          <div id="metric-book-snapshots" class="metric-value">0</div>
+          <div class="metric-sub">近 24h 写入量</div>
+        </div>
+      </section>
+
+      <section class="summary-grid">
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <div class="section-title">策略参数</div>
+              <div class="section-desc">直接展示当前后端生效的关键阈值，避免看页面时猜配置。</div>
+            </div>
+          </div>
+          <div id="strategy-summary" class="info-grid"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <div class="section-title">执行参数</div>
+              <div class="section-desc">区分监控模式和实盘模式，便于快速确认是否开启自动执行。</div>
+            </div>
+          </div>
+          <div id="execution-summary" class="info-grid"></div>
+        </section>
+      </section>
+
+      <main class="dashboard-stack">
+        <section class="top-grid">
+          <section class="card">
+            <div class="card-head">
+              <div>
+                <div class="section-title">市场快照</div>
+                <div class="section-desc">按当前规范化交易对查看各交易所盘口与 funding。</div>
+              </div>
+              <select id="market-symbol-select" class="select compact"></select>
+            </div>
+            <div id="market-cards" class="market-grid"></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <div>
+                <div class="section-title">系统状态</div>
+                <div class="section-desc">展示 connector 健康度、最近事件时间与错误信息。</div>
+              </div>
+            </div>
+            <div id="status-stack" class="status-stack"></div>
+          </section>
+        </section>
+
+        <section class="card plans-full-row">
+          <div class="card-head">
+            <div>
+              <div class="section-title">执行计划</div>
+              <div class="section-desc">单独一整行展示当前计划的投入资金、双腿倍率、Long/Short 仓位与手动开平仓操作。</div>
+            </div>
+          </div>
+          <div id="plans-list" class="plan-list"></div>
+          <div id="plans-empty" class="empty-state">当前没有执行计划。</div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <div class="section-title">执行记录</div>
+              <div class="section-desc">真实执行或 dry-run 的开平仓状态都会落在这里。</div>
+            </div>
+          </div>
+          <div id="executions-list" class="plan-list"></div>
+          <div id="executions-empty" class="empty-state">当前没有执行记录。</div>
+        </section>
+
+        <section class="card">
+          <div class="card-head card-head-wrap">
+            <div>
+              <div class="section-title">套利机会</div>
+              <div class="section-desc">默认展示当前净收益最强的一组；点击左侧机会卡片，可查看不同交易所的资金费率、结算时间、利差、净收益与收益构成。</div>
+            </div>
+            <div class="toolbar toolbar-rich">
+              <input id="symbol-filter" class="input" type="text" placeholder="筛选交易对，例如 BTC" />
+              <select id="exchange-filter" class="select">
+                <option value="all">全部交易所组合</option>
+              </select>
+              <select id="sort-mode" class="select">
+                <option value="net">按净收益排序</option>
+                <option value="score">按评分排序</option>
+                <option value="edge">按小时 funding edge 排序</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="opportunity-summary" class="opportunity-summary"></div>
+
+          <div class="opportunities-layout">
+            <aside>
+              <div id="opportunities-list" class="opportunity-list"></div>
+            </aside>
+            <section>
+              <div id="opportunity-detail" class="opportunity-detail"></div>
+            </section>
+          </div>
+
+          <div id="opportunities-empty" class="empty-state">当前没有套利机会。</div>
+        </section>
+      </main>
+    </div>
+    <script src="/assets/app.js?v=20260316-frontend-2"></script>
   </body>
 </html>

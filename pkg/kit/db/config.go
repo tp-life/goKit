@@ -15,11 +15,12 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Driver:          "mysql",
-		MaxIdleConns:    10,
-		MaxOpenConns:    100,
+		Driver:          "sqlite",
+		DSN:             "data/arbitrage.db",
+		MaxIdleConns:    1,
+		MaxOpenConns:    1,
 		ConnMaxLifetime: time.Hour,
-		LogMode:         "error",
+		LogMode:         "warn",
 		SlowThreshold:   200 * time.Millisecond,
 	}
 }

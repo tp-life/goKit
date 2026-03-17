@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"gorm.io/gorm"
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 	"goKit/pkg/kit/db"
+	"gorm.io/gorm"
 )
 
 type UserRepo struct {

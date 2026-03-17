@@ -17,10 +17,6 @@ type SlogAdapter struct {
 }
 
 func NewSlogAdapter(l *slog.Logger, level logger.LogLevel, slow time.Duration) *SlogAdapter {
-	// 如果 logger 为 nil，使用默认 logger
-	if l == nil {
-		l = slog.Default()
-	}
 	return &SlogAdapter{l: l, LogLevel: level, SlowThreshold: slow}
 }
 
@@ -31,22 +27,22 @@ func (s *SlogAdapter) LogMode(level logger.LogLevel) logger.Interface {
 }
 
 func (s *SlogAdapter) Info(ctx context.Context, str string, args ...any) {
-	if s.LogLevel >= logger.Info && s.l != nil {
+	if s.LogLevel >= logger.Info {
 		s.l.InfoContext(ctx, fmt.Sprintf(str, args...))
 	}
 }
 func (s *SlogAdapter) Warn(ctx context.Context, str string, args ...any) {
-	if s.LogLevel >= logger.Warn && s.l != nil {
+	if s.LogLevel >= logger.Warn {
 		s.l.WarnContext(ctx, fmt.Sprintf(str, args...))
 	}
 }
 func (s *SlogAdapter) Error(ctx context.Context, str string, args ...any) {
-	if s.LogLevel >= logger.Error && s.l != nil {
+	if s.LogLevel >= logger.Error {
 		s.l.ErrorContext(ctx, fmt.Sprintf(str, args...))
 	}
 }
 func (s *SlogAdapter) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
-	if s.LogLevel <= logger.Silent || s.l == nil {
+	if s.LogLevel <= logger.Silent {
 		return
 	}
 	elapsed := time.Since(begin)

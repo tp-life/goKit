@@ -3,6 +3,7 @@ package kit
 import (
 	"goKit/pkg/kit/db"
 	"goKit/pkg/kit/log"
+	"goKit/pkg/kit/rpc"
 	"goKit/pkg/kit/web"
 
 	"go.uber.org/fx"
@@ -14,6 +15,6 @@ var Module = fx.Options(
 	fx.Provide(db.NewClient),
 	fx.Provide(web.NewServer),
 	fx.Invoke(web.StartLifecycle),
-	// fx.Provide(rpc.NewServer),
-	// fx.Invoke(rpc.StartLifecycle),
+	fx.Provide(rpc.NewServer),
+	fx.Invoke(rpc.StartLifecycle),
 )

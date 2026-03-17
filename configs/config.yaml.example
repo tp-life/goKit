@@ -1,10 +1,11 @@
 app:
-  name: "crypto-arbitrage-monitor"
-  version: "v1.0.0"
+  name: "funding-arbitrage-monitor"
+  version: "v2.0.0"
+  debug: false
 
 web:
   port: ":8080"
-  app_name: "Arbitrage Monitor"
+  app_name: "Funding Arbitrage Monitor"
   prefork: false
 
 rpc:
@@ -14,10 +15,10 @@ rpc:
 
 database:
   driver: "sqlite"
-  dsn: "file:data/arbitrage.db?cache=shared&_journal_mode=WAL"
-  max_idle_conns: 5
-  max_open_conns: 10
-  log_mode: "info"
+  dsn: "data/arbitrage.db"
+  max_idle_conns: 1
+  max_open_conns: 1
+  log_mode: "warn"
   slow_threshold: 200ms
 
 log:
@@ -25,57 +26,107 @@ log:
   format: "json"
   source: false
 
+strategy:
+  enabled: true
+  # 统一使用 canonical symbol（基础币）做监控范围。
+  # Binance / Aster 的 BTCUSDT、Hyperliquid 的 BTC 最终都会映射到 BTC。
+  allowed_symbols: ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LINK", "AVAX", "LTC"]
+  quote_asset: "USDT"
+  hold_hours: 24
+  total_capital_usdt: 1000
+  capital_utilization: 0.8
+  leverage: 2
+  assumed_notional: 1600
+  min_net_pnl: 1.5
+  max_displayed_opportunities: 20
+  slippage_bps: 2
+  safety_buffer_usdt: 0.2
+  entry_mode: "maker"
+  exit_mode: "mixed"
+  max_data_age: 15s
+  max_spread_bps: 12
+  entry_lead_time: 180s
+  entry_cutoff_time: 45s
+  funding_snapshot_persist_interval: 60s
+  book_snapshot_persist_interval: 20s
+  snapshot_retention: 168h
+  opportunity_calc_interval: 5s
+  book_snapshot_min_price_change_bps: 0.5
+  book_snapshot_min_qty_change_ratio: 0.05
+  # 全市场 funding 粗筛后，最多挑多少个 symbol 进入动态深扫池。
+  dynamic_candidate_limit: 30  # =0 表示不设上限，所有 funding 候选都允许进入深扫池
+  # 每轮额外抽多少个“没进 TopN 的币”做冷门轮转补扫。
+  rotation_batch_size: 25      # 冷门币轮转补扫数量；=0 表示关闭轮转
+  # 多久重算一次深扫池。
+  rotation_interval: 30s
+  # 某个 symbol 一旦进入深扫池，至少保留这么久，避免 websocket 频繁抖动。
+  deep_scan_hold_duration: 3m # 候选进入深扫池后最少保留多久，避免 websocket 频繁抖动
+
+  execution:
+    # true = 允许真实下单；false = 仅做 dry-run 记录，不会向交易所发单。
+    enabled: false
+    auto_entry: true
+    auto_close: true
+    # 在最后一个 funding 时间之后，再额外等待一小段时间执行自动平仓。
+    close_grace_period: 2m
+    loop_interval: 3s
+    max_latest_plans: 50
+
 exchanges:
   binance:
     enabled: true
-    spot_ws_url: "wss://stream.binance.com:9443/ws"
-    futures_ws_url: "wss://fstream.binance.com/ws"
-    rest_url: "https://fapi.binance.com"
-    reconnect_interval: 5s
-    rate_limit: 1200
-    proxy_url: ""  # 可选，如: "socks5://127.0.0.1:1080"
-    
-  lighter:
+    label: "Binance"
+    settle_asset: "USDT"
+    rest_base_url: "https://fapi.binance.com"
+    market_ws_base_url: "wss://fstream.binance.com"
+    public_ws_base_url: "wss://fstream.binance.com"
+    request_timeout: 10s
+    default_funding_interval_hours: 8
+    proxy:
+      enabled: false
+      url: "http://127.0.0.1:7890"
+    fees:
+      maker_bps: 2.0
+      taker_bps: 5.0
+    auth:
+      api_key_env: "BINANCE_API_KEY"
+      api_secret_env: "BINANCE_API_SECRET"
+
+  aster:
     enabled: true
-    ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
-    rest_url: "https://mainnet.zklighter.elliot.ai/api/v1"
-    reconnect_interval: 5s
-    rate_limit: 100
-    proxy_url: ""
-    
+    label: "Aster"
+    settle_asset: "USDT"
+    rest_base_url: "https://fapi.asterdex.com"
+    market_ws_base_url: "wss://fstream.asterdex.com"
+    public_ws_base_url: "wss://fstream.asterdex.com"
+    request_timeout: 10s
+    default_funding_interval_hours: 8
+    proxy:
+      enabled: false
+      url: "http://127.0.0.1:7890"
+    fees:
+      maker_bps: 0.5
+      taker_bps: 4.0
+    auth:
+      api_key_env: "ASTER_API_KEY"
+      api_secret_env: "ASTER_API_SECRET"
+
   hyperliquid:
     enabled: true
-    ws_url: "wss://api.hyperliquid.xyz/ws"
-    rest_url: "https://api.hyperliquid.xyz"
-    reconnect_interval: 5s
-    rate_limit: 100
-    proxy_url: ""
-
-arbitrage:
-  default_high_threshold: 0.0005    # 0.05%
-  default_medium_threshold: 0.0002  # 0.02%
-  min_profitability: 0.0001         # 0.01%
-  max_single_position: 10000
-  max_total_position: 50000
-  max_execution_time: 30s
-  price_update_interval: 3s
-  rate_update_interval: 60s
-  
-  symbols:
-    - symbol: "BTCUSDC"
-      binance_market: "BTCUSDC"
-      lighter_market_id: 1
-      hyperliquid_market: "BTC"
-      enabled: true
-    - symbol: "ETHUSDC"
-      binance_market: "ETHUSDC"
-      lighter_market_id: 0
-      hyperliquid_market: "ETH"
-      enabled: true
-
-trading:
-  enabled: false  # 当前禁用，后续启用
-  # API 密钥从环境变量读取:
-  # BINANCE_API_KEY, BINANCE_API_SECRET
-  # LIGHTER_API_KEY, LIGHTER_API_SECRET
-  # HYPERLIQUID_API_KEY, HYPERLIQUID_API_SECRET
+    label: "Hyperliquid"
+    settle_asset: "USDC"
+    rest_base_url: "https://api.hyperliquid.xyz"
+    market_ws_base_url: "wss://api.hyperliquid.xyz/ws"
+    public_ws_base_url: "wss://api.hyperliquid.xyz/ws"
+    request_timeout: 10s
+    default_funding_interval_hours: 1
+    proxy:
+      enabled: false
+      url: "http://127.0.0.1:7890"
+    fees:
+      maker_bps: 1.5
+      taker_bps: 4.5
+    auth:
+      private_key_env: "HYPERLIQUID_PRIVATE_KEY"
+      account_address_env: "HYPERLIQUID_ACCOUNT_ADDRESS"
+      vault_address_env: "HYPERLIQUID_VAULT_ADDRESS"

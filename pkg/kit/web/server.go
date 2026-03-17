@@ -2,9 +2,9 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 
-	"github.com/bytedance/sonic"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
@@ -25,8 +25,8 @@ func NewServer(params ServerParams) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:       params.Config.AppName,
 		Prefork:       params.Config.Prefork,
-		JSONEncoder:   sonic.Marshal,
-		JSONDecoder:   sonic.Unmarshal,
+		JSONEncoder:   json.Marshal,
+		JSONDecoder:   json.Unmarshal,
 		StrictRouting: true,
 		CaseSensitive: true,
 	})
