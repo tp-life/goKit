@@ -14,10 +14,12 @@ type Opportunity struct {
 	LongVenueSymbol  string `gorm:"size:64" json:"long_venue_symbol"`
 	ShortVenueSymbol string `gorm:"size:64" json:"short_venue_symbol"`
 
-	LongFundingRate    float64 `json:"long_funding_rate"`
-	ShortFundingRate   float64 `json:"short_funding_rate"`
-	LongFundingTimeMs  int64   `json:"long_funding_time_ms"`
-	ShortFundingTimeMs int64   `json:"short_funding_time_ms"`
+	LongFundingRate           float64 `json:"long_funding_rate"`
+	ShortFundingRate          float64 `json:"short_funding_rate"`
+	LongFundingTimeMs         int64   `json:"long_funding_time_ms"`
+	ShortFundingTimeMs        int64   `json:"short_funding_time_ms"`
+	LongFundingIntervalHours  int     `json:"long_funding_interval_hours"`
+	ShortFundingIntervalHours int     `json:"short_funding_interval_hours"`
 
 	LongFundingHourly  float64 `json:"long_funding_hourly"`
 	ShortFundingHourly float64 `json:"short_funding_hourly"`

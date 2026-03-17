@@ -500,6 +500,22 @@ func (r *StrategyRunner) opportunityLoop(ctx context.Context) {
 	}
 }
 
+// computeCandidates 是“最终机会精算层”的核心。
+//
+// 计算步骤（逐 symbol、逐交易所对）：
+// 1) 读取双边 funding + 盘口 + symbol 元数据（任一缺失直接跳过）；
+// 2) 用 bestFundingDirection 同时评估两个方向：
+//   - Long A / Short B
+//   - Long B / Short A
+//     并选择 carry 更高的一边；
+//     3. 资金收益：
+//     grossFundingPNL = notional * projection.CarryRate
+//     其中 projection.CarryRate 来自“事件时间轴模型”，不是简单小时化线性外推；
+//     4. 成本扣减：entry fee + exit fee + slippage + safety buffer；
+//     5. 风控与执行窗校验：数据新鲜度、basis、最小净利润、入场时间窗；
+//     6. 产出 Opportunity（包含方向、窗口、事件计数、预估净收益）。
+//
+// 精算阶段默认遍历整个基础池。
 func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 	// 精算阶段默认遍历整个基础池。
 	//
@@ -576,6 +592,8 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					ShortFundingRate:             shortFunding.FundingRate,
 					LongFundingTimeMs:            longFunding.FundingTimeMs,
 					ShortFundingTimeMs:           shortFunding.FundingTimeMs,
+					LongFundingIntervalHours:     longFunding.FundingIntervalHours,
+					ShortFundingIntervalHours:    shortFunding.FundingIntervalHours,
 					LongFundingHourly:            longHourly,
 					ShortFundingHourly:           shortHourly,
 					GrossEdgeHourly:              grossEdgeHourly,
@@ -610,12 +628,21 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].NetExpectedPNL > items[j].NetExpectedPNL })
-	if r.cfg.MaxDisplayedOpportunities > 0 && len(items) > r.cfg.MaxDisplayedOpportunities {
-		return items[:r.cfg.MaxDisplayedOpportunities]
-	}
+	// 注意：这里不再按 MaxDisplayedOpportunities 做截断。
+	// 原因：机会列表的“搜索/筛选”需要基于完整 batch 数据；
+	// 若在计算层提前截断，后端与前端都无法再检索被截掉的机会。
+	// 展示数量控制应由查询参数(limit)与前端分页/筛选承担。
 	return items
 }
 
+// evaluateOpportunity 将“收益估算”转成“可执行状态”。
+//
+// 判定顺序是刻意设计的：
+// 1) stale data：防止基于过期市场数据下单；
+// 2) carryRate<=0：funding 本身无正向优势，直接淘汰；
+// 3) basis 限制：避免靠 funding 赚的钱被入场基差吞掉；
+// 4) min net pnl：统一门槛；
+// 5) entry window：确保在计划结算前仍有可执行性。
 func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingProjection, netExpectedPNL float64, basisBps float64, longFunding, shortFunding entity.FundingSnapshot, longBook, shortBook entity.BookTopSnapshot) (string, string, bool) {
 	if r.isSnapshotStale(now, longFunding.EventTimeMs) || r.isSnapshotStale(now, shortFunding.EventTimeMs) || r.isSnapshotStale(now, longBook.EventTimeMs) || r.isSnapshotStale(now, shortBook.EventTimeMs) {
 		return OpportunityStatusStaleData, "market data is stale", false
@@ -684,58 +711,40 @@ func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA enti
 	return exA, exB, projAB, true
 }
 
-// projectFundingCarry 按“当前已知的下一次 funding 事件”估算方向收益。
+// projectFundingCarry 按“当前已知 funding 节奏”估算方向收益。
 //
 // longFunding / shortFunding 的含义是：
 // - longFunding: 假设做多腿所在交易所的 funding 快照
 // - shortFunding: 假设做空腿所在交易所的 funding 快照
 //
-// 这里不再把 funding 先统一小时化后线性外推，而是只考虑“真实已经知道的下一次 funding 事件”：
-// - 候选结算点 = {long 下一次 funding time, short 下一次 funding time}
-// - 对每个候选结算点，计算到该时点时双腿各自会真实发生几次 funding（当前模型下每腿最多 1 次）
+// 这里不把 funding 先统一小时化后线性外推，而是优先按事件时间轴逐点估算：
+// - 候选结算点 = 两侧 funding 事件时间轴上、直到 max(nextLong, nextShort) 之前的所有结算点
+// - 对每个候选结算点，计算到该时点时双腿各自会发生几次 funding（会考虑多次结算）
 // - 选择 CarryRate 最大的那个时点
 //
 // 这样可以正确覆盖：
-// - 一边 1h 结算，一边 4h 结算；
+// - 一边 1h 结算，一边 4h / 8h 结算；
 // - 两边 funding 都为负，但负得不一样；
 // - 最优方向和最优退出点不一定是“最早结算点”。
 func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding, shortFunding entity.FundingSnapshot) (fundingProjection, bool) {
 	nowMs := now.UnixMilli()
-	candidateTimes := make([]int64, 0, 2)
-	addTime := func(v int64) {
-		if v <= nowMs {
-			return
-		}
-		for _, existing := range candidateTimes {
-			if existing == v {
-				return
-			}
-		}
-		candidateTimes = append(candidateTimes, v)
-	}
-	addTime(longFunding.FundingTimeMs)
-	addTime(shortFunding.FundingTimeMs)
+	candidateTimes := buildFundingCandidateTimes(nowMs, longFunding, shortFunding, r.cfg.HoldHours)
 	if len(candidateTimes) == 0 {
 		return fundingProjection{}, false
 	}
-	sort.Slice(candidateTimes, func(i, j int) bool { return candidateTimes[i] < candidateTimes[j] })
 
 	best := fundingProjection{}
 	bestOK := false
 	for _, projectedTime := range candidateTimes {
-		longCount := 0
-		shortCount := 0
-		if longFunding.FundingTimeMs > nowMs && longFunding.FundingTimeMs <= projectedTime {
-			longCount = 1
-		}
-		if shortFunding.FundingTimeMs > nowMs && shortFunding.FundingTimeMs <= projectedTime {
-			shortCount = 1
-		}
+		longCount := fundingEventCountUntil(nowMs, projectedTime, longFunding.FundingTimeMs, longFunding.FundingIntervalHours)
+		shortCount := fundingEventCountUntil(nowMs, projectedTime, shortFunding.FundingTimeMs, shortFunding.FundingIntervalHours)
 		if longCount == 0 && shortCount == 0 {
 			continue
 		}
 
-		carryRate := float64(shortCount)*shortFunding.FundingRate - float64(longCount)*longFunding.FundingRate
+		shortEffectiveMultiplier := fundingRateEventMultiplier(shortCount, r.cfg.FundingRateContinuationDecay)
+		longEffectiveMultiplier := fundingRateEventMultiplier(longCount, r.cfg.FundingRateContinuationDecay)
+		carryRate := shortEffectiveMultiplier*shortFunding.FundingRate - longEffectiveMultiplier*longFunding.FundingRate
 		windowHours := float64(projectedTime-nowMs) / float64(time.Hour/time.Millisecond)
 		if windowHours <= 0 {
 			windowHours = 1.0 / 60.0
@@ -771,6 +780,96 @@ func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding, shortFu
 		}
 	}
 	return best, bestOK
+}
+
+// buildFundingCandidateTimes 构建候选退出时点。
+//
+// 思路：
+// - 各腿从 nextFundingTime 开始，按 interval 生成事件时间轴；
+// - 合并去重；
+// - 在 horizon 内保留候选点，其中 horizon=max(latestNextFunding, now+holdHours)。
+//
+// 这意味着：
+//   - 至少会覆盖两腿“已知下一次结算”之前的所有相关事件；
+//   - 当 holdHours 更长（例如 24h）时，会继续评估更远的退出点，
+//     支持“多轮 funding 覆盖建仓成本”的策略。
+func buildFundingCandidateTimes(nowMs int64, longFunding, shortFunding entity.FundingSnapshot, holdHours float64) []int64 {
+	latestNextFunding := maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs)
+	horizon := latestNextFunding
+	if holdHours > 0 {
+		holdMs := int64(holdHours * float64(time.Hour/time.Millisecond))
+		if holdMs > 0 {
+			horizon = maxInt64(horizon, nowMs+holdMs)
+		}
+	}
+	if horizon <= nowMs {
+		return nil
+	}
+	uniq := make(map[int64]struct{})
+	out := make([]int64, 0, 16)
+	appendTimeline := func(nextTimeMs int64, intervalHours int) {
+		if nextTimeMs <= nowMs {
+			return
+		}
+		intervalMs := int64(maxInt(intervalHours, 0)) * int64(time.Hour/time.Millisecond)
+		for ts := nextTimeMs; ts <= horizon; {
+			if _, exists := uniq[ts]; !exists {
+				uniq[ts] = struct{}{}
+				out = append(out, ts)
+			}
+			if intervalMs <= 0 {
+				break
+			}
+			ts += intervalMs
+		}
+	}
+
+	appendTimeline(longFunding.FundingTimeMs, longFunding.FundingIntervalHours)
+	appendTimeline(shortFunding.FundingTimeMs, shortFunding.FundingIntervalHours)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// fundingEventCountUntil 计算 [now, projectedTime] 窗口内某一腿会发生几次 funding。
+//
+// 规则：
+// - nextFundingTime 不在窗口内 => 0 次；
+// - 在窗口内先计 1 次；
+// - 若 interval>0，再按等间隔累加后续次数。
+//
+// 注意：这里默认“当前已知 fundingRate 在该时间轴上延续”，
+// 属于实盘中常见的近端近似；后续若接入更长历史/预测模型，可替换此处。
+
+func fundingRateEventMultiplier(eventCount int, continuationDecay float64) float64 {
+	if eventCount <= 0 {
+		return 0
+	}
+	if continuationDecay <= 0 || continuationDecay > 1 {
+		continuationDecay = 0.6
+	}
+	if continuationDecay == 1 {
+		return float64(eventCount)
+	}
+	// 首次事件使用 1.0，后续事件按 decay^(k-1) 衰减。
+	// sum_{k=0}^{n-1} decay^k = (1-decay^n)/(1-decay)
+	pow := math.Pow(continuationDecay, float64(eventCount))
+	return (1 - pow) / (1 - continuationDecay)
+}
+
+func fundingEventCountUntil(nowMs, projectedTimeMs, nextFundingTimeMs int64, intervalHours int) int {
+	if projectedTimeMs <= nowMs || nextFundingTimeMs <= nowMs || nextFundingTimeMs > projectedTimeMs {
+		return 0
+	}
+	count := 1
+	intervalMs := int64(maxInt(intervalHours, 0)) * int64(time.Hour/time.Millisecond)
+	if intervalMs <= 0 {
+		return count
+	}
+	extra := (projectedTimeMs - nextFundingTimeMs) / intervalMs
+	if extra > 0 {
+		count += int(extra)
+	}
+	return count
 }
 
 func (r *StrategyRunner) ConfigSnapshot() string {

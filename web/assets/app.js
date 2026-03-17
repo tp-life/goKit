@@ -16,6 +16,8 @@ const state = {
   currentOpportunityBatchId: "",
 };
 
+const OPPORTUNITY_FETCH_LIMIT = 5000;
+
 // ------------------------------------------------------------
 // DOM 引用集中管理，避免后续维护时到处 querySelector。
 // ------------------------------------------------------------
@@ -179,14 +181,15 @@ function normalizeBookMap(payload) {
 // ------------------------------------------------------------
 function opportunityKey(item) {
   if (!item || typeof item !== "object") return "";
-  if (item.id) return `id:${item.id}`;
+  // 选中态必须跨 batch 稳定：
+  // 不能依赖 id / batch_id（每轮刷新都会变），否则详情会被“强制跳回默认项”。
+  // 这里使用机会核心维度作为稳定 key。
   return [
-    item.batch_id,
-    item.symbol,
-    item.long_exchange,
-    item.short_exchange,
-    item.long_venue_symbol,
-    item.short_venue_symbol,
+    String(item.symbol || "").toUpperCase(),
+    String(item.long_exchange || "").toLowerCase(),
+    String(item.short_exchange || "").toLowerCase(),
+    String(item.long_venue_symbol || "").toUpperCase(),
+    String(item.short_venue_symbol || "").toUpperCase(),
   ].join("|");
 }
 
@@ -216,6 +219,53 @@ function fundingEventsText(item) {
   const longCount = Number(item?.long_funding_event_count || 0);
   const shortCount = Number(item?.short_funding_event_count || 0);
   return `Long ${longCount} 次 / Short ${shortCount} 次`;
+}
+
+
+function holdingDurationText(item) {
+  if (!item || typeof item !== "object") return "--";
+  const projectedMs = Number(item.projected_funding_time_ms || 0);
+  if (projectedMs > 0) {
+    return fmtDuration(projectedMs - Date.now());
+  }
+  const windowHours = Number(item.funding_window_hours || 0);
+  if (Number.isFinite(windowHours) && windowHours > 0) {
+    const totalMinutes = Math.round(windowHours * 60);
+    return fmtDuration(totalMinutes * 60 * 1000);
+  }
+  return "--";
+}
+
+
+function fundingIntervalText(hours) {
+  const h = Number(hours || 0);
+  if (!Number.isFinite(h) || h <= 0) return "--";
+  return `${fmtNumber(h, 0)}h`;
+}
+
+function strategyMaxSpreadBps() {
+  return Number(state.system?.strategy?.max_spread_bps || 0);
+}
+
+function strategyTargetNotional() {
+  return Number(state.system?.strategy?.effective_notional || 0);
+}
+
+function basisDecisionText(item) {
+  const basis = Number(item?.basis_bps || 0);
+  const maxSpread = strategyMaxSpreadBps();
+  if (!Number.isFinite(maxSpread) || maxSpread <= 0) {
+    return `当前 Basis=${fmtSignedBps(basis, 2)}（未配置阈值）`;
+  }
+  return `当前 Basis=${fmtSignedBps(basis, 2)}，阈值=${fmtSignedBps(maxSpread, 2)}，${basis > maxSpread ? '已超限' : '未超限'}`;
+}
+
+function targetNotionalText(item, matchedPlan) {
+  const planNotional = Number(matchedPlan?.target_notional_usdt || matchedPlan?.rounded_notional_usdt || 0);
+  if (Number.isFinite(planNotional) && planNotional > 0) return fmtMoney(planNotional, 2);
+  const fallback = strategyTargetNotional();
+  if (Number.isFinite(fallback) && fallback > 0) return `${fmtMoney(fallback, 2)}（策略配置）`;
+  return '--';
 }
 
 // ------------------------------------------------------------
@@ -620,15 +670,27 @@ function normalizePairs() {
 }
 
 function filteredOpportunities() {
-  const symbolKey = (els.symbolFilter.value || "").trim().toUpperCase();
+  const searchKey = (els.symbolFilter.value || "").trim().toUpperCase();
   const pairKey = els.exchangeFilter.value || "all";
   const sortMode = els.sortMode.value || "net";
 
   const items = state.opportunities.filter((item) => {
-    const symbol = String(item.symbol || "").toUpperCase();
-    if (symbolKey && !symbol.includes(symbolKey)) return false;
     if (pairKey !== "all" && opportunityPair(item) !== pairKey) return false;
-    return true;
+    if (!searchKey) return true;
+
+    const haystack = [
+      item.symbol,
+      item.long_exchange,
+      item.short_exchange,
+      item.long_venue_symbol,
+      item.short_venue_symbol,
+      opportunityPair(item),
+      opportunityDirection(item),
+    ]
+      .map((v) => String(v || "").toUpperCase())
+      .join(" ");
+
+    return haystack.includes(searchKey);
   });
 
   items.sort((a, b) => {
@@ -667,7 +729,7 @@ function renderOpportunitySummary(items) {
       <div>
         <div class="summary-kicker">当前默认展示</div>
         <div class="summary-title">${item.symbol} · ${opportunityDirection(item)}</div>
-        <div class="summary-desc">左侧列表会优先展示已经进入执行计划、或者至少满足计划条件的机会。右侧则展示当前选中机会的两腿数据、收益构成与“是否进入计划”的解释。</div>
+        <div class="summary-desc">左侧列表会优先展示已经进入执行计划、或者至少满足计划条件的机会。搜索为本地多字段检索（symbol/交易所/venue symbol/方向），仅对当前已加载机会生效。右侧则展示当前选中机会的两腿数据、收益构成与“是否进入计划”的解释。</div>
       </div>
       <div class="summary-metric-grid">
         ${summaryMetric("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl))}
@@ -676,6 +738,7 @@ function renderOpportunitySummary(items) {
         ${summaryMetric("最早结算倒计时", fmtDuration(earliestDelta))}
         ${summaryMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${summaryMetric("进入计划说明", planStatus.reason || "--")}
+        ${summaryMetric("建议持有时长", holdingDurationText(item))}
       </div>
     </div>
   `;
@@ -701,6 +764,7 @@ function renderOpportunityList(items) {
             <div><span>Basis</span><strong>${fmtSignedBps(item.basis_bps, 2)}</strong></div>
             <div><span>事件化时均 edge</span><strong>${fmtPctRatio(fundingSpreadHourly(item), 5)}</strong></div>
             <div><span>最早结算</span><strong>${fmtDuration(earliestDelta)}</strong></div>
+            <div><span>建议持有</span><strong>${holdingDurationText(item)}</strong></div>
           </div>
           <div class="opportunity-foot dual-pill">
             <span class="pill ${planStatus.cls}">${planStatus.text}</span>
@@ -721,7 +785,7 @@ function detailMetric(label, value, extraClass = "") {
   `;
 }
 
-function legCard(title, exchange, venueSymbol, fundingRate, hourlyRate, fundingTimeMs, bidPrice, askPrice, markPrice) {
+function legCard(title, exchange, venueSymbol, fundingRate, hourlyRate, fundingTimeMs, fundingIntervalHours, bidPrice, askPrice, markPrice) {
   const mid = midpoint(bidPrice, askPrice);
   return `
     <div class="detail-section">
@@ -734,6 +798,7 @@ function legCard(title, exchange, venueSymbol, fundingRate, hourlyRate, fundingT
         <div class="detail-item"><span class="detail-k">资金费率</span><span class="detail-v ${classForNumber(fundingRate)}">${fmtPctRatio(fundingRate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">小时费率</span><span class="detail-v ${classForNumber(hourlyRate)}">${fmtPctRatio(hourlyRate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">下次结算</span><span class="detail-v">${fmtTime(fundingTimeMs)}</span></div>
+        <div class="detail-item"><span class="detail-k">结算周期</span><span class="detail-v">${fundingIntervalText(fundingIntervalHours)}</span></div>
         <div class="detail-item"><span class="detail-k">盘口买一 / 卖一</span><span class="detail-v">${priceText(bidPrice)} / ${priceText(askPrice)}</span></div>
         <div class="detail-item"><span class="detail-k">盘口中间价</span><span class="detail-v">${priceText(mid)}</span></div>
         <div class="detail-item"><span class="detail-k">Mark</span><span class="detail-v">${priceText(markPrice)}</span></div>
@@ -784,17 +849,19 @@ function renderOpportunityDetail(items) {
         ${detailMetric("目标杠杆", matchedPlan ? `${fmtNumber(planTargetLeverage(matchedPlan), 2)}x` : "--")}
         ${detailMetric("Long / Short 杠杆", matchedPlan ? `${fmtNumber(planLongLeverage(matchedPlan), 2)}x / ${fmtNumber(planShortLeverage(matchedPlan), 2)}x` : "--")}
         ${detailMetric("仓位指标", matchedPlan ? (planPositionSkewBps(matchedPlan) == null ? "--" : fmtSignedBps(planPositionSkewBps(matchedPlan), 2)) : "--")}
+        ${detailMetric("目标仓位(名义)", targetNotionalText(item, matchedPlan))}
         ${detailMetric("Long 结算倒计时", fmtDuration(nextLongMs))}
         ${detailMetric("Short 结算倒计时", fmtDuration(nextShortMs))}
         ${detailMetric("预计 funding 兑现点", fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms))}
         ${detailMetric("最晚入场时间", fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms))}
         ${detailMetric("Funding 事件窗口", `${fmtNumber(item.funding_window_hours || 0, 2)} h`)}
+        ${detailMetric("建议持有时长", holdingDurationText(item))}
         ${detailMetric("Funding 事件次数", fundingEventsText(item))}
       </div>
 
       <div class="detail-grid-2">
-        ${legCard("做多腿", item.long_exchange, item.long_venue_symbol, item.long_funding_rate, item.long_funding_hourly, item.long_funding_time_ms, item.long_bid_price, item.long_ask_price, item.long_mark_price)}
-        ${legCard("做空腿", item.short_exchange, item.short_venue_symbol, item.short_funding_rate, item.short_funding_hourly, item.short_funding_time_ms, item.short_bid_price, item.short_ask_price, item.short_mark_price)}
+        ${legCard("做多腿", item.long_exchange, item.long_venue_symbol, item.long_funding_rate, item.long_funding_hourly, item.long_funding_time_ms, item.long_funding_interval_hours, item.long_bid_price, item.long_ask_price, item.long_mark_price)}
+        ${legCard("做空腿", item.short_exchange, item.short_venue_symbol, item.short_funding_rate, item.short_funding_hourly, item.short_funding_time_ms, item.short_funding_interval_hours, item.short_bid_price, item.short_ask_price, item.short_mark_price)}
       </div>
 
       <div class="detail-grid-2">
@@ -825,6 +892,8 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">Long 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planLongNotional(matchedPlan), 2) : "--"}</span></div>
             <div class="detail-item"><span class="detail-k">Short 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planShortNotional(matchedPlan), 2) : "--"}</span></div>
             <div class="detail-item"><span class="detail-k">机会拒绝原因</span><span class="detail-v">${item.reject_reason || "--"}</span></div>
+            <div class="detail-item"><span class="detail-k">跨所价差判定</span><span class="detail-v">${basisDecisionText(item)}</span></div>
+            <div class="detail-item"><span class="detail-k">跨所价差阈值</span><span class="detail-v">${fmtSignedBps(strategyMaxSpreadBps(), 2)}</span></div>
             <div class="detail-item"><span class="detail-k">是否可执行</span><span class="detail-v">${item.eligible_for_execution ? "是" : "否"}</span></div>
             <div class="detail-item"><span class="detail-k">最早结算时间</span><span class="detail-v">${fmtTime(item.earliest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">最晚结算时间</span><span class="detail-v">${fmtTime(item.latest_funding_time_ms)}</span></div>
@@ -835,7 +904,7 @@ function renderOpportunityDetail(items) {
           </div>
           <div class="insight-box">
             <div class="insight-title">怎么看这组机会</div>
-            <div class="insight-text">方向不是固定死的。系统会在每次刷新时，把“Long A / Short B”和“Long B / Short A”两个方向都完整计算一遍，再选当前更优的方向展示。Funding 收益也不再按统一小时平均外推，而是按当前已知的真实 funding 结算事件逐腿估算：如果后续 funding 更新导致反方向更优，下一轮机会就会切换成反方向。</div>
+            <div class="insight-text">方向不是固定死的。系统会在每次刷新时，把“Long A / Short B”和“Long B / Short A”两个方向都完整计算一遍，再选当前更优的方向展示。Funding 收益也不再按统一小时平均外推，而是按当前已知的真实 funding 结算事件逐腿估算。状态里“跨所价差过大”表示当前 Basis（shortBid 与 longAsk 的相对偏离）超过策略阈值 `max_spread_bps`，为避免入场成本吞噬 funding 收益会被拦截。若后续 funding 或 basis 变化导致反方向更优，下一轮机会就会切换成反方向。</div>
           </div>
         </div>
       </div>
@@ -844,18 +913,21 @@ function renderOpportunityDetail(items) {
 }
 
 function syncOpportunityHeights() {
-  // 规则：.opportunities-list 以 .opportunity-detail 的高度为准对齐。
-  // 如果列表内容本身更多，它会自然继续撑开；这里只负责在列表偏矮时补齐到详情高度。
+  // 桌面端让列表与详情区等高，并在列表内容过多时滚动，避免“列表明显高于详情”的视觉失衡。
   const listEl = els.opportunitiesList;
   const detailEl = els.opportunityDetail;
   if (!listEl || !detailEl) return;
 
   listEl.style.minHeight = '';
+  listEl.style.maxHeight = '';
+
+  if (window.innerWidth <= 1080) return;
 
   const detailHeight = detailEl.offsetHeight;
   if (!detailHeight) return;
 
   listEl.style.minHeight = `${detailHeight}px`;
+  listEl.style.maxHeight = `${detailHeight}px`;
 }
 
 
@@ -906,7 +978,7 @@ async function refreshAll() {
   // 前端看起来就会互相矛盾。
   const [system, opportunities, executions, stats] = await Promise.all([
     apiGet("/api/v1/system/status", {}),
-    apiGet("/api/v1/opportunities?limit=200", []),
+    apiGet(`/api/v1/opportunities?limit=${OPPORTUNITY_FETCH_LIMIT}`, []),
     apiGet("/api/v1/executions?limit=50", []),
     apiGet("/api/v1/snapshot-stats", {}),
   ]);
