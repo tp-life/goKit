@@ -90,7 +90,8 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 		if plan.LongEntryPrice <= 0 || plan.ShortEntryPrice <= 0 {
 			continue
 		}
-		if math.Abs(plan.CrossVenueBasisBps) > r.cfg.MaxSpreadBps {
+		maxAllowedBasisBps := r.allowedPlanBasisThresholdBps(opp)
+		if math.Abs(plan.CrossVenueBasisBps) > maxAllowedBasisBps {
 			continue
 		}
 
@@ -130,6 +131,13 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 	}
 
 	return plans
+}
+
+func (r *StrategyRunner) allowedPlanBasisThresholdBps(opp entity.Opportunity) float64 {
+	if opp.MaxAllowedBasisBps > 0 {
+		return opp.MaxAllowedBasisBps
+	}
+	return r.allowedBasisThresholdBps(fundingProjection{FundingWindowHours: opp.FundingWindowHours})
 }
 
 // isOpportunityEligible 决定一个候选是否允许进入 execution_plans。
