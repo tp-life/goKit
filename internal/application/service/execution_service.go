@@ -282,8 +282,15 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 		{role: "short_leg", exchange: plan.ShortExchange, side: ternarySide(phase == "open", "SELL", "BUY"), venueSymbol: plan.ShortVenueSymbol, qty: plan.ShortQty, price: plan.ShortEntryPrice},
 	}
 
+	type successfulLeg struct {
+		role     string
+		exchange string
+		req      exchange.TradeOrderRequest
+	}
+
 	results := make([]entity.OrderRecord, 0, 2)
 	errors := make([]string, 0, 2)
+	successes := make([]successfulLeg, 0, 2)
 	for _, leg := range legs {
 		adapter := s.trades[strings.ToLower(leg.exchange)]
 		meta, _ := s.store.Symbol(leg.exchange, plan.Symbol)
@@ -335,6 +342,9 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 		}
 		_ = s.orderRepo.Create(ctx, &orderRecord)
 		results = append(results, orderRecord)
+		if phase == "open" && orderRecord.ErrorMessage == "" && !strings.EqualFold(orderRecord.Status, "ERROR") && !strings.EqualFold(orderRecord.Status, "SKIPPED") {
+			successes = append(successes, successfulLeg{role: leg.role, exchange: leg.exchange, req: req})
+		}
 		s.logger.Info("execution_order_placed",
 			slog.String("plan_key", plan.PlanKey),
 			slog.String("phase", phase),
@@ -345,6 +355,62 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 			slog.Float64("qty", req.Quantity),
 		)
 	}
+
+	if phase == "open" && len(errors) > 0 && len(successes) > 0 {
+		s.logger.Warn("execution_open_partial_failure_hedge_start",
+			slog.String("plan_key", plan.PlanKey),
+			slog.Int("successful_legs", len(successes)),
+			slog.Int("error_legs", len(errors)),
+		)
+		for _, okLeg := range successes {
+			adapter := s.trades[strings.ToLower(okLeg.exchange)]
+			hedgeReq := okLeg.req
+			hedgeReq.Reason = "open_leg_failed_hedge"
+			hedgeReq.OrderType = "MARKET"
+			hedgeReq.ReduceOnly = true
+			hedgeReq.TimeInForce = "IOC"
+			hedgeResp := exchange.TradeOrderResult{}
+			hedgeErr := error(nil)
+			rec := entity.OrderRecord{
+				PlanKey:         plan.PlanKey,
+				ExecutionStatus: "hedge_close",
+				Phase:           "hedge_close",
+				LegRole:         okLeg.role,
+				Exchange:        okLeg.exchange,
+				Symbol:          plan.Symbol,
+				VenueSymbol:     hedgeReq.VenueSymbol,
+				ClientOrderID:   hedgeReq.ClientOrderID,
+				Side:            hedgeReq.Side,
+				OrderType:       hedgeReq.OrderType,
+				TimeInForce:     hedgeReq.TimeInForce,
+				ReduceOnly:      true,
+				RequestedQty:    hedgeReq.Quantity,
+				RequestedPrice:  hedgeReq.Price,
+				Status:          "PENDING",
+			}
+			if adapter == nil || !adapter.Enabled() {
+				rec.Status = "SKIPPED"
+				rec.ErrorMessage = fmt.Sprintf("hedge trade adapter %s disabled", okLeg.exchange)
+				errors = append(errors, rec.ErrorMessage)
+			} else {
+				hedgeResp, hedgeErr = adapter.ClosePosition(ctx, hedgeReq)
+				if hedgeErr != nil {
+					rec.Status = "ERROR"
+					rec.ErrorMessage = hedgeErr.Error()
+					errors = append(errors, fmt.Sprintf("hedge:%s:%s", okLeg.exchange, hedgeErr.Error()))
+				} else {
+					rec.Status = pickNonEmpty(hedgeResp.Status, "SUBMITTED")
+					rec.VenueOrderID = hedgeResp.VenueOrderID
+					rec.ExecutedQty = hedgeResp.ExecutedQty
+					rec.AvgPrice = hedgeResp.AveragePrice
+					rec.RawResponse = hedgeResp.RawResponse
+				}
+			}
+			_ = s.orderRepo.Create(ctx, &rec)
+			results = append(results, rec)
+		}
+	}
+
 	return results, strings.Join(errors, " | ")
 }
 

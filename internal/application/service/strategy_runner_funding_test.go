@@ -123,3 +123,12 @@ func TestAllowedBasisThresholdBps_GrowsWithWindow(t *testing.T) {
 		t.Fatalf("expected long window threshold at cap 20, got %.4f", longWindow)
 	}
 }
+
+func TestAllowedPlanBasisThresholdBps_UsesOpportunityValue(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{MaxSpreadBps: 10, DynamicMaxSpreadMultiplier: 2, DynamicMaxSpreadReferenceHours: 20}}
+	opp := entity.Opportunity{MaxAllowedBasisBps: 18, FundingWindowHours: 2}
+	got := r.allowedPlanBasisThresholdBps(opp)
+	if got != 18 {
+		t.Fatalf("expected plan threshold to respect opportunity value 18, got %.4f", got)
+	}
+}
