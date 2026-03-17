@@ -592,6 +592,8 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					ShortFundingRate:             shortFunding.FundingRate,
 					LongFundingTimeMs:            longFunding.FundingTimeMs,
 					ShortFundingTimeMs:           shortFunding.FundingTimeMs,
+					LongFundingIntervalHours:     longFunding.FundingIntervalHours,
+					ShortFundingIntervalHours:    shortFunding.FundingIntervalHours,
 					LongFundingHourly:            longHourly,
 					ShortFundingHourly:           shortHourly,
 					GrossEdgeHourly:              grossEdgeHourly,
@@ -626,9 +628,10 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].NetExpectedPNL > items[j].NetExpectedPNL })
-	if r.cfg.MaxDisplayedOpportunities > 0 && len(items) > r.cfg.MaxDisplayedOpportunities {
-		return items[:r.cfg.MaxDisplayedOpportunities]
-	}
+	// 注意：这里不再按 MaxDisplayedOpportunities 做截断。
+	// 原因：机会列表的“搜索/筛选”需要基于完整 batch 数据；
+	// 若在计算层提前截断，后端与前端都无法再检索被截掉的机会。
+	// 展示数量控制应由查询参数(limit)与前端分页/筛选承担。
 	return items
 }
 

@@ -1,98 +1,172 @@
 app:
+  # 服务名（用于日志/展示）。
   name: "funding-arbitrage-monitor"
+  # 服务版本号（用于排障与前后端兼容确认）。
   version: "v2.0.0"
+  # 全局调试开关（true 时建议配合更详细日志级别使用）。
   debug: false
 
 web:
+  # HTTP 服务监听地址。
   port: ":8080"
+  # Web 页面展示的应用名称。
   app_name: "Funding Arbitrage Monitor"
+  # Fiber prefork 开关（多进程模式，通常本地开发保持 false）。
   prefork: false
 
 rpc:
+  # gRPC 服务监听地址。
   port: ":9090"
+  # gRPC 连接最大空闲时间。
   max_connection_idle: 300s
+  # gRPC 请求超时时间。
   timeout: 5s
 
 database:
+  # 数据库驱动。
   driver: "sqlite"
+  # 数据库连接串（sqlite 下为文件路径）。
   dsn: "data/arbitrage.db"
+  # 空闲连接池大小。
   max_idle_conns: 1
+  # 最大打开连接数。
   max_open_conns: 1
+  # ORM 日志级别（silent/error/warn/info）。
   log_mode: "warn"
+  # 慢 SQL 阈值。
   slow_threshold: 200ms
 
 log:
+  # 日志级别（debug/info/warn/error）。
   level: "info"
+  # 日志格式（json/text）。
   format: "json"
+  # 是否在日志中附带源码位置。
   source: false
 
 strategy:
+  # 策略总开关（false 时仅服务启动，不跑策略循环）。
   enabled: true
+
   # 统一使用 canonical symbol（基础币）做监控范围。
   # Binance / Aster 的 BTCUSDT、Hyperliquid 的 BTC 最终都会映射到 BTC。
   allowed_symbols: ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LINK", "AVAX", "LTC"]
+
+  # 报价资产过滤（例如 USDT）。
   quote_asset: "USDT"
+
+  # Funding 机会的最大评估持有窗口（小时）。
+  # 例如设为 24，算法会允许评估到未来 24h 的结算路径，而不只看最近一次结算。
   hold_hours: 24
+
+  # 总资金（USDT），用于推导可分配名义资金。
   total_capital_usdt: 1000
+  # 资金利用率（0~1）。
   capital_utilization: 0.8
+  # 目标杠杆。
   leverage: 2
+  # 假设名义价值（当无法从资金*杠杆推导时的兜底值）。
   assumed_notional: 1600
+
+  # 扣除手续费/滑点/安全垫后的最小净收益门槛（USDT）。
   min_net_pnl: 1.5
+  # 前端展示机会数量上限（仅展示层建议值，非核心计算截断）。
   max_displayed_opportunities: 20
+
+  # 开平仓总滑点假设（bps），会从预期收益中直接扣除。
   slippage_bps: 2
+  # 额外安全垫（USDT），用于覆盖模型外误差。
   safety_buffer_usdt: 0.2
+
+  # 入场下单模式（maker/taker/mixed）。
   entry_mode: "maker"
+  # 出场下单模式（maker/taker/mixed）。
   exit_mode: "mixed"
+
+  # 行情最大允许延迟（超过则判为 stale）。
   max_data_age: 15s
+  # 跨所 basis 超过该阈值则不做（bps）。
   max_spread_bps: 12
+
+  # 开仓窗口上边界：距离 required_entry_by 最多提前多久允许开仓。
   entry_lead_time: 180s
+  # 开仓窗口下边界：距离 required_entry_by 少于该时间则停止开仓。
   entry_cutoff_time: 45s
+
+  # funding 快照落库周期。
   funding_snapshot_persist_interval: 60s
+  # 盘口 top 快照落库周期。
   book_snapshot_persist_interval: 20s
+  # 快照保留时长（超出后清理）。
   snapshot_retention: 168h
+  # 机会计算循环周期。
   opportunity_calc_interval: 5s
+
   # 对同一腿未来第2次及以后 funding 的费率衰减系数，降低 1h 费率瞬时极值外推风险。
   # 1.0=不衰减（激进）；0.6=保守默认。
   funding_rate_continuation_decay: 0.6
+
+  # 盘口快照最小价格变化阈值（bps），低于该值可不落库。
   book_snapshot_min_price_change_bps: 0.5
+  # 盘口快照最小数量变化比例，低于该值可不落库。
   book_snapshot_min_qty_change_ratio: 0.05
+
   # 全市场 funding 粗筛后，最多挑多少个 symbol 进入动态深扫池。
-  dynamic_candidate_limit: 30  # =0 表示不设上限，所有 funding 候选都允许进入深扫池
-  # 每轮额外抽多少个“没进 TopN 的币”做冷门轮转补扫。
-  rotation_batch_size: 25      # 冷门币轮转补扫数量；=0 表示关闭轮转
+  # =0 表示不设上限，所有 funding 候选都允许进入深扫池。
+  dynamic_candidate_limit: 30
+  # 每轮额外抽多少个“没进 TopN 的币”做冷门轮转补扫；=0 表示关闭轮转。
+  rotation_batch_size: 25
   # 多久重算一次深扫池。
   rotation_interval: 30s
   # 某个 symbol 一旦进入深扫池，至少保留这么久，避免 websocket 频繁抖动。
-  deep_scan_hold_duration: 3m # 候选进入深扫池后最少保留多久，避免 websocket 频繁抖动
+  deep_scan_hold_duration: 3m
 
   execution:
     # true = 允许真实下单；false = 仅做 dry-run 记录，不会向交易所发单。
     enabled: false
+    # 是否自动开仓。
     auto_entry: true
+    # 是否自动平仓。
     auto_close: true
     # 在最后一个 funding 时间之后，再额外等待一小段时间执行自动平仓。
     close_grace_period: 2m
+    # 执行引擎轮询周期。
     loop_interval: 3s
+    # 每轮最多读取多少条最新执行计划/记录。
     max_latest_plans: 50
 
 exchanges:
   binance:
+    # 交易所适配器开关。
     enabled: true
+    # 展示名称。
     label: "Binance"
+    # 结算资产（用于跨所比较与风险提示）。
     settle_asset: "USDT"
+    # REST API 基地址。
     rest_base_url: "https://fapi.binance.com"
+    # 行情 WS 基地址（市场数据）。
     market_ws_base_url: "wss://fstream.binance.com"
+    # 公共 WS 基地址（交易/订阅可能复用）。
     public_ws_base_url: "wss://fstream.binance.com"
+    # 请求超时。
     request_timeout: 10s
+    # 默认 funding 周期（小时），当接口未返回时兜底。
     default_funding_interval_hours: 8
     proxy:
+      # 是否启用 HTTP 代理。
       enabled: false
+      # 代理地址。
       url: "http://127.0.0.1:7890"
     fees:
+      # Maker 手续费（bps）。
       maker_bps: 2.0
+      # Taker 手续费（bps）。
       taker_bps: 5.0
     auth:
+      # API Key 的环境变量名。
       api_key_env: "BINANCE_API_KEY"
+      # API Secret 的环境变量名。
       api_secret_env: "BINANCE_API_SECRET"
 
   aster:
@@ -130,6 +204,9 @@ exchanges:
       maker_bps: 1.5
       taker_bps: 4.5
     auth:
+      # 私钥环境变量名（用于签名下单）。
       private_key_env: "HYPERLIQUID_PRIVATE_KEY"
+      # 主账户地址环境变量名。
       account_address_env: "HYPERLIQUID_ACCOUNT_ADDRESS"
+      # Vault 地址环境变量名（如使用金库模式）。
       vault_address_env: "HYPERLIQUID_VAULT_ADDRESS"
