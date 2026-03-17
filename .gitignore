@@ -39,3 +39,4 @@ tmp/
 cmd/server/web/
 
 web/node_modules/*
+__debug_bin*
