@@ -51,6 +51,9 @@ strategy:
   book_snapshot_persist_interval: 20s
   snapshot_retention: 168h
   opportunity_calc_interval: 5s
+  # 对同一腿未来第2次及以后 funding 的费率衰减系数，降低 1h 费率瞬时极值外推风险。
+  # 1.0=不衰减（激进）；0.6=保守默认。
+  funding_rate_continuation_decay: 0.6
   book_snapshot_min_price_change_bps: 0.5
   book_snapshot_min_qty_change_ratio: 0.05
   # 全市场 funding 粗筛后，最多挑多少个 symbol 进入动态深扫池。
