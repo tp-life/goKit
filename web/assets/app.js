@@ -272,6 +272,21 @@ function basisDecisionText(item) {
   return `当前 Basis=${fmtSignedBps(basis, 2)}，阈值=${fmtSignedBps(maxSpread, 2)}，${basis > maxSpread ? "已超限" : "未超限"}`;
 }
 
+function basisTooWideHint(item) {
+  if (String(item?.status || "").toLowerCase() !== "basis_too_wide") return "";
+  return `当前跨所价差 ${fmtSignedBps(item?.basis_bps, 2)}（阈值 ${fmtSignedBps(maxAllowedBasisForItem(item), 2)}）`;
+}
+
+function explainOpportunityRejectReason(item) {
+  const basisHint = basisTooWideHint(item);
+  if (basisHint) {
+    return item?.reject_reason
+      ? `${item.reject_reason} · ${basisHint}`
+      : basisHint;
+  }
+  return item?.reject_reason || explainStatus(item?.status);
+}
+
 function targetNotionalText(item, matchedPlan) {
   const planNotional = Number(
     matchedPlan?.target_notional_usdt ||
@@ -388,7 +403,7 @@ function opportunityPlanStatus(item) {
   return {
     text: "未进入计划",
     cls: "bad",
-    reason: item.reject_reason || explainStatus(item.status),
+    reason: explainOpportunityRejectReason(item),
   };
 }
 
@@ -611,6 +626,38 @@ function planPositionSkewBps(plan) {
   const avg = (Math.abs(longNotional) + Math.abs(shortNotional)) / 2;
   if (!avg) return null;
   return (Math.abs(longNotional - shortNotional) / avg) * 10000;
+}
+
+function syntheticPlanForOpportunity(item) {
+  if (!item || typeof item !== "object") return null;
+  const strategy = state.system?.strategy || {};
+  const targetLeverage = Number(strategy.leverage || 0);
+  const capitalAllocated = Number(
+    strategy.capital_total_usdt || 0,
+  ) * Number(strategy.capital_utilization || 0);
+  const targetNotional = Number(strategy.effective_notional || 0);
+  const longEntryPrice = Number(item.long_ask_price || 0);
+  const shortEntryPrice = Number(item.short_bid_price || 0);
+
+  const synthetic = {
+    target_leverage: targetLeverage,
+    capital_allocated_usdt: capitalAllocated,
+    target_notional_usdt: targetNotional,
+    long_leverage: targetLeverage,
+    short_leverage: targetLeverage,
+    long_entry_price: longEntryPrice,
+    short_entry_price: shortEntryPrice,
+  };
+
+  if (targetNotional > 0 && longEntryPrice > 0) {
+    synthetic.long_qty = targetNotional / longEntryPrice;
+    synthetic.long_notional_usdt = targetNotional;
+  }
+  if (targetNotional > 0 && shortEntryPrice > 0) {
+    synthetic.short_qty = targetNotional / shortEntryPrice;
+    synthetic.short_notional_usdt = targetNotional;
+  }
+  return synthetic;
 }
 
 // ------------------------------------------------------------
@@ -844,7 +891,7 @@ function renderOpportunityList(items) {
         Number(item.earliest_funding_time_ms || 0) - Date.now();
       const planStatus = opportunityPlanStatus(item);
       return `
-        <button class="opportunity-item ${active ? "active" : ""}" data-opportunity-key="${opportunityKey(item)}" type="button">
+	        <button class="opportunity-item ${active ? "active" : ""}" data-opportunity-key="${opportunityKey(item)}" type="button">
           <div class="opportunity-item-head">
             <div>
               <div class="opportunity-item-title">${item.symbol}</div>
@@ -863,6 +910,7 @@ function renderOpportunityList(items) {
             <span class="pill ${planStatus.cls}">${planStatus.text}</span>
             <span class="pill ${item.eligible_for_execution ? "good" : "warn"}">${item.eligible_for_execution ? "可执行" : explainStatus(item.status)}</span>
           </div>
+          ${basisTooWideHint(item) ? `<div class="opportunity-item-hint muted-text">${basisTooWideHint(item)}</div>` : ""}
         </button>
       `;
     })
@@ -924,6 +972,7 @@ function renderOpportunityDetail(items) {
   const nextLongMs = Number(item.long_funding_time_ms || 0) - Date.now();
   const nextShortMs = Number(item.short_funding_time_ms || 0) - Date.now();
   const matchedPlan = bestPlanForOpportunity(item);
+  const displayPlan = matchedPlan || syntheticPlanForOpportunity(item);
   const planStatus = opportunityPlanStatus(item);
   state.selectedOpportunityKey = opportunityKey(item);
   state.selectedPlanKey = matchedPlan?.plan_key || null;
@@ -951,11 +1000,11 @@ function renderOpportunityDetail(items) {
         ${detailMetric("动态价差阈值", fmtSignedBps(maxAllowedBasisForItem(item), 2))}
         ${detailMetric("资金收益", fmtMoney(item.gross_funding_pnl), classForNumber(item.gross_funding_pnl))}
         ${detailMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
-        ${detailMetric("预计投入资金", matchedPlan ? fmtMoney(planCapitalAllocated(matchedPlan), 2) : "--")}
-        ${detailMetric("目标杠杆", matchedPlan ? `${fmtNumber(planTargetLeverage(matchedPlan), 2)}x` : "--")}
-        ${detailMetric("Long / Short 杠杆", matchedPlan ? `${fmtNumber(planLongLeverage(matchedPlan), 2)}x / ${fmtNumber(planShortLeverage(matchedPlan), 2)}x` : "--")}
-        ${detailMetric("仓位指标", matchedPlan ? (planPositionSkewBps(matchedPlan) == null ? "--" : fmtSignedBps(planPositionSkewBps(matchedPlan), 2)) : "--")}
-        ${detailMetric("目标仓位(名义)", targetNotionalText(item, matchedPlan))}
+        ${detailMetric("预计投入资金", displayPlan ? fmtMoney(planCapitalAllocated(displayPlan), 2) : "--")}
+        ${detailMetric("目标杠杆", displayPlan ? `${fmtNumber(planTargetLeverage(displayPlan), 2)}x` : "--")}
+        ${detailMetric("Long / Short 杠杆", displayPlan ? `${fmtNumber(planLongLeverage(displayPlan), 2)}x / ${fmtNumber(planShortLeverage(displayPlan), 2)}x` : "--")}
+        ${detailMetric("仓位指标", displayPlan ? (planPositionSkewBps(displayPlan) == null ? "--" : fmtSignedBps(planPositionSkewBps(displayPlan), 2)) : "--")}
+        ${detailMetric("目标仓位(名义)", targetNotionalText(item, displayPlan))}
         ${detailMetric("Long 结算倒计时", fmtDuration(nextLongMs))}
         ${detailMetric("Short 结算倒计时", fmtDuration(nextShortMs))}
         ${detailMetric("预计 funding 兑现点", fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms))}
@@ -997,7 +1046,7 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">计划关联批次</span><span class="detail-v">${matchedPlan?.opportunity_batch_id || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">Long 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planLongNotional(matchedPlan), 2) : "--"}</span></div>
             <div class="detail-item"><span class="detail-k">Short 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planShortNotional(matchedPlan), 2) : "--"}</span></div>
-            <div class="detail-item"><span class="detail-k">机会拒绝原因</span><span class="detail-v">${item.reject_reason || "--"}</span></div>
+            <div class="detail-item"><span class="detail-k">机会拒绝原因</span><span class="detail-v">${explainOpportunityRejectReason(item) || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">跨所价差判定</span><span class="detail-v">${basisDecisionText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">跨所价差阈值</span><span class="detail-v">${fmtSignedBps(maxAllowedBasisForItem(item), 2)}</span></div>
             <div class="detail-item"><span class="detail-k">是否可执行</span><span class="detail-v">${item.eligible_for_execution ? "是" : "否"}</span></div>
