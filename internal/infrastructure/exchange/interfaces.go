@@ -60,6 +60,34 @@ type TradeOrderResult struct {
 	RawResponse     string
 }
 
+type OrderLookupRequest struct {
+	CanonicalSymbol string
+	VenueSymbol     string
+	AssetID         string
+	ClientOrderID   string
+	VenueOrderID    string
+}
+
+type OrderStatus struct {
+	Exchange      string
+	Status        string
+	ExecutedQty   float64
+	AveragePrice  float64
+	VenueOrderID  string
+	ClientOrderID string
+	Terminal      bool
+	Canceled      bool
+	RawResponse   string
+}
+
+type AccountSnapshot struct {
+	Exchange         string
+	Equity           float64
+	AvailableBalance float64
+	MarginUsed       float64
+	RawResponse      string
+}
+
 type Position struct {
 	Exchange      string
 	Symbol        string
@@ -76,6 +104,8 @@ type TradeAdapter interface {
 	PlaceOrder(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error)
 	ClosePosition(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error)
 	GetPosition(ctx context.Context, canonicalSymbol, venueSymbol, assetID string) (Position, error)
+	GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error)
+	GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error)
 }
 
 func BuildMarketMap(items []MarketAdapter) map[string]MarketAdapter {

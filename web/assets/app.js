@@ -513,7 +513,7 @@ function explainStatus(status) {
   }
 }
 
-function selectedOpportunity(items) {
+function currentSelectedOpportunity(items) {
   if (!items.length) return null;
   const found = items.find(
     (item) => opportunityKey(item) === state.selectedOpportunityKey,
@@ -988,7 +988,7 @@ function summaryMetric(label, value, extraClass = "") {
 }
 
 function renderOpportunitySummary(items) {
-  const item = selectedOpportunity(items);
+  const item = currentSelectedOpportunity(items);
   if (!item) {
     els.opportunitySummary.innerHTML = "";
     return;
@@ -1168,7 +1168,7 @@ function renderProjectionDetails(item) {
 }
 
 function renderOpportunityDetail(items) {
-  const item = selectedOpportunity(items);
+  const item = currentSelectedOpportunity(items);
   if (!item) {
     els.opportunityDetail.innerHTML =
       '<div class="empty-state show">当前没有可查看的套利机会。</div>';
