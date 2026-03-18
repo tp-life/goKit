@@ -32,15 +32,21 @@ type ExecutionPlan struct {
 	LongMinNotionalUSDT  float64 `json:"long_min_notional_usdt"`
 	ShortMinNotionalUSDT float64 `json:"short_min_notional_usdt"`
 
-	CrossVenueBasisBps float64 `json:"cross_venue_basis_bps"`
-	FundingCarryPNL    float64 `json:"funding_carry_pnl"`
-	EntryFeePNL        float64 `json:"entry_fee_pnl"`
-	ExitFeePNL         float64 `json:"exit_fee_pnl"`
-	SlippagePNL        float64 `json:"slippage_pnl"`
-	SafetyBufferPNL    float64 `json:"safety_buffer_pnl"`
-	NetExpectedPNL     float64 `json:"net_expected_pnl"`
-	NetExpectedPNLBps  float64 `json:"net_expected_pnl_bps"`
-	Score              float64 `gorm:"index:idx_plan_score" json:"score"`
+	CrossVenueBasisBps     float64 `json:"cross_venue_basis_bps"`
+	FundingCarryPNL        float64 `json:"funding_carry_pnl"`
+	EntryFeePNL            float64 `json:"entry_fee_pnl"`
+	ExitFeePNL             float64 `json:"exit_fee_pnl"`
+	SlippagePNL            float64 `json:"slippage_pnl"`
+	SafetyBufferPNL        float64 `json:"safety_buffer_pnl"`
+	EntryPenaltyBps        float64 `json:"entry_penalty_bps"`
+	ExitPenaltyBps         float64 `json:"exit_penalty_bps"`
+	HedgePenaltyBps        float64 `json:"hedge_penalty_bps"`
+	ExecutionPenaltyBps    float64 `json:"execution_penalty_bps"`
+	ExecutionPenaltyModel  string  `gorm:"size:64" json:"execution_penalty_model"`
+	ExecutionPenaltyBucket string  `gorm:"size:64" json:"execution_penalty_bucket"`
+	NetExpectedPNL         float64 `json:"net_expected_pnl"`
+	NetExpectedPNLBps      float64 `json:"net_expected_pnl_bps"`
+	Score                  float64 `gorm:"index:idx_plan_score" json:"score"`
 
 	EarliestFundingTimeMs        int64   `json:"earliest_funding_time_ms"`
 	LatestFundingTimeMs          int64   `json:"latest_funding_time_ms"`

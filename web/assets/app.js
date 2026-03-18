@@ -718,6 +718,20 @@ function syntheticPlanForOpportunity(item) {
   const shortEntryPrice = Number(item.short_bid_price || 0);
 
   const synthetic = {
+    plan_key: "synthetic-preview",
+    symbol: item.symbol,
+    status: item.eligible_for_execution ? "preview_ready" : "preview_only",
+    ready_now: Boolean(item.eligible_for_execution),
+    long_exchange: item.long_exchange,
+    short_exchange: item.short_exchange,
+    long_venue_symbol: item.long_venue_symbol,
+    short_venue_symbol: item.short_venue_symbol,
+    net_expected_pnl: item.net_expected_pnl,
+    projected_funding_time_ms: item.projected_funding_time_ms,
+    latest_funding_time_ms: item.latest_funding_time_ms,
+    funding_event_count: item.funding_event_count,
+    funding_event_count_estimate: item.funding_event_count_estimate,
+    cross_venue_basis_bps: item.basis_bps,
     target_leverage: targetLeverage,
     capital_allocated_usdt: capitalAllocated,
     target_notional_usdt: targetNotional,
@@ -762,6 +776,84 @@ function renderExecutionControls(planKey, status) {
   `;
 }
 
+function compactStat(label, value, extraClass = "") {
+  return `
+    <div class="compact-stat ${extraClass}">
+      <span>${label}</span>
+      <strong>${value}</strong>
+    </div>
+  `;
+}
+
+function planCompactMeta(item, linkedOpp) {
+  const metrics = [
+    compactStat("状态", item.status || "--"),
+    compactStat("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl)),
+    compactStat("投入", fmtMoney(planCapitalAllocated(item), 2)),
+    compactStat("杠杆", `${fmtNumber(planLongLeverage(item), 2)}x / ${fmtNumber(planShortLeverage(item), 2)}x`),
+    compactStat("Funding", fundingEventsText(item)),
+    compactStat("兑现", fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)),
+    compactStat("关联机会", linkedOpp ? "已关联" : "--", linkedOpp ? "positive" : "muted-text"),
+  ];
+  return `<div class="compact-stat-grid">${metrics.join("")}</div>`;
+}
+
+function renderCompactPlanCard(item, { selected = false, linkedOpp = null, showActions = true } = {}) {
+  const linkedOppKey = linkedOpp ? opportunityKey(linkedOpp) : "";
+  const isInteractive = Boolean(showActions) || Boolean(linkedOppKey);
+  const positionSkew = planPositionSkewBps(item);
+  const summaryLine = [
+    `${item.long_exchange} Long ${item.long_venue_symbol || "--"}`,
+    `${item.short_exchange} Short ${item.short_venue_symbol || "--"}`,
+    `仓位偏移 ${positionSkew == null ? "--" : fmtSignedBps(positionSkew, 2)}`,
+    `Basis ${fmtNumber(item.cross_venue_basis_bps, 4)} bps`,
+  ].join(" · ");
+  return `
+    <div class="plan-card plan-card-compact ${isInteractive ? "clickable" : ""} ${selected ? "active" : ""}" ${isInteractive ? `data-plan-select="1" data-plan-key="${item.plan_key}" data-opportunity-key="${linkedOppKey}"` : ""}>
+      <div class="plan-head plan-head-compact">
+        <div>
+          <div class="plan-title">${item.symbol} · ${item.long_exchange} / ${item.short_exchange}</div>
+          <div class="plan-sub">${item.plan_key} · ${summaryLine}</div>
+        </div>
+        <div class="plan-head-right">
+          <span class="pill ${item.ready_now ? "good" : "warn"}">${item.ready_now ? "Ready" : "Waiting"}</span>
+          <div class="plan-pnl ${classForNumber(item.net_expected_pnl)}">${fmtMoney(item.net_expected_pnl)}</div>
+        </div>
+      </div>
+      ${planCompactMeta(item, linkedOpp)}
+      ${showActions ? renderExecutionControls(item.plan_key, item.status) : ""}
+    </div>
+  `;
+}
+
+function renderCompactExecutionCard(item) {
+  const openCount = item.open_order_count || 0;
+  const closeCount = item.close_order_count || 0;
+  return `
+    <div class="plan-card plan-card-compact">
+      <div class="plan-head plan-head-compact">
+        <div>
+          <div class="plan-title">${item.symbol} · ${item.long_exchange} / ${item.short_exchange}</div>
+          <div class="plan-sub">${item.plan_key}</div>
+        </div>
+        <div class="plan-head-right">
+          <span class="pill ${String(item.status || "").includes("closed") ? "warn" : "good"}">${item.status || "--"}</span>
+          <div class="plan-pnl">${item.live_trading ? "LIVE" : "DRY"}</div>
+        </div>
+      </div>
+      <div class="compact-stat-grid">
+        ${compactStat("开仓时间", fmtTime(item.opened_at_ms))}
+        ${compactStat("平仓时间", fmtTime(item.closed_at_ms))}
+        ${compactStat("开仓单", String(openCount))}
+        ${compactStat("平仓单", String(closeCount))}
+        ${compactStat("自动平仓", item.auto_close ? "YES" : "NO")}
+      </div>
+      ${item.last_error ? `<div class="status-desc compact-status-desc">${item.last_error}</div>` : ""}
+      ${renderExecutionControls(item.plan_key, item.status)}
+    </div>
+  `;
+}
+
 function renderPlans() {
   if (!state.plans.length) {
     els.plansEmpty.style.display = "block";
@@ -790,52 +882,13 @@ function renderPlans() {
   els.plansList.innerHTML =
     batchBanner +
     sortedPlans
-      .map((item) => {
-        const selected =
-          String(item.plan_key || "") === String(state.selectedPlanKey || "");
-        const linkedOpp = matchingOpportunityForPlan(item);
-        const linkedOppKey = linkedOpp ? opportunityKey(linkedOpp) : "";
-        const positionSkew = planPositionSkewBps(item);
-        const capitalAllocated = planCapitalAllocated(item);
-        const targetLeverage = planTargetLeverage(item);
-        const longLeverage = planLongLeverage(item);
-        const shortLeverage = planShortLeverage(item);
-        const longNotional = planLongNotional(item);
-        const shortNotional = planShortNotional(item);
-
-        return `
-        <div class="plan-card clickable ${selected ? "active" : ""}" data-plan-select="1" data-plan-key="${item.plan_key}" data-opportunity-key="${linkedOppKey}">
-          <div class="plan-head">
-            <div>
-              <div class="plan-title">${item.symbol} · ${item.long_exchange} long / ${item.short_exchange} short</div>
-              <div class="plan-sub">planKey=${item.plan_key} · status=${item.status}</div>
-            </div>
-            <div class="plan-pnl ${classForNumber(item.net_expected_pnl)}">${fmtMoney(item.net_expected_pnl)}</div>
-          </div>
-          <div class="plan-grid">
-            <div><span>Long</span><strong>${item.long_venue_symbol} · ${fmtNumber(item.long_qty, 6)} @ ${priceText(item.long_entry_price)}</strong></div>
-            <div><span>Short</span><strong>${item.short_venue_symbol} · ${fmtNumber(item.short_qty, 6)} @ ${priceText(item.short_entry_price)}</strong></div>
-            <div><span>Long 杠杆</span><strong>${fmtNumber(longLeverage, 2)}x</strong></div>
-            <div><span>Short 杠杆</span><strong>${fmtNumber(shortLeverage, 2)}x</strong></div>
-            <div><span>预计投入资金</span><strong>${fmtMoney(capitalAllocated, 2)}</strong></div>
-            <div><span>目标杠杆</span><strong>${fmtNumber(targetLeverage, 2)}x</strong></div>
-            <div><span>Long 仓位名义</span><strong>${fmtMoney(longNotional, 2)}</strong></div>
-            <div><span>Short 仓位名义</span><strong>${fmtMoney(shortNotional, 2)}</strong></div>
-            <div><span>仓位指标</span><strong>${positionSkew == null ? "--" : fmtSignedBps(positionSkew, 2)}</strong></div>
-            <div><span>Basis</span><strong>${fmtNumber(item.cross_venue_basis_bps, 4)} bps</strong></div>
-            <div><span>预计 funding 兑现点</span><strong>${fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)}</strong></div>
-            <div><span>最晚入场时间</span><strong>${fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms)}</strong></div>
-            <div><span>计划退出时间</span><strong>${fmtTime(item.target_close_time_ms)}</strong></div>
-            <div><span>Ready</span><strong>${item.ready_now ? "YES" : "NO"}</strong></div>
-            <div><span>关联机会</span><strong>${linkedOpp ? "点击可跳转" : "--"}</strong></div>
-            <div><span>Funding 事件</span><strong>${fundingEventsText(item)}</strong></div>
-            <div><span>计算模式</span><strong>${fundingModeText(item)}</strong></div>
-            <div><span>目标收益</span><strong class="${classForNumber(item.net_expected_pnl)}">${fmtMoney(item.net_expected_pnl)}</strong></div>
-          </div>
-          ${renderExecutionControls(item.plan_key, item.status)}
-        </div>
-      `;
-      })
+      .map((item) =>
+        renderCompactPlanCard(item, {
+          selected:
+            String(item.plan_key || "") === String(state.selectedPlanKey || ""),
+          linkedOpp: matchingOpportunityForPlan(item),
+        }),
+      )
       .join("");
 }
 
@@ -847,29 +900,7 @@ function renderExecutions() {
   }
   els.executionsEmpty.style.display = "none";
   els.executionsList.innerHTML = state.executions
-    .map(
-      (item) => `
-        <div class="plan-card">
-          <div class="plan-head">
-            <div>
-              <div class="plan-title">${item.symbol} · ${item.long_exchange} / ${item.short_exchange}</div>
-              <div class="plan-sub">${item.plan_key}</div>
-            </div>
-            <div class="plan-pnl">${item.status}</div>
-          </div>
-          <div class="plan-grid">
-            <div><span>Live</span><strong>${item.live_trading ? "YES" : "NO"}</strong></div>
-            <div><span>Auto Close</span><strong>${item.auto_close ? "YES" : "NO"}</strong></div>
-            <div><span>Opened</span><strong>${fmtTime(item.opened_at_ms)}</strong></div>
-            <div><span>Closed</span><strong>${fmtTime(item.closed_at_ms)}</strong></div>
-            <div><span>Open Orders</span><strong>${item.open_order_count || 0}</strong></div>
-            <div><span>Close Orders</span><strong>${item.close_order_count || 0}</strong></div>
-          </div>
-          <div class="status-desc">${item.last_error || "--"}</div>
-          ${renderExecutionControls(item.plan_key, item.status)}
-        </div>
-      `,
-    )
+    .map((item) => renderCompactExecutionCard(item))
     .join("");
 }
 
@@ -1101,6 +1132,17 @@ function renderOpportunityDetail(items) {
       <div class="detail-grid-2">
         ${legCard("做多腿", item.long_exchange, item.long_venue_symbol, item.long_funding_rate, item.long_future_funding_rate, item.long_funding_hourly, item.long_funding_time_ms, item.long_funding_interval_hours, item.long_bid_price, item.long_ask_price, item.long_mark_price)}
         ${legCard("做空腿", item.short_exchange, item.short_venue_symbol, item.short_funding_rate, item.short_future_funding_rate, item.short_funding_hourly, item.short_funding_time_ms, item.short_funding_interval_hours, item.short_bid_price, item.short_ask_price, item.short_mark_price)}
+      </div>
+
+      <div class="detail-section detail-section-tight linked-plan-section">
+        <div class="detail-section-head">
+          <div>
+            <div class="detail-section-title">关联执行计划</div>
+            <div class="detail-subtitle">把最相关的计划压缩进机会详情里，查看机会时不需要再被整块执行计划列表打断。</div>
+          </div>
+          <span class="pill ${matchedPlan ? "good" : "warn"}">${matchedPlan ? "已生成计划" : "仅展示估算仓位"}</span>
+        </div>
+        ${displayPlan ? renderCompactPlanCard(displayPlan, { selected: Boolean(matchedPlan), linkedOpp: item, showActions: Boolean(matchedPlan) }) : '<div class="empty-state show compact-empty">当前没有可展示的关联执行计划。</div>'}
       </div>
 
       <div class="detail-grid-2">
