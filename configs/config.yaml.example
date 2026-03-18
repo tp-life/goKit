@@ -107,6 +107,14 @@ strategy:
   # 机会计算循环周期。
   opportunity_calc_interval: 5s
 
+  # funding 平滑估算的历史回看窗口。
+  # 注意：若持仓只覆盖当前这一轮结算，系统仍直接使用当前 funding 快照；
+  # 只有跨到后续多轮结算时，才会将“当前 funding 快照”和该窗口内的历史均值做混合。
+  funding_history_lookback: 6h
+  # 当前 funding 快照在平滑估算中的权重（0~1）。
+  # 越高越贴近当前市场，越低越偏向历史均值。
+  funding_smoothing_current_weight: 0.7
+
   # 对同一腿未来第2次及以后 funding 的费率衰减系数，降低 1h 费率瞬时极值外推风险。
   # 1.0=不衰减（激进）；0.6=保守默认。
   funding_rate_continuation_decay: 0.6
