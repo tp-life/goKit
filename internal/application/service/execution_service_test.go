@@ -114,6 +114,9 @@ func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	if hedgeReq.Reason != "open_leg_failed_hedge" {
 		t.Fatalf("expected hedge reason, got %s", hedgeReq.Reason)
 	}
+	if hedgeReq.Side != "SELL" {
+		t.Fatalf("expected hedge close side SELL for previously opened BUY leg, got %s", hedgeReq.Side)
+	}
 	if !hedgeReq.ReduceOnly {
 		t.Fatalf("expected hedge request reduce-only")
 	}
@@ -127,5 +130,17 @@ func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	hedgeRecord := results[2]
 	if hedgeRecord.Phase != "hedge_close" {
 		t.Fatalf("expected hedge phase record, got %s", hedgeRecord.Phase)
+	}
+}
+
+func TestReverseSide(t *testing.T) {
+	if got := reverseSide("BUY"); got != "SELL" {
+		t.Fatalf("expected BUY -> SELL, got %s", got)
+	}
+	if got := reverseSide("sell"); got != "BUY" {
+		t.Fatalf("expected sell -> BUY, got %s", got)
+	}
+	if got := reverseSide("UNKNOWN"); got != "UNKNOWN" {
+		t.Fatalf("expected unknown side to remain unchanged, got %s", got)
 	}
 }
