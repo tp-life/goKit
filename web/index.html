@@ -97,29 +97,7 @@
           </section>
         </section>
 
-        <section class="card plans-full-row">
-          <div class="card-head">
-            <div>
-              <div class="section-title">执行计划</div>
-              <div class="section-desc">单独一整行展示当前计划的投入资金、双腿倍率、Long/Short 仓位与手动开平仓操作。</div>
-            </div>
-          </div>
-          <div id="plans-list" class="plan-list"></div>
-          <div id="plans-empty" class="empty-state">当前没有执行计划。</div>
-        </section>
-
-        <section class="card">
-          <div class="card-head">
-            <div>
-              <div class="section-title">执行记录</div>
-              <div class="section-desc">真实执行或 dry-run 的开平仓状态都会落在这里。</div>
-            </div>
-          </div>
-          <div id="executions-list" class="plan-list"></div>
-          <div id="executions-empty" class="empty-state">当前没有执行记录。</div>
-        </section>
-
-        <section class="card">
+        <section class="card opportunities-card">
           <div class="card-head card-head-wrap">
             <div>
               <div class="section-title">套利机会</div>
@@ -151,8 +129,44 @@
 
           <div id="opportunities-empty" class="empty-state">当前没有套利机会。</div>
         </section>
+
+        <section class="card execution-board">
+          <div class="card-head card-head-wrap">
+            <div>
+              <div class="section-title">执行面板</div>
+              <div class="section-desc">执行计划移到底部集中展示，默认以紧凑速览形式呈现，减少对套利机会主视图的占用；下方仍保留执行记录追踪真实开平仓状态。</div>
+            </div>
+          </div>
+          <div class="execution-board-grid">
+            <section>
+              <div class="execution-subhead">
+                <div class="execution-subhead-row">
+                  <div>
+                    <div class="section-title section-title-sm">执行计划速览</div>
+                    <div class="section-desc">支持切换查看“当前批次 / 全部计划 / 当前选中机会相关计划”，并与详情页中的真实计划 / 估算预览明确区分。</div>
+                  </div>
+                  <select id="plan-view-mode" class="select compact">
+                    <option value="batch">当前批次</option>
+                    <option value="all">全部计划</option>
+                    <option value="related">当前机会相关</option>
+                  </select>
+                </div>
+              </div>
+              <div id="plans-list" class="plan-list plan-list-compact"></div>
+              <div id="plans-empty" class="empty-state compact-empty">当前没有执行计划。</div>
+            </section>
+            <section>
+              <div class="execution-subhead">
+                <div class="section-title section-title-sm">执行记录</div>
+                <div class="section-desc">真实执行或 dry-run 的开平仓状态都会落在这里。</div>
+              </div>
+              <div id="executions-list" class="plan-list plan-list-compact"></div>
+              <div id="executions-empty" class="empty-state compact-empty">当前没有执行记录。</div>
+            </section>
+          </div>
+        </section>
       </main>
     </div>
-    <script src="/assets/app.js?v=20260317-dynamic-basis-1"></script>
+    <script src="/assets/app.js?v=20260318-plan-views-1"></script>
   </body>
 </html>

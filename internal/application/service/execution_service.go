@@ -367,6 +367,13 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 			hedgeReq := okLeg.req
 			hedgeReq.ClientOrderID = buildClientOrderID(plan, "hedge", okLeg.role)
 			hedgeReq.Reason = "open_leg_failed_hedge"
+			// 对冲补救单必须与原始开仓方向相反：
+			// - 原来 BUY 开出的 long leg，需要用 SELL reduce-only 平掉；
+			// - 原来 SELL 开出的 short leg，需要用 BUY reduce-only 平掉。
+			//
+			// 之前这里直接复用了开仓 side，会在单边持仓模式下继续“加仓同方向”，
+			// 无法真正回滚已经成功成交的腿，这是典型的套利执行风险漏洞。
+			hedgeReq.Side = reverseSide(hedgeReq.Side)
 			hedgeReq.OrderType = "MARKET"
 			hedgeReq.ReduceOnly = true
 			hedgeReq.TimeInForce = "IOC"
@@ -515,6 +522,17 @@ func ternarySide(cond bool, a, b string) string {
 		return a
 	}
 	return b
+}
+
+func reverseSide(side string) string {
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "BUY":
+		return "SELL"
+	case "SELL":
+		return "BUY"
+	default:
+		return side
+	}
 }
 
 func pickNonEmpty(values ...string) string {

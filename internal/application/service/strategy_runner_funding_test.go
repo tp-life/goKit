@@ -49,7 +49,7 @@ func TestProjectFundingCarry_CanChooseFartherExitToCoverCosts(t *testing.T) {
 	long := entity.FundingSnapshot{FundingRate: 0.00005, FundingTimeMs: nowMs + int64(8*time.Hour/time.Millisecond), FundingIntervalHours: 8}
 	short := entity.FundingSnapshot{FundingRate: 0.00010, FundingTimeMs: nowMs + int64(1*time.Hour/time.Millisecond), FundingIntervalHours: 1}
 
-	projection, ok := r.projectFundingCarry(now, long, long.FundingRate, short, short.FundingRate)
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
 	if !ok {
 		t.Fatalf("expected projection to be valid")
 	}
@@ -81,7 +81,7 @@ func TestProjectFundingCarry_MisalignedSchedules(t *testing.T) {
 		FundingIntervalHours: 1,
 	}
 
-	projection, ok := r.projectFundingCarry(now, long, long.FundingRate, short, short.FundingRate)
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
 	if !ok {
 		t.Fatalf("expected projection to be valid")
 	}
@@ -98,6 +98,43 @@ func TestProjectFundingCarry_MisalignedSchedules(t *testing.T) {
 	expectedCarry := float64(projection.ShortFundingEventCount)*short.FundingRate - float64(projection.LongFundingEventCount)*long.FundingRate
 	if projection.CarryRate != expectedCarry {
 		t.Fatalf("expected carry %.8f, got %.8f", expectedCarry, projection.CarryRate)
+	}
+}
+
+func TestProjectFundingCarryVariants_ReturnsMultipleOrderedWindows(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{HoldHours: 8, FundingRateContinuationDecay: 1}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowMs := now.UnixMilli()
+
+	long := entity.FundingSnapshot{
+		FundingRate:          -0.0007,
+		FundingTimeMs:        nowMs + int64(4*time.Hour/time.Millisecond),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          -0.0001,
+		FundingTimeMs:        nowMs + int64(1*time.Hour/time.Millisecond),
+		FundingIntervalHours: 1,
+	}
+
+	projections := r.projectFundingCarryVariants(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if len(projections) < 2 {
+		t.Fatalf("expected multiple candidate projections, got %d", len(projections))
+	}
+	if projections[0].CarryRate < projections[1].CarryRate {
+		t.Fatalf("expected projections sorted by carry descending")
+	}
+	found4h := false
+	for _, projection := range projections {
+		if projection.ProjectedFundingTimeMs == nowMs+int64(4*time.Hour/time.Millisecond) {
+			found4h = true
+			if projection.LongFundingEventCount != 1 || projection.ShortFundingEventCount != 4 {
+				t.Fatalf("expected 4h window to have long=1 short=4, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+			}
+		}
+	}
+	if !found4h {
+		t.Fatalf("expected 4h candidate projection to be present")
 	}
 }
 
@@ -129,28 +166,175 @@ func TestBlendedFundingRate_InvalidWeightFallsBackToDefault(t *testing.T) {
 }
 
 func TestProjectedLegFundingCarry_UsesCurrentRateForFirstEventOnly(t *testing.T) {
-	got := projectedLegFundingCarry(0.0010, 0.0004, 1, 0.6)
+	got := projectedLegFundingCarry(fundingForecast{
+		CurrentRate:        0.0010,
+		BaselineRate:       0.0004,
+		HistoryMean:        0.0004,
+		ContinuationDecay:  0.6,
+		MeanReversion:      0.2,
+		EffectiveFloorRate: -1,
+		EffectiveCapRate:   1,
+	}, 1)
 	if got != 0.0010 {
 		t.Fatalf("expected first event to use current rate only, got %.8f", got)
 	}
 }
 
 func TestProjectedLegFundingCarry_UsesSmoothedRateForLaterEvents(t *testing.T) {
-	got := projectedLegFundingCarry(0.0010, 0.0004, 3, 0.6)
-	want := 0.0010 + 0.0004*(1+0.6)
+	got := projectedLegFundingCarry(fundingForecast{
+		CurrentRate:        0.0010,
+		BaselineRate:       0.0004,
+		HistoryMean:        0.0004,
+		ContinuationDecay:  0.6,
+		MeanReversion:      0.2,
+		EffectiveFloorRate: -1,
+		EffectiveCapRate:   1,
+	}, 3)
+	want := 0.0010 + 0.0004 + 0.0004*0.6
 	if got != want {
 		t.Fatalf("expected later events to use smoothed future rate %.8f, got %.8f", want, got)
 	}
 }
 
 func TestFundingEstimateProfile(t *testing.T) {
-	mode, confidence := fundingEstimateProfile(fundingProjection{LongFundingEventCount: 1, ShortFundingEventCount: 1})
+	mode, confidence := fundingEstimateProfile(fundingProjection{LongFundingEventCount: 1, ShortFundingEventCount: 1}, fundingForecast{Confidence: "high"}, fundingForecast{Confidence: "high"})
 	if mode != "single_cycle_spot" || confidence != "high" {
 		t.Fatalf("expected single-cycle high confidence, got mode=%s confidence=%s", mode, confidence)
 	}
-	mode, confidence = fundingEstimateProfile(fundingProjection{LongFundingEventCount: 3, ShortFundingEventCount: 2})
-	if mode != "multi_cycle_smoothed" || confidence != "guarded" {
+	mode, confidence = fundingEstimateProfile(
+		fundingProjection{LongFundingEventCount: 3, ShortFundingEventCount: 2},
+		fundingForecast{Confidence: "guarded"},
+		fundingForecast{Confidence: "medium"},
+	)
+	if mode != "multi_cycle_regime_aware" || confidence != "guarded" {
 		t.Fatalf("expected multi-cycle guarded confidence, got mode=%s confidence=%s", mode, confidence)
+	}
+}
+
+func TestFundingForecast_PredictedRateForEvent_RevertsToMean(t *testing.T) {
+	forecast := fundingForecast{
+		CurrentRate:        0.0012,
+		BaselineRate:       0.0010,
+		HistoryMean:        0.0002,
+		MeanReversion:      0.5,
+		ContinuationDecay:  0.7,
+		EffectiveFloorRate: -0.002,
+		EffectiveCapRate:   0.002,
+	}
+	if got := forecast.PredictedRateForEvent(1); got != 0.0012 {
+		t.Fatalf("expected event1 to use current rate, got %.8f", got)
+	}
+	if got := forecast.PredictedRateForEvent(2); !(got < 0.0010 && got > 0.0002) {
+		t.Fatalf("expected event2 to revert toward mean, got %.8f", got)
+	}
+	if got2, got4 := forecast.PredictedRateForEvent(2), forecast.PredictedRateForEvent(4); !(got4 < got2 && got4 > 0.0002) {
+		t.Fatalf("expected later events to continue reverting, got event2=%.8f event4=%.8f", got2, got4)
+	}
+}
+
+func TestVenueFundingClamp_BinanceLikeScaledByInterval(t *testing.T) {
+	floor, cap, source := venueFundingClamp("binance", 8)
+	if source != "binance_like_cap" {
+		t.Fatalf("expected binance clamp source, got %s", source)
+	}
+	if floor != -0.0075 || cap != 0.0075 {
+		t.Fatalf("expected 8h clamp ±0.0075, got floor=%.6f cap=%.6f", floor, cap)
+	}
+
+	floor, cap, _ = venueFundingClamp("binance", 1)
+	if floor != -0.0009375 || cap != 0.0009375 {
+		t.Fatalf("expected 1h scaled clamp ±0.0009375, got floor=%.7f cap=%.7f", floor, cap)
+	}
+}
+
+func TestEffectiveFundingClamp_UsesVenueIntersection(t *testing.T) {
+	item := entity.FundingSnapshot{Exchange: "hyperliquid", FundingIntervalHours: 1}
+	floor, cap, source := effectiveFundingClamp(item, 0.0001, 0.0001, 0.01)
+	if source != "hyperliquid_cap" {
+		t.Fatalf("expected hyperliquid cap source, got %s", source)
+	}
+	if floor != -0.004 || cap != 0.004 {
+		t.Fatalf("expected hyperliquid clamp ±0.004, got floor=%.6f cap=%.6f", floor, cap)
+	}
+}
+
+func TestEffectiveFundingClamp_BinanceLikeShortIntervalIsAdaptive(t *testing.T) {
+	item := entity.FundingSnapshot{Exchange: "binance", FundingIntervalHours: 1}
+	floor, cap, source := effectiveFundingClamp(item, 0.0020, 0.0015, 0.0002)
+	if source != "binance_like_adaptive_short_interval_cap" {
+		t.Fatalf("expected adaptive short-interval clamp source, got %s", source)
+	}
+	// 不应再被严格压回线性 1h cap ±0.0009375。
+	if cap <= 0.0009375 {
+		t.Fatalf("expected adaptive cap to remain above strict linear 1h cap, got %.7f", cap)
+	}
+	if floor >= -0.0009375 {
+		t.Fatalf("expected adaptive floor to remain below strict linear 1h floor, got %.7f", floor)
+	}
+}
+
+func TestFundingForecast_PredictedRateForEvent_RespectsClamp(t *testing.T) {
+	forecast := fundingForecast{
+		CurrentRate:        0.0100,
+		BaselineRate:       0.0090,
+		HistoryMean:        0.0010,
+		MeanReversion:      0.1,
+		ContinuationDecay:  0.8,
+		EffectiveFloorRate: -0.002,
+		EffectiveCapRate:   0.002,
+		ClampSource:        "test_cap",
+	}
+	if got := forecast.PredictedRateForEvent(2); got != 0.002 {
+		t.Fatalf("expected event2 to be clamped at 0.002, got %.6f", got)
+	}
+}
+
+func TestProjectedLegFundingCarry_RegimeAwarePath(t *testing.T) {
+	forecast := fundingForecast{
+		CurrentRate:        0.0010,
+		BaselineRate:       0.0008,
+		HistoryMean:        0.0002,
+		MeanReversion:      0.5,
+		ContinuationDecay:  0.5,
+		EffectiveFloorRate: -0.002,
+		EffectiveCapRate:   0.002,
+	}
+	got := projectedLegFundingCarry(forecast, 3)
+	// 事件路径：
+	// e1 = 0.0010
+	// e2 = 0.0005, 权重 1
+	// e3 = 0.00035, 权重 0.5
+	want := 0.0010 + 0.0005 + 0.00035*0.5
+	if got != want {
+		t.Fatalf("expected regime-aware path carry %.8f, got %.8f", want, got)
+	}
+}
+
+func TestFundingRegimeProfile(t *testing.T) {
+	regime, confidence, meanReversion, decayTilt := fundingRegimeProfile(3.0, 0.001, 0.0002)
+	if regime != "extreme_positive_reversion" || confidence != "medium" {
+		t.Fatalf("unexpected extreme positive regime=%s confidence=%s", regime, confidence)
+	}
+	if !(meanReversion > 0.6 && decayTilt < 0.6) {
+		t.Fatalf("expected stronger reversion and lower decay tilt, got reversion=%.2f tilt=%.2f", meanReversion, decayTilt)
+	}
+	regime, confidence, _, _ = fundingRegimeProfile(0.1, 0.0003, 0.0002)
+	if regime != "stable_carry" || confidence != "high" {
+		t.Fatalf("unexpected stable regime=%s confidence=%s", regime, confidence)
+	}
+}
+
+func spotForecast(currentRate, decay float64) fundingForecast {
+	return fundingForecast{
+		CurrentRate:        currentRate,
+		BaselineRate:       currentRate,
+		HistoryMean:        currentRate,
+		Regime:             "spot_only",
+		Confidence:         "high",
+		MeanReversion:      0.2,
+		ContinuationDecay:  decay,
+		EffectiveFloorRate: currentRate,
+		EffectiveCapRate:   currentRate,
 	}
 }
 
@@ -172,5 +356,43 @@ func TestAllowedPlanBasisThresholdBps_UsesOpportunityValue(t *testing.T) {
 	got := r.allowedPlanBasisThresholdBps(opp)
 	if got != 18 {
 		t.Fatalf("expected plan threshold to respect opportunity value 18, got %.4f", got)
+	}
+}
+
+func TestEstimateExecutionPenalty_ShortWindowKeepsMoreBasisRisk(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{SlippageBps: 2}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	short := r.estimateExecutionPenalty(now, "BTC", "binance", "aster", fundingProjection{FundingWindowHours: 1, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 10)
+	long := r.estimateExecutionPenalty(now, "BTC", "binance", "aster", fundingProjection{FundingWindowHours: 12, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 10)
+	if short.ExitPenaltyBps <= long.ExitPenaltyBps {
+		t.Fatalf("expected short-window exit penalty %.4f to exceed long-window penalty %.4f", short.ExitPenaltyBps, long.ExitPenaltyBps)
+	}
+}
+
+func TestEstimateExecutionPenalty_MoreEventsIncreaseComplexityPenalty(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{SlippageBps: 2}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	single := r.estimateExecutionPenalty(now, "BTC", "binance", "aster", fundingProjection{FundingWindowHours: 4, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 8)
+	multi := r.estimateExecutionPenalty(now, "BTC", "binance", "aster", fundingProjection{FundingWindowHours: 4, LongFundingEventCount: 3, ShortFundingEventCount: 2}, 8)
+	if multi.HedgeRollbackBps <= single.HedgeRollbackBps {
+		t.Fatalf("expected multi-event hedge penalty %.4f to exceed single-event penalty %.4f", multi.HedgeRollbackBps, single.HedgeRollbackBps)
+	}
+}
+
+func TestEstimateExecutionPenalty_TimeBucketAndExchangeMultipliers(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{SlippageBps: 2}}
+	hot := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
+	normal := time.Date(2026, 1, 1, 5, 0, 0, 0, time.UTC)
+	binance := r.estimateExecutionPenalty(normal, "BTC", "binance", "binance", fundingProjection{FundingWindowHours: 4, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 5)
+	hyper := r.estimateExecutionPenalty(normal, "BTC", "hyperliquid", "hyperliquid", fundingProjection{FundingWindowHours: 4, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 5)
+	hotPenalty := r.estimateExecutionPenalty(hot, "BTC", "binance", "binance", fundingProjection{FundingWindowHours: 4, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 5)
+	if hyper.EntryPenaltyBps <= binance.EntryPenaltyBps {
+		t.Fatalf("expected hyperliquid entry penalty %.4f to exceed binance %.4f", hyper.EntryPenaltyBps, binance.EntryPenaltyBps)
+	}
+	if hotPenalty.EntryPenaltyBps <= binance.EntryPenaltyBps {
+		t.Fatalf("expected hot bucket penalty %.4f to exceed normal %.4f", hotPenalty.EntryPenaltyBps, binance.EntryPenaltyBps)
+	}
+	if hotPenalty.ExperienceBucket != "funding_window_hot" {
+		t.Fatalf("expected funding_window_hot bucket, got %s", hotPenalty.ExperienceBucket)
 	}
 }
