@@ -1,15 +1,30 @@
 package service
 
+import "goKit/internal/infrastructure/exchange"
+
 type SystemService struct {
-	store *MarketStore
-	cfg   Config
+	store     *MarketStore
+	cfg       Config
+	exchanges exchange.ConfigSet
 }
 
-func NewSystemService(store *MarketStore, cfg Config) *SystemService {
-	return &SystemService{store: store, cfg: cfg.normalize()}
+func NewSystemService(store *MarketStore, cfg Config, exchanges exchange.ConfigSet) *SystemService {
+	return &SystemService{
+		store:     store,
+		cfg:       cfg.normalize(),
+		exchanges: exchanges,
+	}
 }
 
 func (s *SystemService) Status() map[string]any {
+	feesByExchange := map[string]any{}
+	for name, cfg := range s.exchanges.Items() {
+		feesByExchange[name] = map[string]any{
+			"maker_bps": cfg.Fees.MakerBps,
+			"taker_bps": cfg.Fees.TakerBps,
+		}
+	}
+
 	return map[string]any{
 		// watchlist 是“全市场基础池”，deep_scan_watchlist 才是当前真的做盘口深扫的那一批 symbol。
 		"watchlist":           s.store.Watchlist(),
@@ -31,6 +46,7 @@ func (s *SystemService) Status() map[string]any {
 			"capital_total_usdt":                 s.cfg.TotalCapitalUSDT,
 			"capital_utilization":                s.cfg.CapitalUtilization,
 			"leverage":                           s.cfg.Leverage,
+			"fees_by_exchange":                   feesByExchange,
 			"dynamic_candidate_limit":            s.cfg.DynamicCandidateLimit,
 			"rotation_batch_size":                s.cfg.RotationBatchSize,
 			"rotation_interval":                  s.cfg.RotationInterval.String(),

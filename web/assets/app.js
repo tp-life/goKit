@@ -257,6 +257,57 @@ function strategyTargetNotional() {
   return Number(state.system?.strategy?.effective_notional || 0);
 }
 
+function exchangeFeeConfig(exchangeName) {
+  const key = String(exchangeName || "").toLowerCase();
+  return state.system?.strategy?.fees_by_exchange?.[key] || null;
+}
+
+function feeRateBps(exchangeName, mode) {
+  const fees = exchangeFeeConfig(exchangeName);
+  if (!fees) return null;
+  const makerBps = Number(fees.maker_bps || 0);
+  const takerBps = Number(fees.taker_bps || 0);
+  const normalizedMode = String(mode || "").toLowerCase();
+  switch (normalizedMode) {
+    case "maker":
+      return makerBps;
+    case "taker":
+      return takerBps;
+    case "mid":
+      return (makerBps + takerBps) / 2;
+    default:
+      return makerBps;
+  }
+}
+
+function feeModeLabel(mode) {
+  const normalizedMode = String(mode || "").toLowerCase();
+  switch (normalizedMode) {
+    case "maker":
+      return "maker";
+    case "taker":
+      return "taker";
+    case "mid":
+      return "mid";
+    default:
+      return normalizedMode || "--";
+  }
+}
+
+function feeBreakdownText(item, mode) {
+  if (!item || typeof item !== "object") return "--";
+  const parts = [
+    [item.long_exchange, feeRateBps(item.long_exchange, mode)],
+    [item.short_exchange, feeRateBps(item.short_exchange, mode)],
+  ]
+    .filter(([exchangeName, bps]) => exchangeName && bps != null)
+    .map(
+      ([exchangeName, bps]) =>
+        `${exchangeName} ${feeModeLabel(mode)} ${fmtNumber(bps, 2)} bps`,
+    );
+  return parts.length ? parts.join(" + ") : "--";
+}
+
 function maxAllowedBasisForItem(item) {
   const dynamic = Number(item?.max_allowed_basis_bps || 0);
   if (Number.isFinite(dynamic) && dynamic > 0) return dynamic;
@@ -1024,8 +1075,8 @@ function renderOpportunityDetail(items) {
           <div class="detail-section-title">收益构成</div>
           <div class="detail-list">
             <div class="detail-item"><span class="detail-k">资金收益</span><span class="detail-v ${classForNumber(item.gross_funding_pnl)}">${fmtMoney(item.gross_funding_pnl)}</span></div>
-            <div class="detail-item"><span class="detail-k">入场手续费</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.entry_fee_pnl || 0)), 3)} USDT</span></div>
-            <div class="detail-item"><span class="detail-k">出场手续费</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.exit_fee_pnl || 0)), 3)} USDT</span></div>
+            <div class="detail-item"><span class="detail-k">入场手续费</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.entry_fee_pnl || 0)), 3)} USDT（${feeBreakdownText(item, state.system?.strategy?.entry_mode)}）</span></div>
+            <div class="detail-item"><span class="detail-k">出场手续费</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.exit_fee_pnl || 0)), 3)} USDT（${feeBreakdownText(item, state.system?.strategy?.exit_mode)}）</span></div>
             <div class="detail-item"><span class="detail-k">滑点预估</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.slippage_pnl || 0)), 3)} USDT</span></div>
             <div class="detail-item"><span class="detail-k">安全缓冲</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.safety_buffer_pnl || 0)), 3)} USDT</span></div>
             <div class="detail-item total-row"><span class="detail-k">净收益</span><span class="detail-v ${classForNumber(item.net_expected_pnl)}">${fmtMoney(item.net_expected_pnl)}</span></div>
