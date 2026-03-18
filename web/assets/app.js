@@ -223,6 +223,33 @@ function fundingModeText(item) {
   return mode || "--";
 }
 
+function fundingEstimateModeText(item) {
+  const mode = String(item?.funding_estimate_mode || "").toLowerCase();
+  if (mode === "single_cycle_spot") return "单轮现值";
+  if (mode === "multi_cycle_smoothed") return "多轮平滑";
+  return mode || "--";
+}
+
+function fundingEstimateConfidenceText(item) {
+  const level = String(item?.funding_estimate_confidence || "").toLowerCase();
+  if (level === "high") return "高";
+  if (level === "medium") return "中";
+  if (level === "guarded") return "谨慎";
+  return level || "--";
+}
+
+function fundingSmoothingLookbackText() {
+  return state.system?.strategy?.funding_history_lookback || "--";
+}
+
+function fundingSmoothingWeightText() {
+  const weight = Number(
+    state.system?.strategy?.funding_smoothing_current_weight,
+  );
+  if (!Number.isFinite(weight)) return "--";
+  return fmtNumber(weight, 2);
+}
+
 function fundingEventsText(item) {
   const longCount = Number(item?.long_funding_event_count || 0);
   const shortCount = Number(item?.short_funding_event_count || 0);
@@ -982,6 +1009,7 @@ function legCard(
   exchange,
   venueSymbol,
   fundingRate,
+  futureFundingRate,
   hourlyRate,
   fundingTimeMs,
   fundingIntervalHours,
@@ -999,6 +1027,7 @@ function legCard(
       <div class="detail-list compact-list">
         <div class="detail-item"><span class="detail-k">交易对</span><span class="detail-v">${venueSymbol || "--"}</span></div>
         <div class="detail-item"><span class="detail-k">资金费率</span><span class="detail-v ${classForNumber(fundingRate)}">${fmtPctRatio(fundingRate, 5)}</span></div>
+        <div class="detail-item"><span class="detail-k">平滑后后续费率</span><span class="detail-v ${classForNumber(futureFundingRate)}">${fmtPctRatio(futureFundingRate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">小时费率</span><span class="detail-v ${classForNumber(hourlyRate)}">${fmtPctRatio(hourlyRate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">下次结算</span><span class="detail-v">${fmtTime(fundingTimeMs)}</span></div>
         <div class="detail-item"><span class="detail-k">结算周期</span><span class="detail-v">${fundingIntervalText(fundingIntervalHours)}</span></div>
@@ -1063,11 +1092,15 @@ function renderOpportunityDetail(items) {
         ${detailMetric("Funding 事件窗口", `${fmtNumber(item.funding_window_hours || 0, 2)} h`)}
         ${detailMetric("建议持有时长", holdingDurationText(item))}
         ${detailMetric("Funding 事件次数", fundingEventsText(item))}
+        ${detailMetric("估算模式", fundingEstimateModeText(item))}
+        ${detailMetric("估算置信度", fundingEstimateConfidenceText(item))}
+        ${detailMetric("平滑回看窗口", fundingSmoothingLookbackText())}
+        ${detailMetric("当前值权重", fundingSmoothingWeightText())}
       </div>
 
       <div class="detail-grid-2">
-        ${legCard("做多腿", item.long_exchange, item.long_venue_symbol, item.long_funding_rate, item.long_funding_hourly, item.long_funding_time_ms, item.long_funding_interval_hours, item.long_bid_price, item.long_ask_price, item.long_mark_price)}
-        ${legCard("做空腿", item.short_exchange, item.short_venue_symbol, item.short_funding_rate, item.short_funding_hourly, item.short_funding_time_ms, item.short_funding_interval_hours, item.short_bid_price, item.short_ask_price, item.short_mark_price)}
+        ${legCard("做多腿", item.long_exchange, item.long_venue_symbol, item.long_funding_rate, item.long_future_funding_rate, item.long_funding_hourly, item.long_funding_time_ms, item.long_funding_interval_hours, item.long_bid_price, item.long_ask_price, item.long_mark_price)}
+        ${legCard("做空腿", item.short_exchange, item.short_venue_symbol, item.short_funding_rate, item.short_future_funding_rate, item.short_funding_hourly, item.short_funding_time_ms, item.short_funding_interval_hours, item.short_bid_price, item.short_ask_price, item.short_mark_price)}
       </div>
 
       <div class="detail-grid-2">

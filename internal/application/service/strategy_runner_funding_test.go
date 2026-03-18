@@ -143,6 +143,17 @@ func TestProjectedLegFundingCarry_UsesSmoothedRateForLaterEvents(t *testing.T) {
 	}
 }
 
+func TestFundingEstimateProfile(t *testing.T) {
+	mode, confidence := fundingEstimateProfile(fundingProjection{LongFundingEventCount: 1, ShortFundingEventCount: 1})
+	if mode != "single_cycle_spot" || confidence != "high" {
+		t.Fatalf("expected single-cycle high confidence, got mode=%s confidence=%s", mode, confidence)
+	}
+	mode, confidence = fundingEstimateProfile(fundingProjection{LongFundingEventCount: 3, ShortFundingEventCount: 2})
+	if mode != "multi_cycle_smoothed" || confidence != "guarded" {
+		t.Fatalf("expected multi-cycle guarded confidence, got mode=%s confidence=%s", mode, confidence)
+	}
+}
+
 func TestAllowedBasisThresholdBps_GrowsWithWindow(t *testing.T) {
 	r := &StrategyRunner{cfg: Config{MaxSpreadBps: 10, DynamicMaxSpreadMultiplier: 2, DynamicMaxSpreadReferenceHours: 20}}
 	shortWindow := r.allowedBasisThresholdBps(fundingProjection{FundingWindowHours: 2})

@@ -47,6 +47,8 @@ func (s *SystemService) Status() map[string]any {
 			"capital_utilization":                s.cfg.CapitalUtilization,
 			"leverage":                           s.cfg.Leverage,
 			"fees_by_exchange":                   feesByExchange,
+			"funding_history_lookback":           s.cfg.FundingHistoryLookback.String(),
+			"funding_smoothing_current_weight":   s.cfg.FundingSmoothingCurrentWeight,
 			"dynamic_candidate_limit":            s.cfg.DynamicCandidateLimit,
 			"rotation_batch_size":                s.cfg.RotationBatchSize,
 			"rotation_interval":                  s.cfg.RotationInterval.String(),
