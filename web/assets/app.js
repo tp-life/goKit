@@ -1232,6 +1232,17 @@ function renderOpportunityDetail(items) {
         ${legCard("做空腿", item.short_exchange, item.short_venue_symbol, item.short_funding_rate, item.short_future_funding_rate, item.short_funding_hourly, item.short_funding_time_ms, item.short_funding_interval_hours, item.short_bid_price, item.short_ask_price, item.short_mark_price)}
       </div>
 
+      <div class="detail-section detail-section-tight linked-plan-section">
+        <div class="detail-section-head">
+          <div>
+            <div class="detail-section-title">关联执行计划</div>
+            <div class="detail-subtitle">把最相关的计划压缩进机会详情里，查看机会时不需要再被整块执行计划列表打断。</div>
+          </div>
+          <span class="pill ${matchedPlan ? "good" : "warn"}">${matchedPlan ? "已生成计划" : "仅展示估算仓位"}</span>
+        </div>
+        ${displayPlan ? renderCompactPlanCard(displayPlan, { selected: Boolean(matchedPlan), linkedOpp: item, showActions: Boolean(matchedPlan) }) : '<div class="empty-state show compact-empty">当前没有可展示的关联执行计划。</div>'}
+      </div>
+
       <div class="detail-grid-2">
         ${fundingRuleSummaryCard("做多腿 funding rule", item.long_funding_rule, item.long_funding_event_count)}
         ${fundingRuleSummaryCard("做空腿 funding rule", item.short_funding_rule, item.short_funding_event_count)}
