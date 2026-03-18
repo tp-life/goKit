@@ -77,9 +77,16 @@ score += CarryRateHourlyEquivalent * 1000   (若 > 0)
 grossFundingPNL = notional * projection.CarryRate
 entryFeePNL     = longEntryFee + shortEntryFee
 exitFeePNL      = longExitFee + shortExitFee
-slippagePNL     = notional * slippageBps / 10000
+slippagePNL     = notional * projectedExecutionPenaltyBps / 10000
 netExpectedPNL  = grossFundingPNL - entryFeePNL - exitFeePNL - slippagePNL - safetyBuffer
 ```
+
+其中 `projectedExecutionPenaltyBps` / `execution penalty model` 不再只是固定 `slippage_bps`，而是组合了：
+
+- `entry penalty`：入场滑点 / 盘口冲击；
+- `exit penalty`：退出时残留 basis 与执行摩擦；
+- `hedge rollback penalty`：路径更长、单腿异常时的对冲回滚冗余；
+- exchange / symbol / time-bucket 经验乘子。
 
 4. 计算基差：
 
@@ -165,10 +172,10 @@ count = 1, if interval <= 0 and nextFunding <= T
 ### C) 逐候选点评估 carry
 
 ```text
-shortMultiplier = 1 + decay + decay^2 + ... (共 shortCount 项)
-longMultiplier  = 1 + decay + decay^2 + ... (共 longCount 项)
-carryRate       = shortMultiplier * shortFundingRate - longMultiplier * longFundingRate
-hourlyEq        = carryRate / windowHours
+event1_rate          = current funding snapshot
+event2+ future_rate  = regime-aware predictor(current, recentAvg, historyMean, zscore, reversion)
+carryRate            = Σ short_leg(event_k * decay_weight_k) - Σ long_leg(event_k * decay_weight_k)
+hourlyEq             = carryRate / windowHours
 ```
 
 在所有候选点中选择最优 projection。
@@ -178,6 +185,248 @@ hourlyEq        = carryRate / windowHours
 
 
 > 这使得模型可以在高建仓成本场景下评估“更远退出点”（例如 24h）是否能靠多轮 funding 覆盖成本，而不是只盯最近结算点。
+
+### 5.2.1 当前已升级到 regime-aware forecaster
+
+当前代码不再把“第 2 次及以后 funding”简单视为一个固定的 `futureRate`：
+
+- 会读取历史 funding 序列；
+- 计算 `historyMean / stdDev / recentAvg / zscore`；
+- 识别当前处于 `stable_carry / elevated_reversion / extreme_reversion / sign_flip_risk` 等状态；
+- 再按不同状态给出不同的均值回归速度与 continuation decay；
+- 并额外叠加交易所级别的 funding cap / floor clamp，避免把超极端 funding 机械外推到多轮路径。
+
+对于 Binance / Aster 这类 Binance-like venue：
+
+- 常规情况下仍参考 8h cap；
+- 但若某个币本身是 `1h / 4h` 这类短周期 funding，不再做“严格线性缩放后再强压交集”；
+- 而是进入自适应短周期 clamp：结合当前 funding、历史波动带、完整 8h cap 一起放宽，
+  以免把短周期 funding alpha 直接抹掉。
+
+这意味着：
+
+- 极端 funding 不会被机械地线性外推；
+- 交易所本身存在的 funding 上下限会参与约束未来路径；
+- 多轮 funding 的远期收益会更保守、更贴近真实均值回归过程；
+- 同样是 `1h vs 4h/8h`，不同 symbol 的预测路径会因为历史结构不同而不同。
+
+### 5.2.2 形式化规则算法（抽象版）
+
+为了方便后续 review、复盘和扩展，可以把当前实现抽象成下面这套规则：
+
+#### 输入
+
+对于每一条腿（Long leg / Short leg），至少需要：
+
+- `exchange`
+- `symbol`
+- `currentFundingRate`
+- `nextFundingTime`
+- `fundingIntervalHours`
+- `historyMean / historyStdDev / recentAvg`
+
+并且对于同一个交易所对，要同时计算两个方向：
+
+1. `Long A / Short B`
+2. `Long B / Short A`
+
+#### 规则 1：先构建每条腿自己的 funding 预测器
+
+```text
+event_1_rate = currentFundingRate
+event_k_rate = clamp(
+  historyMean + (baselineRate - historyMean) * (1 - reversion)^(k-1),
+  effectiveFloorRate,
+  effectiveCapRate
+), k >= 2
+```
+
+其中：
+
+- `baselineRate` 是 `current / recentAvg / historyMean` 的折中；
+- `reversion` 来自当前 funding 所处 regime；
+- `effectiveFloorRate / effectiveCapRate` 来自交易所机制 + 历史带的联合约束。
+
+#### 规则 2：候选退出点来自两条腿 funding 时间轴的并集
+
+```text
+timeline_leg = [nextFundingTime, nextFundingTime + interval, nextFundingTime + 2*interval, ...]
+candidateTimes = union(timeline_long, timeline_short)
+horizon = max(max(nextLong, nextShort), now + holdHours)
+```
+
+也就是说，系统不会假设“最早 funding 点就是最优退出点”，而是会把两边各自可能发生 funding 的时间都拿出来比较。
+
+#### 规则 3：对每个候选退出点，分别计算两边 funding 次数
+
+```text
+longCount  = fundingEventCountUntil(now, T, longNextFunding, longInterval)
+shortCount = fundingEventCountUntil(now, T, shortNextFunding, shortInterval)
+```
+
+这一步是处理 `1h vs 4h/8h` 的关键，因为到同一个退出时点时，两边发生的 funding 次数往往不同。
+
+#### 规则 4：逐腿累计 carry，再做净额
+
+```text
+longCarry  = Σ event_k_rate(long)  * decayWeight(k)
+shortCarry = Σ event_k_rate(short) * decayWeight(k)
+carryRate  = shortCarry - longCarry
+hourlyEq   = carryRate / windowHours
+```
+
+其中：
+
+- 第 1 次 event 权重固定为 `1.0`；
+- 第 2 次及以后按 `continuationDecay^(k-2)` 衰减；
+- 这样既保留多轮 funding，又避免把远期收益无限线性外推。
+
+#### 规则 5：在所有候选退出点中选择最优 projection
+
+优先级如下：
+
+1. `carryRate` 更高者优先；
+2. 若相同，则 `hourlyEq` 更高者优先；
+3. 若仍相同，则更早退出者优先。
+
+#### 规则 6：在两个方向中选择更优方向
+
+对于同一对交易所，系统始终会同时计算：
+
+- `Long A / Short B`
+- `Long B / Short A`
+
+哪个方向的最优 projection 更高，就返回哪个方向，而不是预先固定方向。
+
+### 5.2.3 特殊规则：Binance / Aster 的 1h / 4h funding 合约
+
+对于 Binance / Aster 这类 Binance-like venue：
+
+- 常规基础 cap 仍以 `8h ±0.75%` 为基准；
+- 若某个 symbol 的 funding interval 为 `1h / 4h`，仍然先得到一个按 interval 缩放后的 `venueCap`；
+- 但若当前 funding 与历史波动显示这个 symbol 本身就处在短周期高 funding 状态，
+  则不会再被“严格线性 1h/4h cap + 历史带交集”机械压住；
+- 系统会进入 `adaptive short-interval clamp`，在完整 `8h cap` 包络内适度放宽。
+
+抽象写法如下：
+
+```text
+venueCap   = 0.0075 * intervalHours / 8
+dynamicCap = min(
+  0.0075,
+  max(abs(currentRate) * 1.25, abs(historyMean) + 4*historyStdDev, abs(venueCap))
+)
+```
+
+若 `dynamicCap > venueCap`，则使用更宽的 `[-dynamicCap, +dynamicCap]` 作为有效约束区间。
+
+### 5.2.4 示例一：Binance 1h vs Aster 4h
+
+假设当前时间是 `10:00`，同一个币种在两边的 funding 信息如下：
+
+- Binance
+  - `interval = 1h`
+  - `nextFunding = 11:00`
+  - `currentFunding = +0.12%`
+- Aster
+  - `interval = 4h`
+  - `nextFunding = 14:00`
+  - `currentFunding = -0.20%`
+
+#### 候选退出点
+
+两边 funding 时间轴并集大致为：
+
+```text
+11:00, 12:00, 13:00, 14:00, 15:00, 16:00, ...
+```
+
+#### 方向 A：Long Binance / Short Aster
+
+到 `14:00` 时：
+
+- Binance 已发生 4 次 funding；
+- Aster 已发生 1 次 funding。
+
+若 Binance 后续 3 次预测 funding 逐步均值回归，而 Aster 仍维持 1 次当前 funding，
+则系统会按：
+
+```text
+carry = shortCarry(Aster) - longCarry(Binance)
+```
+
+来计算。由于这个例子里 Binance 为正 funding、Aster 为负 funding，
+那么 `Long Binance / Short Aster` 通常会得到较差结果。
+
+#### 方向 B：Long Aster / Short Binance
+
+系统会自动再算一次：
+
+```text
+carry = shortCarry(Binance) - longCarry(Aster)
+```
+
+在这个例子里，这个方向往往会得到更高的净 carry，因此最终返回的会是：
+
+```text
+Long Aster / Short Binance
+```
+
+这个例子说明：
+
+- 方向不是预先固定的；
+- 同一个 symbol 在不同 venue 的不同结算周期，会直接影响最优方向与最优退出点；
+- 只有按事件时间轴逐点计算，才能正确处理这种 `1h vs 4h` 的情况。
+
+### 5.2.5 示例二：为什么“最优退出点”不一定是最近 funding 点
+
+继续用上面的例子。
+
+如果在 `11:00` 退出：
+
+- Binance 只发生 1 次 funding；
+- Aster 还没有发生 funding；
+- 绝对 carry 可能不高，但窗口更短，因此 `hourlyEq` 可能更高。
+
+如果在 `14:00` 退出：
+
+- Binance 已累计 4 次 funding；
+- Aster 已累计 1 次 funding；
+- 绝对 carry 更大，但小时等价收益不一定更高。
+
+所以系统在选择 projection 时，不是单纯盯着“最近 funding 时间”，而是：
+
+1. 先比较绝对 carry；
+2. 再比较小时等价；
+3. 最后才比较退出时点早晚。
+
+这也是为什么当前实现能够支持“多轮 funding 覆盖建仓成本”的场景。
+
+### 5.2.6 示例三：Binance 1h 高 funding 特殊币不应被机械压扁
+
+假设 Binance 某个 `1h` funding symbol 当前数据如下：
+
+- `currentFunding = +0.20%`
+- `historyMean = +0.15%`
+- `historyStdDev = 0.02%`
+
+若只采用线性 1h cap：
+
+```text
+8h cap = ±0.75%
+1h cap = ±0.09375%
+```
+
+那么会出现一个明显不合理的情况：
+
+- 当前 funding 已经高于线性 1h cap；
+- 但模型却强行把未来路径压回 `±0.09375%`；
+- 这会让多轮 funding carry 被系统性低估。
+
+当前实现中，这类 symbol 会先参考基础 `venueCap`，
+再结合 `currentFunding / historyMean / historyStdDev` 计算 `dynamicCap`。
+如果 `dynamicCap` 更宽，则使用 adaptive clamp，
+从而避免把真实存在的短周期 funding alpha 直接抹掉。
 
 ### 5.3 为什么这是策略上的关键点
 
@@ -241,7 +490,275 @@ hourlyEq        = carryRate / windowHours
 
 ---
 
-## 8. 当前模型边界
+## 8. 自动开单与自动平仓的执行逻辑
+
+这一节专门记录当前代码里“自动开单 / 自动平仓”是如何工作的，方便后续排障、review 和前端展示解释。
+
+### 8.1 执行引擎的启动方式
+
+执行引擎由 `ExecutionService.loop()` 周期性轮询驱动：
+
+- 总开关：`cfg.enabled`
+- 自动开仓：`cfg.execution.auto_entry`
+- 自动平仓：`cfg.execution.auto_close`
+- 轮询周期：`cfg.execution.loop_interval`
+
+也就是说：
+
+- 只要总开关关闭，执行引擎不会跑；
+- 总开关开启后，每个 `loop_interval` 周期会分别检查“是否需要自动开仓”和“是否需要自动平仓”。
+
+### 8.2 自动开单（auto entry）的前置条件
+
+自动开单不是对所有机会直接下单，而是只针对已经进入 `execution_plans` 的计划执行。
+
+在策略层，某个机会要先满足下面这些条件，才会被转成 `ExecutionPlan`：
+
+1. `opp.EligibleForExecution = true`
+2. `opp.Status == eligible`
+3. `opp.NetExpectedPNL >= min_net_pnl`
+4. 没有超过 entry cutoff
+5. 当前盘口、最小下单量、最小名义价值、basis 阈值等检查都通过
+
+只有通过这些检查，才会生成 `execution_plan`；否则仍然只是普通 opportunity，不会进入自动执行队列。
+
+### 8.3 自动开单（auto entry）的 ready 判定
+
+计划生成后，还要进一步判断“是不是现在就可以开”。
+
+对每个 plan：
+
+```text
+entryAnchor        = requiredEntryByFundingTimeMs (若无则退化到 earliestFundingTimeMs)
+entryWindowOpenMs  = entryAnchor - entry_lead_time
+entryWindowCloseMs = entryAnchor - entry_cutoff_time
+
+readyNow = now ∈ [entryWindowOpenMs, entryWindowCloseMs]
+```
+
+于是当前计划会处于三种主要状态之一：
+
+- `ready`：现在就在允许入场窗口内，可以自动开单；
+- `watching`：还没到可入场时间，只观察；
+- `late`：已经错过入场截止时间，不应再开。
+
+### 8.4 自动开单（runAutoOpen）的执行规则
+
+执行引擎每轮自动开仓时，做的是：
+
+1. 读取最新一批 execution plans；
+2. 只处理：
+   - `plan.ReadyNow == true`
+   - `plan.Status == "ready"`
+3. 查询这个 `plan_key` 是否已经存在 execution record；
+4. 如果已经有 execution record，则跳过，避免重复开仓；
+5. 否则调用 `openPlan(plan, trigger="auto")`。
+
+这意味着当前自动开单逻辑本质上是：
+
+> **“只对 ready 且从未执行过的 plan 自动尝试开仓一次”。**
+
+### 8.5 自动开单时，实际下的是什么单
+
+`openPlan()` 会先创建/复用 `ExecutionRecord`，然后区分两种模式：
+
+#### A) dry-run 模式
+
+当 `cfg.execution.enabled = false` 时：
+
+- 不会向交易所真实发单；
+- 只写入 execution record；
+- 状态记为 `dry_run_opened`。
+
+#### B) live 模式
+
+当 `cfg.execution.enabled = true` 时：
+
+- 调用 `placePlanOrders(phase="open")`
+- 同时给 long / short 两条腿构建下单请求
+- long 腿在 open 阶段使用 `BUY`
+- short 腿在 open 阶段使用 `SELL`
+
+具体委托类型由 `EntryMode` 决定：
+
+- `maker`
+  - 尽量挂盘口对手侧附近的 maker 价
+  - TIF 通常为 `GTX` / `ALO`
+- `taker`
+  - 多数交易所直接用 `MARKET`
+  - Hyperliquid 特殊处理为 `LIMIT + IOC + aggressivePrice`
+- `mixed`
+  - 当前实现近似为 `LIMIT + IOC + aggressivePrice`
+
+### 8.6 自动开单后的状态记录
+
+开单结束后，系统会汇总两腿结果并写入 `ExecutionRecord`：
+
+- 两腿都成功：`opened`
+- 部分成功：`open_partial_failed`
+- 全部失败：`open_failed`
+- dry-run：`dry_run_opened`
+
+同时还会记录：
+
+- `OpenedAtMs`
+- `OpenOrderCount`
+- `LastError`
+- `AutoClose`
+- `TargetCloseTimeMs`
+
+这里的 `AutoClose` 与 `TargetCloseTimeMs` 非常重要，因为后续自动平仓就是靠这两个字段驱动的。
+
+### 8.7 开单部分成功时的自动补救（hedge_close）
+
+如果 open 阶段出现：
+
+- 至少一条腿成功；
+- 至少一条腿失败；
+
+系统会立即触发补救逻辑：
+
+1. 找出已成功提交的腿；
+2. 为每条成功腿发起一个 `hedge_close`；
+3. 这个补救单会：
+   - 反转原始开仓方向；
+   - `reduce-only = true`
+   - `orderType = MARKET`
+   - `timeInForce = IOC`
+
+目的不是继续完成套利，而是：
+
+> **尽快把已经打开的单边风险腿回滚掉。**
+
+这一步不是“自动平仓计划”的一部分，而是“自动开仓失败后的紧急补救动作”。
+
+### 8.8 自动平仓（auto close）的触发条件
+
+自动平仓由 `runAutoClose()` 周期性执行。每轮会读取最新 execution records，并只处理满足以下条件的记录：
+
+1. 当前 execution status 属于：
+   - `opened`
+   - `dry_run_opened`
+   - `open_partial_failed`
+2. `rec.AutoClose == true`
+3. `rec.TargetCloseTimeMs > 0`
+4. `now >= rec.TargetCloseTimeMs`
+
+如果这些条件都满足，则会：
+
+1. 用 `rec.PlanKey` 回查对应的 `ExecutionPlan`
+2. 调用 `closePlan(plan, trigger="auto")`
+
+也就是说，自动平仓的本质是：
+
+> **“对已经开过的记录，在达到计划目标平仓时间后，按 plan 自动发起 close”。**
+
+### 8.9 自动平仓时间是如何确定的
+
+在 plan 生成阶段：
+
+```text
+exitAnchor        = projectedFundingTimeMs (若无则退化到 latestFundingTimeMs)
+targetCloseTimeMs = exitAnchor + close_grace_period
+```
+
+所以自动平仓不是“到 funding 时间立刻平”，而是：
+
+- 先以策略选出的最佳 funding 兑现点为核心；
+- 再加一段 `close_grace_period` 作为缓冲；
+- 到时再执行自动 close。
+
+这个设计是为了避免：
+
+- 刚到 funding 事件边界就立刻抢平；
+- 因接口延迟 / 交易所时间边界 / 数据不同步导致过于激进。
+
+### 8.10 自动平仓时，实际下的是什么单
+
+`closePlan()` 的行为与 `openPlan()` 类似，也分 dry-run / live。
+
+在 live 模式下调用 `placePlanOrders(phase="close")`，此时两腿方向会自动反过来：
+
+- long 腿在 close 阶段使用 `SELL`
+- short 腿在 close 阶段使用 `BUY`
+
+同时 `buildTradeRequest()` 会自动设置：
+
+- `ReduceOnly = true`
+- 委托模式取 `plan.ExitMode`
+
+因此自动平仓的语义是：
+
+> **严格按已有仓位的反方向、reduce-only 去做退出，而不是重新建仓。**
+
+### 8.11 自动平仓后的状态记录
+
+平仓完成后，系统会更新 execution record：
+
+- 两腿都成功：`closed`
+- 部分成功：`close_partial_failed`
+- 全部失败：`close_failed`
+- dry-run：`dry_run_closed`
+
+并更新：
+
+- `ClosedAtMs`
+- `CloseOrderCount`
+- `LastError`
+
+### 8.12 抽象成一句规则
+
+当前自动执行链路可以抽象成：
+
+```text
+Opportunity
+  -> pass eligibility checks
+  -> build ExecutionPlan
+  -> if now in entry window: auto open once
+  -> if open partial failure: emergency hedge_close rollback
+  -> after targetCloseTimeMs and auto_close enabled: auto close
+```
+
+### 8.13 一个完整例子
+
+假设某个 plan 的时间参数如下：
+
+- `requiredEntryByFundingTime = 13:00`
+- `entry_lead_time = 30m`
+- `entry_cutoff_time = 5m`
+- `projectedFundingTime = 14:00`
+- `close_grace_period = 2m`
+
+则：
+
+- `entryWindowOpen = 12:30`
+- `entryWindowClose = 12:55`
+- `targetCloseTime = 14:02`
+
+系统行为会是：
+
+1. `12:29` 前：状态 `watching`，不会自动开；
+2. `12:30 ~ 12:55`：状态 `ready`，若还没有 execution record，则自动尝试开仓一次；
+3. 若开仓中一腿成功、一腿失败：立即对成功腿发 `hedge_close`；
+4. 若成功开仓且 `auto_close=true`：到 `14:02` 后自动发起 close；
+5. 若是 dry-run 模式：整条链路只记状态，不会真实发单。
+
+### 8.14 当前实现的边界与注意事项
+
+当前自动开平仓逻辑有几个重要边界：
+
+1. 自动开仓只避免“同一个 planKey 已有 execution record 时重复开”，
+   但并不是完整的多状态执行状态机；
+2. 自动平仓依赖 `execution_record + target_close_time_ms`，而不是订单成交回报 websocket；
+3. `open_partial_failed` 会进入紧急回滚，但其后续记录仍可能进入 auto-close 扫描；
+4. 若要继续提升生产可用性，最值得补的是：
+   - 订单状态 websocket；
+   - 更完整的双腿执行状态机；
+   - 更细粒度的重复执行 / 幂等控制。
+
+---
+
+## 9. 当前模型边界
 
 当前是“已知 nextFundingRate + interval 的事件外推”模型，优点是稳定、低成本、实时；
 但它不预测未来 funding rate 变化（只对次数做时间轴累加）。
@@ -253,7 +770,7 @@ hourlyEq        = carryRate / windowHours
 
 ---
 
-## 9. 你接下来最值得继续加强的方向
+## 10. 你接下来最值得继续加强的方向
 
 如果目标是把这套系统继续往生产套利 bot 演进，优先级建议如下：
 
