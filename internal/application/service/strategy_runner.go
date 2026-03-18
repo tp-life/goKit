@@ -527,6 +527,11 @@ func (r *StrategyRunner) opportunityLoop(ctx context.Context) {
 //     6. 产出 Opportunity（包含方向、窗口、事件计数、预估净收益）。
 //
 // 精算阶段默认遍历整个基础池。
+//
+// 为什么这里不直接只遍历“当前深扫池”：
+// 1) CEX 侧现在可以常驻全市场 bookTicker，盘口数据天然比深扫池更广；
+// 2) 真正的缺失会在 ok1~ok6 处被过滤，不会因为全量遍历而误下单；
+// 3) 这样可以避免“已经拿到盘口的数据，仅因未被调度进深扫池而被静默漏算”。
 func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 	// 精算阶段默认遍历整个基础池。
 	//
@@ -963,7 +968,6 @@ func (r *StrategyRunner) cachedFundingHistoryAverage(ctx context.Context, now ti
 //
 // 注意：这里默认“当前已知 fundingRate 在该时间轴上延续”，
 // 属于实盘中常见的近端近似；后续若接入更长历史/预测模型，可替换此处。
-
 func fundingRateEventMultiplier(eventCount int, continuationDecay float64) float64 {
 	if eventCount <= 0 {
 		return 0
