@@ -21,9 +21,13 @@ type Opportunity struct {
 	LongFundingIntervalHours  int     `json:"long_funding_interval_hours"`
 	ShortFundingIntervalHours int     `json:"short_funding_interval_hours"`
 
-	LongFundingHourly  float64 `json:"long_funding_hourly"`
-	ShortFundingHourly float64 `json:"short_funding_hourly"`
-	GrossEdgeHourly    float64 `json:"gross_edge_hourly"`
+	LongFundingHourly         float64 `json:"long_funding_hourly"`
+	ShortFundingHourly        float64 `json:"short_funding_hourly"`
+	GrossEdgeHourly           float64 `json:"gross_edge_hourly"`
+	LongFutureFundingRate     float64 `json:"long_future_funding_rate"`
+	ShortFutureFundingRate    float64 `json:"short_future_funding_rate"`
+	FundingEstimateMode       string  `gorm:"size:64" json:"funding_estimate_mode"`
+	FundingEstimateConfidence string  `gorm:"size:32" json:"funding_estimate_confidence"`
 
 	LongBidPrice   float64 `json:"long_bid_price"`
 	LongAskPrice   float64 `json:"long_ask_price"`

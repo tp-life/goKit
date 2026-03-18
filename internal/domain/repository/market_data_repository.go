@@ -15,6 +15,7 @@ type SnapshotStats struct {
 type MarketDataRepository interface {
 	SaveFundingSnapshots(ctx context.Context, items []entity.FundingSnapshot) error
 	SaveBookTopSnapshots(ctx context.Context, items []entity.BookTopSnapshot) error
+	RecentFundingSnapshots(ctx context.Context, exchangeName, symbol string, since time.Time, limit int) ([]entity.FundingSnapshot, error)
 
 	// DeleteOldFundingSnapshots 删除保留期之外的 funding 快照。
 	DeleteOldFundingSnapshots(ctx context.Context, cutoff time.Time) error

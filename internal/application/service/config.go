@@ -46,6 +46,8 @@ type Config struct {
 	BookSnapshotMinPriceChangeBps  float64       `mapstructure:"book_snapshot_min_price_change_bps"`
 	BookSnapshotMinQtyChangeRatio  float64       `mapstructure:"book_snapshot_min_qty_change_ratio"`
 	OpportunityCalcInterval        time.Duration `mapstructure:"opportunity_calc_interval"`
+	FundingHistoryLookback         time.Duration `mapstructure:"funding_history_lookback"`
+	FundingSmoothingCurrentWeight  float64       `mapstructure:"funding_smoothing_current_weight"`
 	// FundingRateContinuationDecay 控制“在同一持仓窗口内，对同一腿未来第2次及以后 funding 事件”的费率衰减。
 	//
 	// 取值建议：
@@ -125,6 +127,12 @@ func (c Config) normalize() Config {
 	}
 	if c.OpportunityCalcInterval <= 0 {
 		c.OpportunityCalcInterval = 5 * time.Second
+	}
+	if c.FundingHistoryLookback <= 0 {
+		c.FundingHistoryLookback = 6 * time.Hour
+	}
+	if c.FundingSmoothingCurrentWeight < 0 || c.FundingSmoothingCurrentWeight > 1 {
+		c.FundingSmoothingCurrentWeight = 0.7
 	}
 	if c.FundingRateContinuationDecay <= 0 || c.FundingRateContinuationDecay > 1 {
 		c.FundingRateContinuationDecay = 0.6

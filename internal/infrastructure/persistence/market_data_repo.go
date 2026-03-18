@@ -31,6 +31,19 @@ func (r *MarketDataRepo) SaveBookTopSnapshots(ctx context.Context, items []entit
 	return r.client.GetDB(ctx).Create(&items).Error
 }
 
+func (r *MarketDataRepo) RecentFundingSnapshots(ctx context.Context, exchangeName, symbol string, since time.Time, limit int) ([]entity.FundingSnapshot, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var items []entity.FundingSnapshot
+	err := r.client.GetDB(ctx).
+		Where("exchange = ? AND symbol = ? AND event_time_ms >= ?", exchangeName, symbol, since.UnixMilli()).
+		Order("event_time_ms desc").
+		Limit(limit).
+		Find(&items).Error
+	return items, err
+}
+
 func (r *MarketDataRepo) DeleteOldFundingSnapshots(ctx context.Context, cutoff time.Time) error {
 	return r.client.GetDB(ctx).
 		Where("created_at < ?", cutoff).

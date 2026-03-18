@@ -100,6 +100,7 @@ type StrategyRunner struct {
 
 	lastFundingPersisted map[string]entity.FundingSnapshot
 	lastBookPersisted    map[string]entity.BookTopSnapshot
+	fundingHistoryCache  map[string]cachedFundingHistory
 
 	// fundingSymbolsByExchange 保存“全市场粗筛层”使用的 symbol 集合。
 	// 这批 symbol 不要求都有盘口，只要求至少在两家交易所可比即可。
@@ -113,6 +114,12 @@ type StrategyRunner struct {
 	subscriptionMu      sync.RWMutex
 	deepScanPinnedUntil map[string]time.Time
 	rotationCursor      int
+	fundingHistoryMu    sync.RWMutex
+}
+
+type cachedFundingHistory struct {
+	avg       float64
+	expiresAt time.Time
 }
 
 func NewStrategyRunner(p StrategyRunnerParams) *StrategyRunner {
@@ -128,6 +135,7 @@ func NewStrategyRunner(p StrategyRunnerParams) *StrategyRunner {
 		markets:                  exchange.BuildMarketMap(p.Markets),
 		lastFundingPersisted:     make(map[string]entity.FundingSnapshot),
 		lastBookPersisted:        make(map[string]entity.BookTopSnapshot),
+		fundingHistoryCache:      make(map[string]cachedFundingHistory),
 		fundingSymbolsByExchange: make(map[string][]entity.Symbol),
 		bookSymbolsByExchange:    make(map[string][]entity.Symbol),
 		deepScanPinnedUntil:      make(map[string]time.Time),
@@ -527,6 +535,7 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 	//    下面的 ok1~ok6 校验会自动把该组合跳过。
 	watch := r.store.Watchlist()
 	items := make([]entity.Opportunity, 0, len(watch)*2)
+	smoothedFundingRateCache := make(map[string]float64)
 	for _, symbol := range watch {
 		exchanges := r.store.ExchangesForSymbol(symbol)
 		if len(exchanges) < 2 {
@@ -544,8 +553,10 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 				if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6) {
 					continue
 				}
+				futureRateA := r.smoothedFundingRate(context.Background(), now, smoothedFundingRateCache, fA)
+				futureRateB := r.smoothedFundingRate(context.Background(), now, smoothedFundingRateCache, fB)
 
-				longExchange, shortExchange, projection, ok := r.bestFundingDirection(now, exA, fA, exB, fB)
+				longExchange, shortExchange, projection, ok := r.bestFundingDirection(now, exA, fA, futureRateA, exB, fB, futureRateB)
 				if !ok {
 					continue
 				}
@@ -553,11 +564,14 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 				longFunding, shortFunding := fA, fB
 				longBook, shortBook := bA, bB
 				longMeta, shortMeta := metaA, metaB
+				longFutureRate, shortFutureRate := futureRateA, futureRateB
 				if strings.EqualFold(longExchange, exB) {
 					longFunding, shortFunding = fB, fA
 					longBook, shortBook = bB, bA
 					longMeta, shortMeta = metaB, metaA
+					longFutureRate, shortFutureRate = futureRateB, futureRateA
 				}
+				estimateMode, estimateConfidence := fundingEstimateProfile(projection)
 
 				// 保留“小时化等价值”只用于展示和打分，不再作为 funding 收益的核心计算公式。
 				longHourly := longFunding.FundingRate / float64(maxInt(longFunding.FundingIntervalHours, 1))
@@ -598,6 +612,10 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					LongFundingHourly:            longHourly,
 					ShortFundingHourly:           shortHourly,
 					GrossEdgeHourly:              grossEdgeHourly,
+					LongFutureFundingRate:        longFutureRate,
+					ShortFutureFundingRate:       shortFutureRate,
+					FundingEstimateMode:          estimateMode,
+					FundingEstimateConfidence:    estimateConfidence,
 					LongBidPrice:                 longBook.BidPrice,
 					LongAskPrice:                 longBook.AskPrice,
 					ShortBidPrice:                shortBook.BidPrice,
@@ -710,9 +728,9 @@ func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingPr
 // - 当前时刻哪个方向更优，就返回哪个方向。
 //
 // 因此，如果后续 funding 快照变化，反方向变得更优，下一轮计算自然会切换方向。
-func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA entity.FundingSnapshot, exB string, fB entity.FundingSnapshot) (string, string, fundingProjection, bool) {
-	projAB, okAB := r.projectFundingCarry(now, fA, fB)
-	projBA, okBA := r.projectFundingCarry(now, fB, fA)
+func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA entity.FundingSnapshot, futureRateA float64, exB string, fB entity.FundingSnapshot, futureRateB float64) (string, string, fundingProjection, bool) {
+	projAB, okAB := r.projectFundingCarry(now, fA, futureRateA, fB, futureRateB)
+	projBA, okBA := r.projectFundingCarry(now, fB, futureRateB, fA, futureRateA)
 	if !okAB && !okBA {
 		return "", "", fundingProjection{}, false
 	}
@@ -758,7 +776,7 @@ func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA enti
 // - 一边 1h 结算，一边 4h / 8h 结算；
 // - 两边 funding 都为负，但负得不一样；
 // - 最优方向和最优退出点不一定是“最早结算点”。
-func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding, shortFunding entity.FundingSnapshot) (fundingProjection, bool) {
+func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding entity.FundingSnapshot, longFutureRate float64, shortFunding entity.FundingSnapshot, shortFutureRate float64) (fundingProjection, bool) {
 	nowMs := now.UnixMilli()
 	candidateTimes := buildFundingCandidateTimes(nowMs, longFunding, shortFunding, r.cfg.HoldHours)
 	if len(candidateTimes) == 0 {
@@ -774,9 +792,11 @@ func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding, shortFu
 			continue
 		}
 
-		shortEffectiveMultiplier := fundingRateEventMultiplier(shortCount, r.cfg.FundingRateContinuationDecay)
-		longEffectiveMultiplier := fundingRateEventMultiplier(longCount, r.cfg.FundingRateContinuationDecay)
-		carryRate := shortEffectiveMultiplier*shortFunding.FundingRate - longEffectiveMultiplier*longFunding.FundingRate
+		// 第一笔已知 funding 事件仍使用当前快照；
+		// 只有当持仓窗口跨到第 2 次及以后事件时，才使用平滑后的 futureRate 参与估算。
+		shortCarry := projectedLegFundingCarry(shortFunding.FundingRate, shortFutureRate, shortCount, r.cfg.FundingRateContinuationDecay)
+		longCarry := projectedLegFundingCarry(longFunding.FundingRate, longFutureRate, longCount, r.cfg.FundingRateContinuationDecay)
+		carryRate := shortCarry - longCarry
 		windowHours := float64(projectedTime-nowMs) / float64(time.Hour/time.Millisecond)
 		if windowHours <= 0 {
 			windowHours = 1.0 / 60.0
@@ -862,6 +882,75 @@ func buildFundingCandidateTimes(nowMs int64, longFunding, shortFunding entity.Fu
 	return out
 }
 
+func (r *StrategyRunner) smoothedFundingRate(ctx context.Context, now time.Time, cache map[string]float64, item entity.FundingSnapshot) float64 {
+	key := strings.ToLower(item.Exchange) + "|" + strings.ToUpper(item.Symbol)
+	if cached, ok := cache[key]; ok {
+		return cached
+	}
+	if r.marketRepo == nil {
+		cache[key] = item.FundingRate
+		return item.FundingRate
+	}
+	lookback := r.cfg.FundingHistoryLookback
+	if lookback <= 0 {
+		cache[key] = item.FundingRate
+		return item.FundingRate
+	}
+	historyAvg, ok := r.cachedFundingHistoryAverage(ctx, now, item, lookback)
+	if !ok {
+		cache[key] = item.FundingRate
+		return item.FundingRate
+	}
+	smoothedRate := blendedFundingRate(
+		item.FundingRate,
+		historyAvg,
+		r.cfg.FundingSmoothingCurrentWeight,
+	)
+	cache[key] = smoothedRate
+	return smoothedRate
+}
+
+func (r *StrategyRunner) cachedFundingHistoryAverage(ctx context.Context, now time.Time, item entity.FundingSnapshot, lookback time.Duration) (float64, bool) {
+	key := strings.ToLower(item.Exchange) + "|" + strings.ToUpper(item.Symbol)
+	r.fundingHistoryMu.RLock()
+	cached, ok := r.fundingHistoryCache[key]
+	r.fundingHistoryMu.RUnlock()
+	if ok && now.Before(cached.expiresAt) {
+		return cached.avg, true
+	}
+
+	history, err := r.marketRepo.RecentFundingSnapshots(ctx, item.Exchange, item.Symbol, now.Add(-lookback), 24)
+	if err != nil || len(history) == 0 {
+		return 0, false
+	}
+	sum := 0.0
+	count := 0
+	for _, snap := range history {
+		if !math.IsNaN(snap.FundingRate) && !math.IsInf(snap.FundingRate, 0) {
+			sum += snap.FundingRate
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, false
+	}
+	avg := sum / float64(count)
+	ttl := r.cfg.OpportunityCalcInterval * 6
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	if ttl > 30*time.Second {
+		ttl = 30 * time.Second
+	}
+	r.fundingHistoryMu.Lock()
+	r.fundingHistoryCache[key] = cachedFundingHistory{
+		avg:       avg,
+		expiresAt: now.Add(ttl),
+	}
+	r.fundingHistoryMu.Unlock()
+	return avg, true
+}
+
 // fundingEventCountUntil 计算 [now, projectedTime] 窗口内某一腿会发生几次 funding。
 //
 // 规则：
@@ -886,6 +975,36 @@ func fundingRateEventMultiplier(eventCount int, continuationDecay float64) float
 	// sum_{k=0}^{n-1} decay^k = (1-decay^n)/(1-decay)
 	pow := math.Pow(continuationDecay, float64(eventCount))
 	return (1 - pow) / (1 - continuationDecay)
+}
+
+func blendedFundingRate(currentRate, historyAvg, currentWeight float64) float64 {
+	if currentWeight < 0 || currentWeight > 1 {
+		currentWeight = 0.7
+	}
+	return currentRate*currentWeight + historyAvg*(1-currentWeight)
+}
+
+func projectedLegFundingCarry(currentRate, futureRate float64, eventCount int, continuationDecay float64) float64 {
+	if eventCount <= 0 {
+		return 0
+	}
+	carry := currentRate
+	if eventCount == 1 {
+		return carry
+	}
+	return carry + futureRate*fundingRateEventMultiplier(eventCount-1, continuationDecay)
+}
+
+func fundingEstimateProfile(projection fundingProjection) (string, string) {
+	maxEvents := maxInt(projection.LongFundingEventCount, projection.ShortFundingEventCount)
+	switch {
+	case maxEvents <= 1:
+		return "single_cycle_spot", "high"
+	case maxEvents == 2:
+		return "multi_cycle_smoothed", "medium"
+	default:
+		return "multi_cycle_smoothed", "guarded"
+	}
 }
 
 func fundingEventCountUntil(nowMs, projectedTimeMs, nextFundingTimeMs int64, intervalHours int) int {

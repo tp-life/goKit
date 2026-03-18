@@ -49,7 +49,7 @@ func TestProjectFundingCarry_CanChooseFartherExitToCoverCosts(t *testing.T) {
 	long := entity.FundingSnapshot{FundingRate: 0.00005, FundingTimeMs: nowMs + int64(8*time.Hour/time.Millisecond), FundingIntervalHours: 8}
 	short := entity.FundingSnapshot{FundingRate: 0.00010, FundingTimeMs: nowMs + int64(1*time.Hour/time.Millisecond), FundingIntervalHours: 1}
 
-	projection, ok := r.projectFundingCarry(now, long, short)
+	projection, ok := r.projectFundingCarry(now, long, long.FundingRate, short, short.FundingRate)
 	if !ok {
 		t.Fatalf("expected projection to be valid")
 	}
@@ -81,7 +81,7 @@ func TestProjectFundingCarry_MisalignedSchedules(t *testing.T) {
 		FundingIntervalHours: 1,
 	}
 
-	projection, ok := r.projectFundingCarry(now, long, short)
+	projection, ok := r.projectFundingCarry(now, long, long.FundingRate, short, short.FundingRate)
 	if !ok {
 		t.Fatalf("expected projection to be valid")
 	}
@@ -109,6 +109,48 @@ func TestFundingRateEventMultiplier_Decay(t *testing.T) {
 	noDecay := fundingRateEventMultiplier(5, 1)
 	if noDecay != 5 {
 		t.Fatalf("expected no-decay multiplier 5, got %.8f", noDecay)
+	}
+}
+
+func TestBlendedFundingRate(t *testing.T) {
+	got := blendedFundingRate(0.0010, 0.0004, 0.7)
+	want := 0.00082
+	if got != want {
+		t.Fatalf("expected blended rate %.8f, got %.8f", want, got)
+	}
+}
+
+func TestBlendedFundingRate_InvalidWeightFallsBackToDefault(t *testing.T) {
+	got := blendedFundingRate(0.0010, 0.0004, 2)
+	want := 0.00082
+	if got != want {
+		t.Fatalf("expected default-weight blended rate %.8f, got %.8f", want, got)
+	}
+}
+
+func TestProjectedLegFundingCarry_UsesCurrentRateForFirstEventOnly(t *testing.T) {
+	got := projectedLegFundingCarry(0.0010, 0.0004, 1, 0.6)
+	if got != 0.0010 {
+		t.Fatalf("expected first event to use current rate only, got %.8f", got)
+	}
+}
+
+func TestProjectedLegFundingCarry_UsesSmoothedRateForLaterEvents(t *testing.T) {
+	got := projectedLegFundingCarry(0.0010, 0.0004, 3, 0.6)
+	want := 0.0010 + 0.0004*(1+0.6)
+	if got != want {
+		t.Fatalf("expected later events to use smoothed future rate %.8f, got %.8f", want, got)
+	}
+}
+
+func TestFundingEstimateProfile(t *testing.T) {
+	mode, confidence := fundingEstimateProfile(fundingProjection{LongFundingEventCount: 1, ShortFundingEventCount: 1})
+	if mode != "single_cycle_spot" || confidence != "high" {
+		t.Fatalf("expected single-cycle high confidence, got mode=%s confidence=%s", mode, confidence)
+	}
+	mode, confidence = fundingEstimateProfile(fundingProjection{LongFundingEventCount: 3, ShortFundingEventCount: 2})
+	if mode != "multi_cycle_smoothed" || confidence != "guarded" {
+		t.Fatalf("expected multi-cycle guarded confidence, got mode=%s confidence=%s", mode, confidence)
 	}
 }
 
