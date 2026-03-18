@@ -24,6 +24,7 @@ type CEXTradeClient struct {
 	apiSecret    string
 	orderPath    string
 	positionPath string
+	accountPath  string
 }
 
 func NewBinanceTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
@@ -41,6 +42,7 @@ func NewBinanceTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
 		apiSecret:    readEnvByName(c.Auth.APISecretEnv),
 		orderPath:    "/fapi/v1/order",
 		positionPath: "/fapi/v2/positionRisk",
+		accountPath:  "/fapi/v2/account",
 	}
 }
 
@@ -59,6 +61,7 @@ func NewAsterTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
 		apiSecret:    readEnvByName(c.Auth.APISecretEnv),
 		orderPath:    "/fapi/v3/order",
 		positionPath: "/fapi/v3/positionRisk",
+		accountPath:  "/fapi/v3/account",
 	}
 }
 
@@ -138,6 +141,59 @@ func (c *CEXTradeClient) ClosePosition(ctx context.Context, req TradeOrderReques
 		ClientOrderID:   req.ClientOrderID,
 		Reason:          req.Reason,
 	})
+}
+
+func (c *CEXTradeClient) GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error) {
+	if !c.Enabled() {
+		return OrderStatus{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
+	}
+	params := url.Values{}
+	params.Set("symbol", req.VenueSymbol)
+	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	if req.VenueOrderID != "" {
+		params.Set("orderId", req.VenueOrderID)
+	} else if req.ClientOrderID != "" {
+		params.Set("origClientOrderId", req.ClientOrderID)
+	} else {
+		return OrderStatus{}, fmt.Errorf("missing order lookup id")
+	}
+	var payload map[string]any
+	raw, err := c.signedGET(ctx, c.orderPath, params, &payload)
+	if err != nil {
+		return OrderStatus{}, err
+	}
+	status := strings.ToUpper(asString(payload["status"]))
+	return OrderStatus{
+		Exchange:      c.name,
+		Status:        status,
+		ExecutedQty:   parseNullableFloat(payload["executedQty"]),
+		AveragePrice:  parseNullableFloat(payload["avgPrice"]),
+		VenueOrderID:  firstNonEmpty(asString(payload["orderId"]), req.VenueOrderID),
+		ClientOrderID: firstNonEmpty(asString(payload["clientOrderId"]), req.ClientOrderID),
+		Terminal:      isTerminalOrderStatus(status),
+		Canceled:      status == "CANCELED" || status == "EXPIRED",
+		RawResponse:   raw,
+	}, nil
+}
+
+func (c *CEXTradeClient) GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error) {
+	if !c.Enabled() {
+		return AccountSnapshot{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
+	}
+	params := url.Values{}
+	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	var payload map[string]any
+	raw, err := c.signedGET(ctx, c.accountPath, params, &payload)
+	if err != nil {
+		return AccountSnapshot{}, err
+	}
+	return AccountSnapshot{
+		Exchange:         c.name,
+		Equity:           firstPositive(parseNullableFloat(payload["totalMarginBalance"]), parseNullableFloat(payload["totalWalletBalance"])),
+		AvailableBalance: parseNullableFloat(payload["availableBalance"]),
+		MarginUsed:       parseNullableFloat(payload["totalInitialMargin"]),
+		RawResponse:      raw,
+	}, nil
 }
 
 func (c *CEXTradeClient) GetPosition(ctx context.Context, canonicalSymbol, venueSymbol, _ string) (Position, error) {
@@ -220,6 +276,24 @@ func asString(v any) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+func isTerminalOrderStatus(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "FILLED", "CANCELED", "REJECTED", "EXPIRED", "NO_POSITION":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstPositive(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func firstNonEmpty(values ...string) string {
