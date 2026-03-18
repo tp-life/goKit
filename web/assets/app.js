@@ -1081,7 +1081,11 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">安全缓冲</span><span class="detail-v negative">-${fmtNumber(Math.abs(Number(item.safety_buffer_pnl || 0)), 3)} USDT</span></div>
             <div class="detail-item total-row"><span class="detail-k">净收益</span><span class="detail-v ${classForNumber(item.net_expected_pnl)}">${fmtMoney(item.net_expected_pnl)}</span></div>
           </div>
-          <div class="formula-box">净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲</div>
+          <div class="formula-box">
+            净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲
+            <br />
+            说明：这里不是只看“当前这一期” funding，而是按当前最优持有窗口估算；若只覆盖当前这一轮结算，则直接使用当前 funding 快照；若会跨到后续多轮结算，则对后续事件结合近期历史均值做平滑估算。
+          </div>
         </div>
 
         <div class="detail-section opportunity-explain">
