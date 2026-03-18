@@ -412,6 +412,7 @@ func (r *StrategyRunner) refreshDeepScanPlan(now time.Time) {
 func (r *StrategyRunner) rankCoarseCandidates(now time.Time) []coarseCandidate {
 	watch := r.store.Watchlist()
 	out := make([]coarseCandidate, 0, len(watch))
+	smoothedFundingRateCache := make(map[string]float64)
 	for _, symbol := range watch {
 		exchanges := r.store.ExchangesForSymbol(symbol)
 		if len(exchanges) < 2 {
@@ -429,8 +430,10 @@ func (r *StrategyRunner) rankCoarseCandidates(now time.Time) []coarseCandidate {
 				if r.isSnapshotStale(now, fA.EventTimeMs) || r.isSnapshotStale(now, fB.EventTimeMs) {
 					continue
 				}
+				futureRateA := r.smoothedFundingRate(context.Background(), now, smoothedFundingRateCache, fA)
+				futureRateB := r.smoothedFundingRate(context.Background(), now, smoothedFundingRateCache, fB)
 
-				_, _, projection, ok := r.bestFundingDirection(now, exchanges[i], fA, exchanges[j], fB)
+				_, _, projection, ok := r.bestFundingDirection(now, exchanges[i], fA, futureRateA, exchanges[j], fB, futureRateB)
 				if !ok || projection.CarryRate <= 0 {
 					continue
 				}
