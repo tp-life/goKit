@@ -261,10 +261,9 @@ func adaptiveShortIntervalClamp(exchangeName string, intervalHours int, currentR
 	}
 
 	fullWindowCap := 0.0075
-	dynamicCap := math.Max(math.Max(
+	dynamicCap := math.Max(
 		math.Abs(currentRate)*1.25,
-		math.Abs(historyMean)+historyStdDev*4),
-		math.Abs(venueCap),
+		math.Abs(historyMean)+historyStdDev*4,
 	)
 	dynamicCap = math.Min(dynamicCap, fullWindowCap)
 	if dynamicCap <= math.Abs(venueCap) {

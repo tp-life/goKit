@@ -101,6 +101,43 @@ func TestProjectFundingCarry_MisalignedSchedules(t *testing.T) {
 	}
 }
 
+func TestProjectFundingCarryVariants_ReturnsMultipleOrderedWindows(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{HoldHours: 8, FundingRateContinuationDecay: 1}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowMs := now.UnixMilli()
+
+	long := entity.FundingSnapshot{
+		FundingRate:          -0.0007,
+		FundingTimeMs:        nowMs + int64(4*time.Hour/time.Millisecond),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          -0.0001,
+		FundingTimeMs:        nowMs + int64(1*time.Hour/time.Millisecond),
+		FundingIntervalHours: 1,
+	}
+
+	projections := r.projectFundingCarryVariants(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if len(projections) < 2 {
+		t.Fatalf("expected multiple candidate projections, got %d", len(projections))
+	}
+	if projections[0].CarryRate < projections[1].CarryRate {
+		t.Fatalf("expected projections sorted by carry descending")
+	}
+	found4h := false
+	for _, projection := range projections {
+		if projection.ProjectedFundingTimeMs == nowMs+int64(4*time.Hour/time.Millisecond) {
+			found4h = true
+			if projection.LongFundingEventCount != 1 || projection.ShortFundingEventCount != 4 {
+				t.Fatalf("expected 4h window to have long=1 short=4, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+			}
+		}
+	}
+	if !found4h {
+		t.Fatalf("expected 4h candidate projection to be present")
+	}
+}
+
 func TestFundingRateEventMultiplier_Decay(t *testing.T) {
 	m := fundingRateEventMultiplier(5, 0.6)
 	if !(m > 2.3 && m < 2.31) {
