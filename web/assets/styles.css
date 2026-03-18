@@ -367,6 +367,11 @@ button, input, select { font: inherit; }
 .opportunity-mini-grid span { color: var(--muted); font-size: 12px; }
 .opportunity-foot { display: flex; justify-content: flex-start; }
 .dual-pill { gap: 8px; flex-wrap: wrap; }
+.opportunity-item-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
 
 .opportunity-detail { min-height: 200px; }
 .detail-shell {
