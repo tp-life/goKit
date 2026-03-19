@@ -7,6 +7,8 @@ const state = {
   activeSymbol: "BTC",
   opportunities: [],
   plans: [],
+  batchPlans: [],
+  allPlans: [],
   executions: [],
   system: null,
   stats: null,
@@ -14,6 +16,7 @@ const state = {
   selectedOpportunityKey: null,
   selectedPlanKey: null,
   currentOpportunityBatchId: "",
+  planViewMode: "batch",
 };
 
 const OPPORTUNITY_FETCH_LIMIT = 5000;
@@ -46,6 +49,7 @@ const els = {
   opportunitiesEmpty: document.getElementById("opportunities-empty"),
   plansList: document.getElementById("plans-list"),
   plansEmpty: document.getElementById("plans-empty"),
+  planViewMode: document.getElementById("plan-view-mode"),
   executionsList: document.getElementById("executions-list"),
   executionsEmpty: document.getElementById("executions-empty"),
   manualRefreshBtn: document.getElementById("manual-refresh-btn"),
@@ -386,7 +390,7 @@ function targetNotionalText(item, matchedPlan) {
 // ------------------------------------------------------------
 function matchingPlansForOpportunity(item) {
   if (!item) return [];
-  return (state.plans || []).filter((plan) => {
+  return (state.allPlans || []).filter((plan) => {
     if (!plan) return false;
     const sameCore =
       String(plan.symbol || "") === String(item.symbol || "") &&
@@ -855,16 +859,31 @@ function renderCompactExecutionCard(item) {
 }
 
 function renderPlans() {
-  if (!state.plans.length) {
+  const selectedOpportunity = selectedOpportunity(state.opportunities || []);
+  let sourcePlans = state.batchPlans || [];
+  let emptyText = state.currentOpportunityBatchId
+    ? `当前机会批次（${state.currentOpportunityBatchId}）下没有可展示的执行计划。`
+    : "当前没有执行计划。";
+  if (state.planViewMode === "all") {
+    sourcePlans = state.allPlans || [];
+    emptyText = "当前没有可展示的历史/最新执行计划。";
+  } else if (state.planViewMode === "related") {
+    sourcePlans = selectedOpportunity
+      ? matchingPlansForOpportunity(selectedOpportunity)
+      : [];
+    emptyText = selectedOpportunity
+      ? "当前选中机会没有可展示的真实执行计划。"
+      : "请先在左侧选择一条套利机会，再查看相关执行计划。";
+  }
+
+  if (!sourcePlans.length) {
     els.plansEmpty.style.display = "block";
-    els.plansEmpty.textContent = state.currentOpportunityBatchId
-      ? `当前机会批次（${state.currentOpportunityBatchId}）下没有可展示的执行计划。`
-      : "当前没有执行计划。";
+    els.plansEmpty.textContent = emptyText;
     els.plansList.innerHTML = "";
     return;
   }
 
-  const sortedPlans = [...state.plans].sort((a, b) => {
+  const sortedPlans = [...sourcePlans].sort((a, b) => {
     const aSelected =
       String(a.plan_key || "") === String(state.selectedPlanKey || "");
     const bSelected =
@@ -876,9 +895,14 @@ function renderPlans() {
   });
 
   els.plansEmpty.style.display = "none";
-  const batchBanner = state.currentOpportunityBatchId
-    ? `<div class="plan-batch-banner">当前执行计划已按机会批次对齐：<strong>${state.currentOpportunityBatchId}</strong></div>`
-    : "";
+  let batchBanner = "";
+  if (state.planViewMode === "batch" && state.currentOpportunityBatchId) {
+    batchBanner = `<div class="plan-batch-banner">当前执行计划已按机会批次对齐：<strong>${state.currentOpportunityBatchId}</strong></div>`;
+  } else if (state.planViewMode === "all") {
+    batchBanner = '<div class="plan-batch-banner">当前展示的是最新执行计划全集，不按机会批次过滤。</div>';
+  } else if (state.planViewMode === "related") {
+    batchBanner = `<div class="plan-batch-banner">当前展示的是“${selectedOpportunity?.symbol || "--"}”对应的真实执行计划；详情里的“仅展示估算仓位”不会出现在这里。</div>`;
+  }
   els.plansList.innerHTML =
     batchBanner +
     sortedPlans
@@ -1070,6 +1094,79 @@ function legCard(
   `;
 }
 
+function fundingRuleSummaryCard(title, rule, eventCount) {
+  if (!rule || typeof rule !== "object") {
+    return `
+      <div class="detail-section">
+        <div class="detail-section-title">${title}</div>
+        <div class="empty-state show compact-empty">暂无 funding rule 元数据。</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="detail-section">
+      <div class="detail-section-head">
+        <div class="detail-section-title">${title}</div>
+        <span class="pill ${eventCount > 1 ? "good" : "warn"}">${eventCount || 0} 次事件</span>
+      </div>
+      <div class="detail-list compact-list">
+        <div class="detail-item"><span class="detail-k">交易所 / 合约</span><span class="detail-v">${rule.exchange || "--"} / ${rule.venue_symbol || "--"}</span></div>
+        <div class="detail-item"><span class="detail-k">结算周期</span><span class="detail-v">${fundingIntervalText(rule.funding_interval_hours)}</span></div>
+        <div class="detail-item"><span class="detail-k">下一次结算</span><span class="detail-v">${fmtTime(rule.next_funding_time_ms)}</span></div>
+        <div class="detail-item"><span class="detail-k">当前 funding</span><span class="detail-v ${classForNumber(rule.current_funding_rate)}">${fmtPctRatio(rule.current_funding_rate, 5)}</span></div>
+        <div class="detail-item"><span class="detail-k">Clamp 来源</span><span class="detail-v">${rule.clamp_source || "--"}</span></div>
+        <div class="detail-item"><span class="detail-k">有效区间</span><span class="detail-v">${fmtPctRatio(rule.effective_floor_rate, 5)} ~ ${fmtPctRatio(rule.effective_cap_rate, 5)}</span></div>
+        <div class="detail-item"><span class="detail-k">Regime / 置信度</span><span class="detail-v">${rule.forecast_regime || "--"} / ${rule.forecast_confidence || "--"}</span></div>
+      </div>
+      <div class="formula-box">${rule.metadata_summary || "--"}</div>
+    </div>
+  `;
+}
+
+function renderProjectionDetails(item) {
+  const rows = Array.isArray(item?.projection_details)
+    ? item.projection_details
+    : [];
+  if (!rows.length) {
+    return '<div class="empty-state show compact-empty">当前没有可展示的多窗口 projection 明细。</div>';
+  }
+  return `
+    <div class="projection-table-wrap">
+      <table class="projection-table">
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>兑现点</th>
+            <th>窗口</th>
+            <th>Long 事件</th>
+            <th>Short 事件</th>
+            <th>Carry</th>
+            <th>时均</th>
+            <th>净收益</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `
+                <tr class="${row.is_best_projection ? "best" : ""}">
+                  <td>${row.is_best_projection ? "✅" : row.projection_rank || "--"}</td>
+                  <td>${fmtTime(row.projected_funding_time_ms)}</td>
+                  <td>${fmtNumber(row.funding_window_hours || 0, 2)} h</td>
+                  <td>${row.long_funding_event_count || 0}</td>
+                  <td>${row.short_funding_event_count || 0}</td>
+                  <td class="${classForNumber(row.carry_rate)}">${fmtPctRatio(row.carry_rate, 5)}</td>
+                  <td class="${classForNumber(row.carry_rate_hourly_equivalent)}">${fmtPctRatio(row.carry_rate_hourly_equivalent, 5)}</td>
+                  <td class="${classForNumber(row.net_expected_pnl)}">${fmtMoney(row.net_expected_pnl)}</td>
+                </tr>`,
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderOpportunityDetail(items) {
   const item = currentSelectedOpportunity(items);
   if (!item) {
@@ -1084,6 +1181,7 @@ function renderOpportunityDetail(items) {
   const nextShortMs = Number(item.short_funding_time_ms || 0) - Date.now();
   const matchedPlan = bestPlanForOpportunity(item);
   const displayPlan = matchedPlan || syntheticPlanForOpportunity(item);
+  const planPreviewLabel = matchedPlan ? "真实执行计划" : "估算执行计划预览";
   const planStatus = opportunityPlanStatus(item);
   state.selectedOpportunityKey = opportunityKey(item);
   state.selectedPlanKey = matchedPlan?.plan_key || null;
@@ -1141,6 +1239,33 @@ function renderOpportunityDetail(items) {
             <div class="detail-subtitle">把最相关的计划压缩进机会详情里，查看机会时不需要再被整块执行计划列表打断。</div>
           </div>
           <span class="pill ${matchedPlan ? "good" : "warn"}">${matchedPlan ? "已生成计划" : "仅展示估算仓位"}</span>
+        </div>
+        ${displayPlan ? renderCompactPlanCard(displayPlan, { selected: Boolean(matchedPlan), linkedOpp: item, showActions: Boolean(matchedPlan) }) : '<div class="empty-state show compact-empty">当前没有可展示的关联执行计划。</div>'}
+      </div>
+
+      <div class="detail-grid-2">
+        ${fundingRuleSummaryCard("做多腿 funding rule", item.long_funding_rule, item.long_funding_event_count)}
+        ${fundingRuleSummaryCard("做空腿 funding rule", item.short_funding_rule, item.short_funding_event_count)}
+      </div>
+
+      <div class="detail-section detail-section-tight">
+        <div class="detail-section-head">
+          <div>
+            <div class="detail-section-title">候选持有窗口 / Projection 明细</div>
+            <div class="detail-subtitle">同一条机会只保留一个最佳 projection 进入主列表，但这里会展示同方向下多个候选兑现窗口，帮助理解为什么最终选中了当前窗口。</div>
+          </div>
+          <span class="pill good">${Array.isArray(item.projection_details) ? item.projection_details.length : 0} 个窗口</span>
+        </div>
+        ${renderProjectionDetails(item)}
+      </div>
+
+      <div class="detail-section detail-section-tight linked-plan-section">
+        <div class="detail-section-head">
+          <div>
+            <div class="detail-section-title">关联执行计划</div>
+            <div class="detail-subtitle">这里优先展示真实 execution plan；若当前没有匹配到真实 plan，则退化为前端估算预览。因此这里能看到内容，并不代表底部“执行计划速览”一定有真实记录。</div>
+          </div>
+          <span class="pill ${matchedPlan ? "good" : "warn"}">${planPreviewLabel}</span>
         </div>
         ${displayPlan ? renderCompactPlanCard(displayPlan, { selected: Boolean(matchedPlan), linkedOpp: item, showActions: Boolean(matchedPlan) }) : '<div class="empty-state show compact-empty">当前没有可展示的关联执行计划。</div>'}
       </div>
@@ -1283,12 +1408,17 @@ async function refreshAll() {
   const plansPath = currentBatchId
     ? `/api/v1/plans?limit=100&opportunity_batch_id=${encodeURIComponent(currentBatchId)}`
     : `/api/v1/plans?limit=100`;
-  const plans = await apiGet(plansPath, []);
+  const [plans, allPlans] = await Promise.all([
+    apiGet(plansPath, []),
+    apiGet("/api/v1/plans?limit=100", []),
+  ]);
 
   state.system = system || {};
   state.opportunities = normalizedOpportunities;
   state.currentOpportunityBatchId = currentBatchId;
-  state.plans = Array.isArray(plans) ? plans : [];
+  state.batchPlans = Array.isArray(plans) ? plans : [];
+  state.allPlans = Array.isArray(allPlans) ? allPlans : [];
+  state.plans = state.allPlans;
   state.executions = Array.isArray(executions) ? executions : [];
   state.stats = stats || {};
 
@@ -1370,6 +1500,10 @@ function bindEvents() {
 
   els.symbolFilter.addEventListener("input", renderOpportunities);
   els.exchangeFilter.addEventListener("change", renderOpportunities);
+  els.planViewMode?.addEventListener("change", (event) => {
+    state.planViewMode = event.target.value || "batch";
+    renderPlans();
+  });
   els.sortMode.addEventListener("change", () => {
     state.selectedOpportunityKey = null;
     renderOpportunities();

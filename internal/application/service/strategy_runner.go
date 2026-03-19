@@ -608,6 +608,7 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					longMeta, shortMeta = metaB, metaA
 					longForecast, shortForecast = forecastB, forecastA
 				}
+				projectionVariants := r.projectFundingCarryVariants(now, longFunding, longForecast, shortFunding, shortForecast)
 				estimateMode, estimateConfidence := fundingEstimateProfile(projection, longForecast, shortForecast)
 
 				// 保留“小时化等价值”只用于展示和打分，不再作为 funding 收益的核心计算公式。
@@ -697,6 +698,9 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					ShortFundingEventCount:       projection.ShortFundingEventCount,
 					FundingWindowHours:           projection.FundingWindowHours,
 					FundingComputationMode:       projection.ComputationMode,
+					ProjectionDetails:            buildOpportunityProjectionDetails(projectionVariants, notional, entryFeePNL, exitFeePNL, slippagePNL, safetyBufferPNL),
+					LongFundingRule:              buildFundingRuleMetadata(longFunding, longMeta, longForecast),
+					ShortFundingRule:             buildFundingRuleMetadata(shortFunding, shortMeta, shortForecast),
 					Status:                       status,
 					RejectReason:                 reason,
 					EligibleForExecution:         eligible,
@@ -834,14 +838,18 @@ func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA enti
 // - 两边 funding 都为负，但负得不一样；
 // - 最优方向和最优退出点不一定是“最早结算点”。
 func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) (fundingProjection, bool) {
+	projections := r.projectFundingCarryVariants(now, longFunding, longForecast, shortFunding, shortForecast)
+	return selectBestFundingProjection(projections)
+}
+
+func (r *StrategyRunner) projectFundingCarryVariants(now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
 	nowMs := now.UnixMilli()
 	candidateTimes := buildFundingCandidateTimes(nowMs, longFunding, shortFunding, r.cfg.HoldHours)
 	if len(candidateTimes) == 0 {
-		return fundingProjection{}, false
+		return nil
 	}
 
-	best := fundingProjection{}
-	bestOK := false
+	projections := make([]fundingProjection, 0, len(candidateTimes))
 	for _, projectedTime := range candidateTimes {
 		longCount := fundingEventCountUntil(nowMs, projectedTime, longFunding.FundingTimeMs, longFunding.FundingIntervalHours)
 		shortCount := fundingEventCountUntil(nowMs, projectedTime, shortFunding.FundingTimeMs, shortFunding.FundingIntervalHours)
@@ -883,15 +891,90 @@ func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding entity.F
 		if longForecast.Regime != "" || shortForecast.Regime != "" {
 			projection.ComputationMode = "event_based_regime_aware_forecast"
 		}
+		projections = append(projections, projection)
+	}
+	sort.Slice(projections, func(i, j int) bool {
+		if projections[i].CarryRate != projections[j].CarryRate {
+			return projections[i].CarryRate > projections[j].CarryRate
+		}
+		if projections[i].CarryRateHourlyEquivalent != projections[j].CarryRateHourlyEquivalent {
+			return projections[i].CarryRateHourlyEquivalent > projections[j].CarryRateHourlyEquivalent
+		}
+		return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
+	})
+	return projections
+}
 
-		if !bestOK || projection.CarryRate > best.CarryRate ||
-			(projection.CarryRate == best.CarryRate && projection.CarryRateHourlyEquivalent > best.CarryRateHourlyEquivalent) ||
-			(projection.CarryRate == best.CarryRate && projection.CarryRateHourlyEquivalent == best.CarryRateHourlyEquivalent && projection.ProjectedFundingTimeMs < best.ProjectedFundingTimeMs) {
-			best = projection
-			bestOK = true
+func selectBestFundingProjection(projections []fundingProjection) (fundingProjection, bool) {
+	if len(projections) == 0 {
+		return fundingProjection{}, false
+	}
+	return projections[0], true
+}
+
+func buildOpportunityProjectionDetails(projections []fundingProjection, notional, entryFeePNL, exitFeePNL, slippagePNL, safetyBufferPNL float64) []entity.OpportunityProjection {
+	out := make([]entity.OpportunityProjection, 0, len(projections))
+	for i, projection := range projections {
+		grossFundingPNL := notional * projection.CarryRate
+		netExpectedPNL := grossFundingPNL - entryFeePNL - exitFeePNL - slippagePNL - safetyBufferPNL
+		netExpectedBps := 0.0
+		if notional > 0 {
+			netExpectedBps = netExpectedPNL / notional * 10000
+		}
+		out = append(out, entity.OpportunityProjection{
+			ProjectionRank:               i + 1,
+			IsBestProjection:             i == 0,
+			ProjectedFundingTimeMs:       projection.ProjectedFundingTimeMs,
+			RequiredEntryByFundingTimeMs: projection.RequiredEntryByFundingTimeMs,
+			LongFundingEventCount:        projection.LongFundingEventCount,
+			ShortFundingEventCount:       projection.ShortFundingEventCount,
+			FundingWindowHours:           projection.FundingWindowHours,
+			CarryRate:                    projection.CarryRate,
+			CarryRateHourlyEquivalent:    projection.CarryRateHourlyEquivalent,
+			GrossFundingPNL:              grossFundingPNL,
+			NetExpectedPNL:               netExpectedPNL,
+			NetExpectedBps:               netExpectedBps,
+			ComputationMode:              projection.ComputationMode,
+		})
+	}
+	return out
+}
+
+func buildFundingRuleMetadata(item entity.FundingSnapshot, meta entity.Symbol, forecast fundingForecast) entity.OpportunityFundingRule {
+	summary := fmt.Sprintf("%s %dh funding / clamp=%s / range=[%s, %s]",
+		strings.ToLower(strings.TrimSpace(item.Exchange)),
+		maxInt(item.FundingIntervalHours, 1),
+		pickFirstNonEmpty(forecast.ClampSource, "spot_only"),
+		formatFundingRateForSummary(forecast.EffectiveFloorRate),
+		formatFundingRateForSummary(forecast.EffectiveCapRate),
+	)
+	return entity.OpportunityFundingRule{
+		Exchange:             item.Exchange,
+		VenueSymbol:          pickFirstNonEmpty(meta.VenueSymbol, item.VenueSymbol),
+		FundingIntervalHours: item.FundingIntervalHours,
+		NextFundingTimeMs:    item.FundingTimeMs,
+		CurrentFundingRate:   item.FundingRate,
+		ClampSource:          forecast.ClampSource,
+		EffectiveFloorRate:   forecast.EffectiveFloorRate,
+		EffectiveCapRate:     forecast.EffectiveCapRate,
+		ForecastRegime:       forecast.Regime,
+		ForecastConfidence:   forecast.Confidence,
+		MetadataSummary:      summary,
+	}
+}
+
+func formatFundingRateForSummary(v float64) string {
+	return fmt.Sprintf("%.5f%%", v*100)
+}
+
+func pickFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
 		}
 	}
-	return best, bestOK
+	return ""
 }
 
 // buildFundingCandidateTimes 构建候选退出时点。
