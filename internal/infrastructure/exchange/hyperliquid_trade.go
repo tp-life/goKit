@@ -164,6 +164,77 @@ func (c *HyperliquidTradeClient) ClosePosition(ctx context.Context, req TradeOrd
 	})
 }
 
+func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error) {
+	if !c.Enabled() {
+		return OrderStatus{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
+	}
+	payload := map[string]any{"type": "orderStatus", "user": c.accountAddress}
+	if req.VenueOrderID != "" {
+		payload["oid"] = req.VenueOrderID
+	} else if req.ClientOrderID != "" {
+		payload["cloid"] = req.ClientOrderID
+	} else {
+		return OrderStatus{}, fmt.Errorf("missing order lookup id")
+	}
+	var resp map[string]any
+	raw, err := c.postInfo(ctx, payload, &resp)
+	if err != nil {
+		return OrderStatus{}, err
+	}
+	status := strings.ToUpper(firstNonEmpty(asString(resp["status"]), asString(resp["state"])))
+	filled := parseNullableFloat(resp["filled"])
+	avg := parseNullableFloat(resp["avgPx"])
+	if data, ok := resp["order"].(map[string]any); ok {
+		status = strings.ToUpper(firstNonEmpty(status, asString(data["status"]), asString(data["state"])))
+		filled = firstPositive(filled, parseNullableFloat(data["filled"]), parseNullableFloat(data["sz"])-parseNullableFloat(data["remainingSz"]))
+		avg = firstPositive(avg, parseNullableFloat(data["avgPx"]))
+	}
+	return OrderStatus{
+		Exchange:      "hyperliquid",
+		Status:        firstNonEmpty(status, "SUBMITTED"),
+		ExecutedQty:   filled,
+		AveragePrice:  avg,
+		VenueOrderID:  firstNonEmpty(req.VenueOrderID, asString(resp["oid"])),
+		ClientOrderID: req.ClientOrderID,
+		Terminal:      isTerminalOrderStatus(status),
+		Canceled:      status == "CANCELED" || status == "CANCELLED" || status == "EXPIRED",
+		RawResponse:   raw,
+	}, nil
+}
+
+func (c *HyperliquidTradeClient) GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error) {
+	if !c.Enabled() {
+		return AccountSnapshot{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
+	}
+	payload := map[string]any{"type": "userState", "user": c.accountAddress}
+	var resp map[string]any
+	raw, err := c.postInfo(ctx, payload, &resp)
+	if err != nil {
+		return AccountSnapshot{}, err
+	}
+	margin := 0.0
+	if assetPositions, ok := resp["assetPositions"].([]any); ok {
+		for _, item := range assetPositions {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			pos, ok := m["position"].(map[string]any)
+			if !ok {
+				continue
+			}
+			margin += parseNullableFloat(pos["positionValue"])
+		}
+	}
+	return AccountSnapshot{
+		Exchange:         "hyperliquid",
+		Equity:           hyperliquidEquity(resp),
+		AvailableBalance: parseNullableFloat(resp["withdrawable"]),
+		MarginUsed:       margin,
+		RawResponse:      raw,
+	}, nil
+}
+
 func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbol, venueSymbol, _ string) (Position, error) {
 	if !c.Enabled() {
 		return Position{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
@@ -229,6 +300,13 @@ type hlSignature struct {
 	R string `json:"r"`
 	S string `json:"s"`
 	V int    `json:"v"`
+}
+
+func hyperliquidEquity(resp map[string]any) float64 {
+	if summary, ok := resp["marginSummary"].(map[string]any); ok {
+		return firstPositive(parseNullableFloat(summary["accountValue"]), parseNullableFloat(summary["marginUsed"]))
+	}
+	return firstPositive(parseNullableFloat(resp["accountValue"]), parseNullableFloat(resp["withdrawable"]))
 }
 
 func hlTIF(v string) string {

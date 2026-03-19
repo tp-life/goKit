@@ -343,7 +343,7 @@ func TestEstimateExecutionPenalty_MoreEventsIncreaseComplexityPenalty(t *testing
 }
 
 func TestEstimateExecutionPenalty_TimeBucketAndExchangeMultipliers(t *testing.T) {
-	r := &StrategyRunner{cfg: Config{SlippageBps: 2}}
+	r := &StrategyRunner{cfg: Config{SlippageBps: 2}, venues: defaultVenueProfileRegistry()}
 	hot := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
 	normal := time.Date(2026, 1, 1, 5, 0, 0, 0, time.UTC)
 	binance := r.estimateExecutionPenalty(normal, "BTC", "binance", "binance", fundingProjection{FundingWindowHours: 4, LongFundingEventCount: 1, ShortFundingEventCount: 1}, 5)
@@ -357,5 +357,24 @@ func TestEstimateExecutionPenalty_TimeBucketAndExchangeMultipliers(t *testing.T)
 	}
 	if hotPenalty.ExperienceBucket != "funding_window_hot" {
 		t.Fatalf("expected funding_window_hot bucket, got %s", hotPenalty.ExperienceBucket)
+	}
+}
+
+func TestVenueProfileRegistry_DefaultFundingClampAndPenalty(t *testing.T) {
+	registry := defaultVenueProfileRegistry()
+
+	floor, cap, source := registry.FundingClamp("aster", 1)
+	if source != "binance_like_cap" {
+		t.Fatalf("expected binance-like source for aster, got %s", source)
+	}
+	if floor != -0.0009375 || cap != 0.0009375 {
+		t.Fatalf("expected aster 1h clamp ±0.0009375, got floor=%.7f cap=%.7f", floor, cap)
+	}
+
+	if got := registry.ExecutionPenaltyMultiplier("hyperliquid"); got != 1.15 {
+		t.Fatalf("expected hyperliquid penalty multiplier 1.15, got %.2f", got)
+	}
+	if got := registry.ExecutionPenaltyMultiplier("unknown"); got != 1.05 {
+		t.Fatalf("expected default penalty multiplier 1.05, got %.2f", got)
 	}
 }

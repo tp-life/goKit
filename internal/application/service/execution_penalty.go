@@ -16,9 +16,16 @@ type executionPenaltyBreakdown struct {
 	ExitBasisResidualBps float64
 }
 
+// estimateExecutionPenalty 负责把“执行摩擦”拆成可解释的三段：
+// 1. EntryPenaltyBps：开仓即刻吃到的冲击成本；
+// 2. ExitPenaltyBps：平仓时残留 basis 风险 + 退出滑点；
+// 3. HedgeRollbackBps：多事件路径越长，单腿失败后回滚/补救越复杂，需要更高冗余。
+//
+// 其中 exchange multiplier 不再在这里用 switch 写死，而是统一来自 venue profile。
+// 这样 execution penalty 与 funding forecaster 就共享同一套 venue taxonomy。
 func (r *StrategyRunner) estimateExecutionPenalty(now time.Time, symbol, longExchange, shortExchange string, projection fundingProjection, currentBasisBps float64) executionPenaltyBreakdown {
 	base := maxFloat(r.cfg.SlippageBps, 0)
-	exchangeMultiplier := (exchangePenaltyMultiplier(longExchange) + exchangePenaltyMultiplier(shortExchange)) / 2
+	exchangeMultiplier := (r.exchangePenaltyMultiplier(longExchange) + r.exchangePenaltyMultiplier(shortExchange)) / 2
 	symbolMultiplier := symbolPenaltyMultiplier(symbol)
 	timeMultiplier, bucket := timeBucketPenaltyMultiplier(now)
 	riskMultiplier := exchangeMultiplier * symbolMultiplier * timeMultiplier
@@ -49,17 +56,11 @@ func (r *StrategyRunner) estimateExecutionPenalty(now time.Time, symbol, longExc
 	}
 }
 
-func exchangePenaltyMultiplier(exchangeName string) float64 {
-	switch strings.ToLower(strings.TrimSpace(exchangeName)) {
-	case "binance":
-		return 1.00
-	case "aster":
-		return 1.10
-	case "hyperliquid":
-		return 1.15
-	default:
-		return 1.05
+func (r *StrategyRunner) exchangePenaltyMultiplier(exchangeName string) float64 {
+	if r != nil && r.venues != nil {
+		return r.venues.ExecutionPenaltyMultiplier(exchangeName)
 	}
+	return defaultVenueProfileRegistry().ExecutionPenaltyMultiplier(exchangeName)
 }
 
 func symbolPenaltyMultiplier(symbol string) float64 {

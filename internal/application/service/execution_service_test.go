@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/infrastructure/exchange"
@@ -15,8 +16,77 @@ type testOrderRepo struct {
 	items []entity.OrderRecord
 }
 
+type testExecRepo struct {
+	items []entity.ExecutionRecord
+}
+
+func (r *testExecRepo) Upsert(_ context.Context, item *entity.ExecutionRecord) error {
+	if item == nil {
+		return nil
+	}
+	for i := range r.items {
+		if r.items[i].PlanKey == item.PlanKey {
+			r.items[i] = *item
+			return nil
+		}
+	}
+	r.items = append(r.items, *item)
+	return nil
+}
+
+func (r *testExecRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionRecord, error) {
+	for i := range r.items {
+		if r.items[i].PlanKey == planKey {
+			cp := r.items[i]
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *testExecRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionRecord, error) {
+	return append([]entity.ExecutionRecord(nil), r.items...), nil
+}
+
+type testPlanRepo struct {
+	items []entity.ExecutionPlan
+}
+
+func (r *testPlanRepo) SaveBatch(_ context.Context, _, _ string, items []entity.ExecutionPlan) error {
+	r.items = append([]entity.ExecutionPlan(nil), items...)
+	return nil
+}
+
+func (r *testPlanRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionPlan, error) {
+	return append([]entity.ExecutionPlan(nil), r.items...), nil
+}
+
+func (r *testPlanRepo) ListByOpportunityBatch(_ context.Context, _ string, _ int) ([]entity.ExecutionPlan, error) {
+	return append([]entity.ExecutionPlan(nil), r.items...), nil
+}
+
+func (r *testPlanRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionPlan, error) {
+	for i := range r.items {
+		if r.items[i].PlanKey == planKey {
+			cp := r.items[i]
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 func (r *testOrderRepo) Create(_ context.Context, item *entity.OrderRecord) error {
 	r.items = append(r.items, *item)
+	return nil
+}
+
+func (r *testOrderRepo) Update(_ context.Context, item *entity.OrderRecord) error {
+	for i := range r.items {
+		if r.items[i].ID == item.ID && item.ID != 0 {
+			r.items[i] = *item
+			return nil
+		}
+	}
 	return nil
 }
 
@@ -35,12 +105,17 @@ func (r *testOrderRepo) ListLatest(_ context.Context, _ int) ([]entity.OrderReco
 }
 
 type testTradeAdapter struct {
-	name      string
-	enabled   bool
-	placeErr  error
-	placed    []exchange.TradeOrderRequest
-	closed    []exchange.TradeOrderRequest
-	closeResp exchange.TradeOrderResult
+	name        string
+	enabled     bool
+	placeErr    error
+	accountErr  error
+	positionErr error
+	placed      []exchange.TradeOrderRequest
+	closed      []exchange.TradeOrderRequest
+	closeResp   exchange.TradeOrderResult
+	orderStatus exchange.OrderStatus
+	account     exchange.AccountSnapshot
+	position    exchange.Position
 }
 
 func (a *testTradeAdapter) Name() string  { return a.name }
@@ -50,7 +125,7 @@ func (a *testTradeAdapter) PlaceOrder(_ context.Context, req exchange.TradeOrder
 	if a.placeErr != nil {
 		return exchange.TradeOrderResult{}, a.placeErr
 	}
-	return exchange.TradeOrderResult{Status: "FILLED", ClientOrderID: req.ClientOrderID}, nil
+	return exchange.TradeOrderResult{Status: "NEW", ClientOrderID: req.ClientOrderID}, nil
 }
 func (a *testTradeAdapter) ClosePosition(_ context.Context, req exchange.TradeOrderRequest) (exchange.TradeOrderResult, error) {
 	a.closed = append(a.closed, req)
@@ -63,7 +138,34 @@ func (a *testTradeAdapter) ClosePosition(_ context.Context, req exchange.TradeOr
 	return a.closeResp, nil
 }
 func (a *testTradeAdapter) GetPosition(_ context.Context, _, _, _ string) (exchange.Position, error) {
-	return exchange.Position{}, nil
+	if a.positionErr != nil {
+		return exchange.Position{}, a.positionErr
+	}
+	return a.position, nil
+}
+func (a *testTradeAdapter) GetOrderStatus(_ context.Context, _ exchange.OrderLookupRequest) (exchange.OrderStatus, error) {
+	if a.orderStatus.Status == "" {
+		a.orderStatus.Status = "FILLED"
+		a.orderStatus.Terminal = true
+	}
+	return a.orderStatus, nil
+}
+func (a *testTradeAdapter) GetAccountSnapshot(_ context.Context) (exchange.AccountSnapshot, error) {
+	if a.accountErr != nil {
+		return exchange.AccountSnapshot{}, a.accountErr
+	}
+	return a.account, nil
+}
+
+func newTestExecutionService(orderRepo *testOrderRepo, trades map[string]exchange.TradeAdapter) *ExecutionService {
+	return &ExecutionService{
+		cfg:             Config{Leverage: 2, Execution: ExecutionConfig{OrderStatusPollAttempts: 1, OrderStatusPollInterval: time.Millisecond, APIFailureThreshold: 2, APIFailureCooldown: time.Minute, MinAvailableBalanceRatio: 0.05}}.normalize(),
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:           NewMarketStore(),
+		orderRepo:       orderRepo,
+		trades:          trades,
+		exchangeFailure: map[string]exchangeFailureState{},
+	}
 }
 
 func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
@@ -73,32 +175,13 @@ func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
 	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
 
-	longAdapter := &testTradeAdapter{name: "longex", enabled: true}
-	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, placeErr: errors.New("short leg failed")}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}, orderStatus: exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, Terminal: true}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, placeErr: errors.New("short leg failed"), account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
 	orderRepo := &testOrderRepo{}
 
-	svc := &ExecutionService{
-		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:     store,
-		orderRepo: orderRepo,
-		trades: map[string]exchange.TradeAdapter{
-			"longex":  longAdapter,
-			"shortex": shortAdapter,
-		},
-	}
-	plan := &entity.ExecutionPlan{
-		PlanKey:          "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd",
-		Symbol:           "BTCUSDT",
-		LongExchange:     "longex",
-		ShortExchange:    "shortex",
-		LongVenueSymbol:  "BTCUSDT",
-		ShortVenueSymbol: "BTCUSDT",
-		LongQty:          1,
-		ShortQty:         1,
-		LongEntryPrice:   101,
-		ShortEntryPrice:  102,
-		EntryMode:        "taker",
-	}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.store = store
+	plan := &entity.ExecutionPlan{PlanKey: "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd", Symbol: "BTCUSDT", LongExchange: "longex", ShortExchange: "shortex", LongVenueSymbol: "BTCUSDT", ShortVenueSymbol: "BTCUSDT", LongQty: 1, ShortQty: 1, LongEntryPrice: 101, ShortEntryPrice: 102, EntryMode: "taker"}
 
 	results, errMsg := svc.placePlanOrders(context.Background(), plan, "open", "manual")
 	if errMsg == "" {
@@ -131,6 +214,44 @@ func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	if hedgeRecord.Phase != "hedge_close" {
 		t.Fatalf("expected hedge phase record, got %s", hedgeRecord.Phase)
 	}
+	if got := summarizeExecutionStatus(results, "open"); got != executionStateOpenHedging {
+		t.Fatalf("expected hedging state, got %s", got)
+	}
+}
+
+func TestEnforceRiskControls_BlocksLowBalance(t *testing.T) {
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 10}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 10}}
+	orderRepo := &testOrderRepo{}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.cfg.Execution.MinAvailableBalanceRatio = 0.2
+	plan := &entity.ExecutionPlan{Symbol: "BTCUSDT", LongExchange: "longex", ShortExchange: "shortex", LongVenueSymbol: "BTCUSDT", ShortVenueSymbol: "BTCUSDT", LongQty: 1, ShortQty: 1, LongEntryPrice: 100, ShortEntryPrice: 100}
+	if err := svc.enforceRiskControls(context.Background(), plan); err == nil {
+		t.Fatal("expected low balance risk block")
+	}
+}
+
+func TestEnforceRiskControls_CircuitBreaker(t *testing.T) {
+	adapter := &testTradeAdapter{name: "longex", enabled: true, accountErr: errors.New("boom")}
+	other := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 500}}
+	orderRepo := &testOrderRepo{}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": adapter, "shortex": other})
+	plan := &entity.ExecutionPlan{Symbol: "BTCUSDT", LongExchange: "longex", ShortExchange: "shortex", LongVenueSymbol: "BTCUSDT", ShortVenueSymbol: "BTCUSDT", LongQty: 1, ShortQty: 1, LongEntryPrice: 100, ShortEntryPrice: 100}
+	_ = svc.enforceRiskControls(context.Background(), plan)
+	_ = svc.enforceRiskControls(context.Background(), plan)
+	if err := svc.ensureExchangeAvailable("longex"); err == nil {
+		t.Fatal("expected circuit breaker to open after repeated api failures")
+	}
+}
+
+func TestReconcileOrderUsesOrderStatusFill(t *testing.T) {
+	adapter := &testTradeAdapter{name: "longex", enabled: true, orderStatus: exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, AveragePrice: 100, Terminal: true}}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": adapter})
+	rec := entity.OrderRecord{Status: "NEW", ClientOrderID: "abc", RequestedQty: 1}
+	out := svc.reconcileOrder(context.Background(), adapter, rec, exchange.TradeOrderRequest{CanonicalSymbol: "BTCUSDT", VenueSymbol: "BTCUSDT", Quantity: 1})
+	if out.Status != "FILLED" || out.ExecutedQty != 1 {
+		t.Fatalf("expected reconcile fill, got status=%s qty=%f", out.Status, out.ExecutedQty)
+	}
 }
 
 func TestReverseSide(t *testing.T) {
@@ -142,5 +263,61 @@ func TestReverseSide(t *testing.T) {
 	}
 	if got := reverseSide("UNKNOWN"); got != "UNKNOWN" {
 		t.Fatalf("expected unknown side to remain unchanged, got %s", got)
+	}
+}
+
+func TestShouldAutoCloseRecord_OnlyAllowsOpenedStates(t *testing.T) {
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpened}) {
+		t.Fatal("expected opened record to be auto-close eligible")
+	}
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: "dry_run_opened"}) {
+		t.Fatal("expected dry_run_opened record to be auto-close eligible")
+	}
+	if shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpenPartial}) {
+		t.Fatal("expected open_partial_failed to be excluded from auto-close")
+	}
+	if shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpenHedging}) {
+		t.Fatal("expected open_hedging to be excluded from auto-close")
+	}
+}
+
+func TestRunAutoClose_SkipsOpenPartialFailedRecords(t *testing.T) {
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-1",
+				Symbol:           "BTCUSDT",
+				LongExchange:     "longex",
+				ShortExchange:    "shortex",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          1,
+				ShortQty:         1,
+				LongEntryPrice:   100,
+				ShortEntryPrice:  100,
+				ExitMode:         "taker",
+			},
+		},
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:           "plan-1",
+				Status:            executionStateOpenPartial,
+				AutoClose:         true,
+				TargetCloseTimeMs: time.Now().Add(-time.Minute).UnixMilli(),
+			},
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.planRepo = planRepo
+	svc.execRepo = execRepo
+
+	svc.runAutoClose(context.Background())
+
+	if len(longAdapter.closed) != 0 || len(shortAdapter.closed) != 0 {
+		t.Fatalf("expected auto-close to skip open_partial_failed records, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
 	}
 }

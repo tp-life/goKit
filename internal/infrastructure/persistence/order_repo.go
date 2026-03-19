@@ -20,6 +20,10 @@ func (r *OrderRepo) Create(ctx context.Context, item *entity.OrderRecord) error 
 	return r.client.GetDB(ctx).Create(item).Error
 }
 
+func (r *OrderRepo) Update(ctx context.Context, item *entity.OrderRecord) error {
+	return r.client.GetDB(ctx).Save(item).Error
+}
+
 func (r *OrderRepo) ListByPlanKey(ctx context.Context, planKey string) ([]entity.OrderRecord, error) {
 	var out []entity.OrderRecord
 	err := r.client.GetDB(ctx).Where("plan_key = ?", planKey).Order("created_at asc").Find(&out).Error

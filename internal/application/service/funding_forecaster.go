@@ -59,15 +59,23 @@ type fundingStats struct {
 type RegimeAwareFundingForecaster struct {
 	cfg        Config
 	marketRepo repository.MarketDataRepository
+	// venues 保存 funding 预测阶段共享的 venue 规则表。
+	// 注意它应该与 StrategyRunner 中持有的是“同一份默认 registry”；
+	// 否则 execution penalty 与 funding clamp 可能因为默认表漂移而出现静默分叉。
+	venues *VenueProfileRegistry
 
 	mu    sync.RWMutex
 	cache map[string]fundingStats
 }
 
-func NewFundingForecaster(cfg Config, marketRepo repository.MarketDataRepository) FundingForecaster {
+func NewFundingForecaster(cfg Config, marketRepo repository.MarketDataRepository, venues *VenueProfileRegistry) FundingForecaster {
+	if venues == nil {
+		venues = defaultVenueProfileRegistry()
+	}
 	return &RegimeAwareFundingForecaster{
 		cfg:        cfg.normalize(),
 		marketRepo: marketRepo,
+		venues:     venues,
 		cache:      make(map[string]fundingStats),
 	}
 }
@@ -129,7 +137,7 @@ func (f *RegimeAwareFundingForecaster) Forecast(ctx context.Context, now time.Ti
 }
 
 func (f *RegimeAwareFundingForecaster) historyStats(ctx context.Context, now time.Time, item entity.FundingSnapshot) (fundingStats, bool) {
-	key := strings.ToLower(item.Exchange) + "|" + strings.ToUpper(item.Symbol)
+	key := normalizeVenueName(item.Exchange) + "|" + strings.ToUpper(item.Symbol)
 	f.mu.RLock()
 	cached, ok := f.cache[key]
 	f.mu.RUnlock()
@@ -218,6 +226,12 @@ func fundingRegimeProfile(zScore, currentRate, mean float64) (regime, confidence
 	}
 }
 
+// effectiveFundingClamp 把“统计历史带”和“venue 机制护栏”合并成最终可用区间。
+//
+// 合并顺序是有意设计的：
+// 1. 先从历史分布得到一个统计意义上的波动带；
+// 2. 再引入 venue 的机制上限，避免把极端瞬时 funding 机械外推到未来多轮；
+// 3. 对 Binance-like 的短周期 funding，再允许受控地放宽，保留短周期 alpha。
 func effectiveFundingClamp(item entity.FundingSnapshot, currentRate, historyMean, historyStdDev float64) (floorRate, capRate float64, source string) {
 	floorRate = historyMean - historyStdDev*3
 	capRate = historyMean + historyStdDev*3
@@ -252,44 +266,26 @@ func effectiveFundingClamp(item entity.FundingSnapshot, currentRate, historyMean
 	return floorRate, capRate, venueSource
 }
 
-func adaptiveShortIntervalClamp(exchangeName string, intervalHours int, currentRate, historyMean, historyStdDev, venueFloor, venueCap float64) (floorRate, capRate float64, source string, widened bool) {
-	if !(strings.EqualFold(exchangeName, "binance") || strings.EqualFold(exchangeName, "aster")) {
+func (f *RegimeAwareFundingForecaster) adaptiveShortIntervalClamp(exchangeName string, intervalHours int, currentRate, historyMean, historyStdDev, venueFloor, venueCap float64) (floorRate, capRate float64, source string, widened bool) {
+	if f == nil || f.venues == nil {
 		return 0, 0, "", false
 	}
-	if intervalHours <= 0 || intervalHours >= 8 {
-		return 0, 0, "", false
-	}
+	return f.venues.AdaptiveShortIntervalClamp(exchangeName, intervalHours, currentRate, historyMean, historyStdDev, venueFloor, venueCap)
+}
 
-	fullWindowCap := 0.0075
-	dynamicCap := math.Max(math.Max(
-		math.Abs(currentRate)*1.25,
-		math.Abs(historyMean)+historyStdDev*4),
-		math.Abs(venueCap),
-	)
-	dynamicCap = math.Min(dynamicCap, fullWindowCap)
-	if dynamicCap <= math.Abs(venueCap) {
-		return 0, 0, "", false
+func (f *RegimeAwareFundingForecaster) venueFundingClamp(exchangeName string, intervalHours int) (floorRate, capRate float64, source string) {
+	if f == nil || f.venues == nil {
+		return 0, 0, ""
 	}
-	return -dynamicCap, dynamicCap, "binance_like_adaptive_short_interval_cap", true
+	return f.venues.FundingClamp(exchangeName, intervalHours)
 }
 
 func venueFundingClamp(exchangeName string, intervalHours int) (floorRate, capRate float64, source string) {
-	intervalHours = maxInt(intervalHours, 1)
-	switch strings.ToLower(strings.TrimSpace(exchangeName)) {
-	case "binance", "aster":
-		// Binance-like perp 常见 funding 上下限约在每 8h ±0.75%。
-		// 对 1h 周期按时间比例缩放，避免把 Hyperliquid 这类高频结算路径过度放宽。
-		perHourCap := 0.0075 / 8.0
-		cap := perHourCap * float64(intervalHours)
-		return -cap, cap, "binance_like_cap"
-	case "hyperliquid":
-		// Hyperliquid 为 1h 结算，实盘中 funding 往往明显小于 CEX 的 8h cap；
-		// 这里给出保守的每小时上下限，防止极端瞬时 funding 被机械外推到多轮。
-		cap := 0.0040
-		return -cap, cap, "hyperliquid_cap"
-	default:
-		return 0, 0, ""
-	}
+	return defaultVenueProfileRegistry().FundingClamp(exchangeName, intervalHours)
+}
+
+func adaptiveShortIntervalClamp(exchangeName string, intervalHours int, currentRate, historyMean, historyStdDev, venueFloor, venueCap float64) (floorRate, capRate float64, source string, widened bool) {
+	return defaultVenueProfileRegistry().AdaptiveShortIntervalClamp(exchangeName, intervalHours, currentRate, historyMean, historyStdDev, venueFloor, venueCap)
 }
 
 func sameFundingSign(a, b float64) bool {
