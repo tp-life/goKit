@@ -577,7 +577,7 @@ func (s *ExecutionService) enforceRiskControls(ctx context.Context, plan *entity
 		}
 		pos, err := adapter.GetPosition(ctx, plan.Symbol, leg.venue, leg.assetID)
 		if err == nil {
-			ref := firstPositive(pos.MarkPrice, pos.EntryPrice, leg.price)
+			ref := firstPositiveFloat(pos.MarkPrice, pos.EntryPrice, leg.price)
 			existing := math.Abs(pos.Quantity * ref)
 			symbolExposure += existing + notional
 			exchangeExposure[strings.ToLower(leg.exchange)] += existing + notional
@@ -772,9 +772,11 @@ func isFailedOrderStatus(status string) bool {
 	}
 }
 
-func maxFloat(a, b float64) float64 {
-	if b > a {
-		return b
+func firstPositiveFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
 	}
-	return a
+	return 0
 }
