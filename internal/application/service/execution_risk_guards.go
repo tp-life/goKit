@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"goKit/internal/domain/entity"
@@ -306,6 +307,15 @@ func buildFundingProjections(now time.Time, holdHours float64, longFunding entit
 			ComputationMode:              "event_based_spot_revalidation",
 		})
 	}
+	sort.Slice(projections, func(i, j int) bool {
+		if projections[i].CarryRate != projections[j].CarryRate {
+			return projections[i].CarryRate > projections[j].CarryRate
+		}
+		if projections[i].CarryRateHourlyEquivalent != projections[j].CarryRateHourlyEquivalent {
+			return projections[i].CarryRateHourlyEquivalent > projections[j].CarryRateHourlyEquivalent
+		}
+		return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
+	})
 	return projections
 }
 

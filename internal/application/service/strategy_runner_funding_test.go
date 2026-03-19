@@ -40,6 +40,34 @@ func TestBuildFundingCandidateTimes_ExtendToHoldWindow(t *testing.T) {
 	}
 }
 
+func TestBuildFundingCandidateTimes_StrictlyRespectsHoldWindow(t *testing.T) {
+	now := time.Date(2026, 1, 1, 16, 50, 0, 0, time.UTC).UnixMilli()
+	long := entity.FundingSnapshot{FundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(), FundingIntervalHours: 4}
+	short := entity.FundingSnapshot{FundingTimeMs: time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC).UnixMilli(), FundingIntervalHours: 1}
+
+	times := buildFundingCandidateTimes(now, long, short, 10.0/60.0)
+	if len(times) != 1 {
+		t.Fatalf("expected exactly 1 candidate time within 10m hold window, got %d", len(times))
+	}
+	if want := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC).UnixMilli(); times[0] != want {
+		t.Fatalf("expected only 17:00 funding candidate, got %d", times[0])
+	}
+}
+
+func TestBuildFundingCandidateTimes_IncludesSharedSettlementInsideHoldWindow(t *testing.T) {
+	now := time.Date(2026, 1, 1, 19, 50, 0, 0, time.UTC).UnixMilli()
+	long := entity.FundingSnapshot{FundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(), FundingIntervalHours: 4}
+	short := entity.FundingSnapshot{FundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(), FundingIntervalHours: 1}
+
+	times := buildFundingCandidateTimes(now, long, short, 10.0/60.0)
+	if len(times) != 1 {
+		t.Fatalf("expected shared 20:00 settlement to be included once, got %d candidates", len(times))
+	}
+	if want := time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(); times[0] != want {
+		t.Fatalf("expected only 20:00 funding candidate, got %d", times[0])
+	}
+}
+
 func TestProjectFundingCarry_CanChooseFartherExitToCoverCosts(t *testing.T) {
 	r := &StrategyRunner{cfg: Config{HoldHours: 24, FundingRateContinuationDecay: 1}}
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -63,6 +91,63 @@ func TestProjectFundingCarry_CanChooseFartherExitToCoverCosts(t *testing.T) {
 	}
 	if projection.ShortFundingEventCount != 24 {
 		t.Fatalf("expected short leg to have 24 events by 24h, got %d", projection.ShortFundingEventCount)
+	}
+}
+
+func TestProjectFundingCarry_OnlyCountsFundingEventsInsideHoldWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{HoldHours: 10.0 / 60.0, FundingRateContinuationDecay: 1}}
+	now := time.Date(2026, 1, 1, 16, 50, 0, 0, time.UTC)
+
+	long := entity.FundingSnapshot{
+		FundingRate:          0.0002,
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          0.0001,
+		FundingTimeMs:        time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if !ok {
+		t.Fatalf("expected projection to be valid")
+	}
+	if want := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected best projection at 17:00, got %d", projection.ProjectedFundingTimeMs)
+	}
+	if projection.LongFundingEventCount != 0 || projection.ShortFundingEventCount != 1 {
+		t.Fatalf("expected only short leg funding inside window, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+	}
+	if projection.CarryRate != short.FundingRate {
+		t.Fatalf("expected carry to equal short-leg funding %.8f, got %.8f", short.FundingRate, projection.CarryRate)
+	}
+}
+
+func TestProjectFundingCarry_CountsBothLegsWhenSharedSettlementInsideHoldWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{HoldHours: 10.0 / 60.0, FundingRateContinuationDecay: 1}}
+	now := time.Date(2026, 1, 1, 19, 50, 0, 0, time.UTC)
+
+	long := entity.FundingSnapshot{
+		FundingRate:          0.0002,
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          0.0006,
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if !ok {
+		t.Fatalf("expected projection to be valid")
+	}
+	if projection.LongFundingEventCount != 1 || projection.ShortFundingEventCount != 1 {
+		t.Fatalf("expected both legs to settle once at 20:00, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+	}
+	if want := short.FundingRate - long.FundingRate; projection.CarryRate != want {
+		t.Fatalf("expected carry %.8f, got %.8f", want, projection.CarryRate)
 	}
 }
 
@@ -136,6 +221,29 @@ func TestProjectFundingCarryVariants_ReturnsMultipleOrderedWindows(t *testing.T)
 	}
 	if !found4h {
 		t.Fatalf("expected 4h candidate projection to be present")
+	}
+}
+
+func TestBuildFundingProjections_SortsBestCarryFirstForRevalidation(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowMs := now.UnixMilli()
+	long := entity.FundingSnapshot{
+		FundingRate:          -0.0007,
+		FundingTimeMs:        nowMs + int64(4*time.Hour/time.Millisecond),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          -0.0001,
+		FundingTimeMs:        nowMs + int64(1*time.Hour/time.Millisecond),
+		FundingIntervalHours: 1,
+	}
+
+	projections := buildFundingProjections(now, 8, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if len(projections) == 0 {
+		t.Fatalf("expected projections")
+	}
+	if want := nowMs + int64(8*time.Hour/time.Millisecond); projections[0].ProjectedFundingTimeMs != want {
+		t.Fatalf("expected best projection first at 8h, got %d", projections[0].ProjectedFundingTimeMs)
 	}
 }
 

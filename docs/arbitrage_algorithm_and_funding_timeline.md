@@ -157,7 +157,12 @@ allowedBasisBps = max_spread_bps * (1 + (dynamic_max_spread_multiplier - 1) * cl
 
 - 从双方 `nextFundingTime` 出发，按 `FundingIntervalHours` 生成时间轴；
 - 合并去重；
-- 截断到 `horizon = max(max(nextLong, nextShort), now + hold_hours)`。
+- 截断到 `horizon = now + hold_hours`。
+
+这意味着只有真实落在计划持仓窗口里的 funding 事件，才会参与 carry 估算。
+例如：
+- `16:50` 开仓、`hold_hours = 10m`、Binance 下一次结算在 `17:00`、Aster 下一次结算在 `20:00`，则只会计入 `17:00` 那一侧；
+- `19:50` 开仓、`hold_hours = 10m`、两侧都在 `20:00` 结算，则两侧都会计入。
 
 ### B) 事件计数 `fundingEventCountUntil`
 

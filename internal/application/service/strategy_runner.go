@@ -989,20 +989,23 @@ func pickFirstNonEmpty(values ...string) string {
 // 思路：
 // - 各腿从 nextFundingTime 开始，按 interval 生成事件时间轴；
 // - 合并去重；
-// - 在 horizon 内保留候选点，其中 horizon=max(latestNextFunding, now+holdHours)。
+// - 在 horizon 内保留候选点，其中 horizon=now+holdHours。
 //
 // 这意味着：
-//   - 至少会覆盖两腿“已知下一次结算”之前的所有相关事件；
+//   - 只有真实落在“计划持仓窗口”里的 funding 事件，才会进入收益估算；
 //   - 当 holdHours 更长（例如 24h）时，会继续评估更远的退出点，
-//     支持“多轮 funding 覆盖建仓成本”的策略。
+//     支持“多轮 funding 覆盖建仓成本”的策略；
+//   - 如果持仓窗口内没有任何 funding 事件，则当前方向不存在可兑现的 funding carry。
 func buildFundingCandidateTimes(nowMs int64, longFunding, shortFunding entity.FundingSnapshot, holdHours float64) []int64 {
-	latestNextFunding := maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs)
-	horizon := latestNextFunding
+	horizon := int64(0)
 	if holdHours > 0 {
 		holdMs := int64(holdHours * float64(time.Hour/time.Millisecond))
 		if holdMs > 0 {
-			horizon = maxInt64(horizon, nowMs+holdMs)
+			horizon = nowMs + holdMs
 		}
+	}
+	if horizon <= 0 {
+		horizon = maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs)
 	}
 	if horizon <= nowMs {
 		return nil

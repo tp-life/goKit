@@ -211,6 +211,14 @@ function opportunityDirection(item) {
 }
 
 function fundingSpread(item) {
+  const bestProjectionCarry = Number(item?.projection_details?.[0]?.carry_rate);
+  if (Number.isFinite(bestProjectionCarry)) {
+    return bestProjectionCarry;
+  }
+  const targetNotional = strategyTargetNotional();
+  if (targetNotional > 0) {
+    return Number(item?.gross_funding_pnl || 0) / targetNotional;
+  }
   return (
     Number(item.short_funding_rate || 0) - Number(item.long_funding_rate || 0)
   );
@@ -1223,7 +1231,7 @@ function renderOpportunityDetail(items) {
       <div class="detail-metric-grid">
         ${detailMetric("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl))}
         ${detailMetric("净收益率", fmtSignedBps(item.net_expected_bps, 2), classForNumber(item.net_expected_bps))}
-        ${detailMetric("资金费率差", fmtPctRatio(fundingDelta, 5), classForNumber(fundingDelta))}
+        ${detailMetric("窗口内 funding carry", fmtPctRatio(fundingDelta, 5), classForNumber(fundingDelta))}
         ${detailMetric("事件化时均 edge", fmtPctRatio(hourlyDelta, 5), classForNumber(hourlyDelta))}
         ${detailMetric("Basis", fmtSignedBps(item.basis_bps, 2))}
         ${detailMetric("动态价差阈值", fmtSignedBps(maxAllowedBasisForItem(item), 2))}
