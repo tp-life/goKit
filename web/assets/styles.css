@@ -268,6 +268,133 @@ select {
   margin-bottom: 12px;
 }
 
+.execution-subhead-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.section-title-sm {
+  font-size: 17px;
+  margin-bottom: 4px;
+}
+
+.plan-list-compact {
+  gap: 10px;
+}
+
+.plan-card-compact {
+  padding: 14px;
+}
+
+.plan-head-compact {
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.plan-head-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.compact-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.compact-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.025);
+}
+
+.compact-stat span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.compact-stat strong {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.compact-status-desc {
+  margin-top: 10px;
+}
+
+.linked-plan-section {
+  margin-bottom: 14px;
+}
+
+.detail-section-tight {
+  padding: 12px;
+}
+
+.projection-table-wrap {
+  overflow-x: auto;
+}
+
+.projection-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.projection-table th,
+.projection-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.projection-table th:first-child,
+.projection-table td:first-child,
+.projection-table th:nth-child(2),
+.projection-table td:nth-child(2) {
+  text-align: left;
+}
+
+.projection-table thead th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.projection-table tbody tr.best {
+  background: rgba(110,168,254,0.08);
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.execution-board {
+  order: 2;
+}
+
+.execution-board-grid {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 16px;
+}
+
+.execution-subhead {
+  margin-bottom: 12px;
+}
+
 .section-title-sm {
   font-size: 17px;
   margin-bottom: 4px;
@@ -501,9 +628,6 @@ select {
     background: rgba(255, 255, 255, 0.07);
     color: var(--text);
     border: 1px solid var(--line);
-}
-.compact-actions {
-    margin-top: 14px;
 }
 .compact-actions { margin-top: 12px; }
 .compact-actions .btn { padding: 9px 14px; }
