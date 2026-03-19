@@ -714,9 +714,9 @@ function syntheticPlanForOpportunity(item) {
   if (!item || typeof item !== "object") return null;
   const strategy = state.system?.strategy || {};
   const targetLeverage = Number(strategy.leverage || 0);
-  const capitalAllocated = Number(
-    strategy.capital_total_usdt || 0,
-  ) * Number(strategy.capital_utilization || 0);
+  const capitalAllocated =
+    Number(strategy.capital_total_usdt || 0) *
+    Number(strategy.capital_utilization || 0);
   const targetNotional = Number(strategy.effective_notional || 0);
   const longEntryPrice = Number(item.long_ask_price || 0);
   const shortEntryPrice = Number(item.short_bid_price || 0);
@@ -792,17 +792,34 @@ function compactStat(label, value, extraClass = "") {
 function planCompactMeta(item, linkedOpp) {
   const metrics = [
     compactStat("状态", item.status || "--"),
-    compactStat("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl)),
+    compactStat(
+      "净收益",
+      fmtMoney(item.net_expected_pnl),
+      classForNumber(item.net_expected_pnl),
+    ),
     compactStat("投入", fmtMoney(planCapitalAllocated(item), 2)),
-    compactStat("杠杆", `${fmtNumber(planLongLeverage(item), 2)}x / ${fmtNumber(planShortLeverage(item), 2)}x`),
+    compactStat(
+      "杠杆",
+      `${fmtNumber(planLongLeverage(item), 2)}x / ${fmtNumber(planShortLeverage(item), 2)}x`,
+    ),
     compactStat("Funding", fundingEventsText(item)),
-    compactStat("兑现", fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)),
-    compactStat("关联机会", linkedOpp ? "已关联" : "--", linkedOpp ? "positive" : "muted-text"),
+    compactStat(
+      "兑现",
+      fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms),
+    ),
+    compactStat(
+      "关联机会",
+      linkedOpp ? "已关联" : "--",
+      linkedOpp ? "positive" : "muted-text",
+    ),
   ];
   return `<div class="compact-stat-grid">${metrics.join("")}</div>`;
 }
 
-function renderCompactPlanCard(item, { selected = false, linkedOpp = null, showActions = true } = {}) {
+function renderCompactPlanCard(
+  item,
+  { selected = false, linkedOpp = null, showActions = true } = {},
+) {
   const linkedOppKey = linkedOpp ? opportunityKey(linkedOpp) : "";
   const isInteractive = Boolean(showActions) || Boolean(linkedOppKey);
   const positionSkew = planPositionSkewBps(item);
@@ -859,7 +876,9 @@ function renderCompactExecutionCard(item) {
 }
 
 function renderPlans() {
-  const selectedOpportunity = selectedOpportunity(state.opportunities || []);
+  const selectedOpportunity = currentSelectedOpportunity(
+    state.opportunities || [],
+  );
   let sourcePlans = state.batchPlans || [];
   let emptyText = state.currentOpportunityBatchId
     ? `当前机会批次（${state.currentOpportunityBatchId}）下没有可展示的执行计划。`
@@ -899,7 +918,8 @@ function renderPlans() {
   if (state.planViewMode === "batch" && state.currentOpportunityBatchId) {
     batchBanner = `<div class="plan-batch-banner">当前执行计划已按机会批次对齐：<strong>${state.currentOpportunityBatchId}</strong></div>`;
   } else if (state.planViewMode === "all") {
-    batchBanner = '<div class="plan-batch-banner">当前展示的是最新执行计划全集，不按机会批次过滤。</div>';
+    batchBanner =
+      '<div class="plan-batch-banner">当前展示的是最新执行计划全集，不按机会批次过滤。</div>';
   } else if (state.planViewMode === "related") {
     batchBanner = `<div class="plan-batch-banner">当前展示的是“${selectedOpportunity?.symbol || "--"}”对应的真实执行计划；详情里的“仅展示估算仓位”不会出现在这里。</div>`;
   }
