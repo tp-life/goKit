@@ -98,6 +98,7 @@ type StrategyRunner struct {
 	planRepo   repository.ExecutionPlanRepository
 	markets    map[string]exchange.MarketAdapter
 	forecaster FundingForecaster
+	venues     *VenueProfileRegistry
 
 	lastFundingPersisted map[string]entity.FundingSnapshot
 	lastBookPersisted    map[string]entity.BookTopSnapshot
@@ -118,6 +119,10 @@ type StrategyRunner struct {
 
 func NewStrategyRunner(p StrategyRunnerParams) *StrategyRunner {
 	cfg := p.Cfg.normalize()
+	// 这里显式构造并复用同一份 venue registry，
+	// 这样 StrategyRunner 自己的 execution penalty 逻辑与 FundingForecaster
+	// 的 funding clamp 逻辑会共享一套规则来源，避免两边默认值各自漂移。
+	venues := defaultVenueProfileRegistry()
 	return &StrategyRunner{
 		cfg:                      cfg,
 		logger:                   p.Logger,
@@ -127,7 +132,8 @@ func NewStrategyRunner(p StrategyRunnerParams) *StrategyRunner {
 		oppRepo:                  p.OppRepo,
 		planRepo:                 p.PlanRepo,
 		markets:                  exchange.BuildMarketMap(p.Markets),
-		forecaster:               NewFundingForecaster(cfg, p.MarketRepo),
+		venues:                   venues,
+		forecaster:               NewFundingForecaster(cfg, p.MarketRepo, venues),
 		lastFundingPersisted:     make(map[string]entity.FundingSnapshot),
 		lastBookPersisted:        make(map[string]entity.BookTopSnapshot),
 		fundingSymbolsByExchange: make(map[string][]entity.Symbol),

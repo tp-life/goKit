@@ -141,8 +141,7 @@ func (s *ExecutionService) runAutoClose(ctx context.Context) {
 	}
 	nowMs := time.Now().UnixMilli()
 	for _, rec := range records {
-		status := strings.ToLower(rec.Status)
-		if status != executionStateOpened && status != "dry_run_opened" && status != executionStateOpenPartial {
+		if !shouldAutoCloseRecord(rec) {
 			continue
 		}
 		if !rec.AutoClose || rec.TargetCloseTimeMs <= 0 || nowMs < rec.TargetCloseTimeMs {
@@ -156,6 +155,31 @@ func (s *ExecutionService) runAutoClose(ctx context.Context) {
 		if _, err := s.closePlan(ctx, plan, "auto", s.cfg.Execution.Enabled); err != nil {
 			s.logger.Error("execution_auto_close_failed", slog.String("plan_key", rec.PlanKey), slog.Any("err", err))
 		}
+	}
+}
+
+// shouldAutoCloseRecord 明确约束“哪些 execution record 可以进入自动平仓扫描”。
+//
+// 当前只允许：
+// 1. 真正已经双腿打开完成的 `opened`
+// 2. dry-run 下的 `dry_run_opened`
+//
+// 刻意不再允许：
+// - `open_partial_failed`
+// - `open_hedging`
+// - 其他任何异常/中间态
+//
+// 原因：
+// 部分失败后的记录虽然可能曾经有单腿短暂成交，但系统已经立即发起 `hedge_close`
+// 做紧急回滚；这类记录的净仓位是否还存在、是否适合按原 plan 再执行一次 close，
+// 需要更完整的双腿执行状态机才能安全判定。在状态机完善前，宁可保守跳过，
+// 也不要把异常路径重新送入 auto-close。
+func shouldAutoCloseRecord(rec entity.ExecutionRecord) bool {
+	switch strings.ToLower(strings.TrimSpace(rec.Status)) {
+	case executionStateOpened, "dry_run_opened":
+		return true
+	default:
+		return false
 	}
 }
 

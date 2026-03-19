@@ -639,7 +639,6 @@ readyNow = now ∈ [entryWindowOpenMs, entryWindowCloseMs]
 1. 当前 execution status 属于：
    - `opened`
    - `dry_run_opened`
-   - `open_partial_failed`
 2. `rec.AutoClose == true`
 3. `rec.TargetCloseTimeMs > 0`
 4. `now >= rec.TargetCloseTimeMs`
@@ -652,6 +651,22 @@ readyNow = now ∈ [entryWindowOpenMs, entryWindowCloseMs]
 也就是说，自动平仓的本质是：
 
 > **“对已经开过的记录，在达到计划目标平仓时间后，按 plan 自动发起 close”。**
+
+特别说明：
+
+- `open_partial_failed`
+- `open_hedging`
+- 以及其他异常/中间态 record
+
+**不应该进入 auto-close 扫描。**
+
+原因是这类记录在 open 阶段已经发生单腿异常，系统会先尝试 `hedge_close`
+做紧急回滚；此时剩余净仓位是否真实存在、是否仍适合按原 plan 再走一次 close，
+需要更完整的双腿执行状态机才能安全判断。
+
+因此在当前实现里，auto-close 应保持保守：
+
+> **只有确认已经完整打开的记录，才允许进入自动平仓。**
 
 ### 8.9 自动平仓时间是如何确定的
 
@@ -750,7 +765,7 @@ Opportunity
 1. 自动开仓只避免“同一个 planKey 已有 execution record 时重复开”，
    但并不是完整的多状态执行状态机；
 2. 自动平仓依赖 `execution_record + target_close_time_ms`，而不是订单成交回报 websocket；
-3. `open_partial_failed` 会进入紧急回滚，但其后续记录仍可能进入 auto-close 扫描；
+3. `open_partial_failed` 会进入紧急回滚，但**不应**再进入 auto-close 扫描；
 4. 若要继续提升生产可用性，最值得补的是：
    - 订单状态 websocket；
    - 更完整的双腿执行状态机；

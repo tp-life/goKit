@@ -16,6 +16,65 @@ type testOrderRepo struct {
 	items []entity.OrderRecord
 }
 
+type testExecRepo struct {
+	items []entity.ExecutionRecord
+}
+
+func (r *testExecRepo) Upsert(_ context.Context, item *entity.ExecutionRecord) error {
+	if item == nil {
+		return nil
+	}
+	for i := range r.items {
+		if r.items[i].PlanKey == item.PlanKey {
+			r.items[i] = *item
+			return nil
+		}
+	}
+	r.items = append(r.items, *item)
+	return nil
+}
+
+func (r *testExecRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionRecord, error) {
+	for i := range r.items {
+		if r.items[i].PlanKey == planKey {
+			cp := r.items[i]
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *testExecRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionRecord, error) {
+	return append([]entity.ExecutionRecord(nil), r.items...), nil
+}
+
+type testPlanRepo struct {
+	items []entity.ExecutionPlan
+}
+
+func (r *testPlanRepo) SaveBatch(_ context.Context, _, _ string, items []entity.ExecutionPlan) error {
+	r.items = append([]entity.ExecutionPlan(nil), items...)
+	return nil
+}
+
+func (r *testPlanRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionPlan, error) {
+	return append([]entity.ExecutionPlan(nil), r.items...), nil
+}
+
+func (r *testPlanRepo) ListByOpportunityBatch(_ context.Context, _ string, _ int) ([]entity.ExecutionPlan, error) {
+	return append([]entity.ExecutionPlan(nil), r.items...), nil
+}
+
+func (r *testPlanRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionPlan, error) {
+	for i := range r.items {
+		if r.items[i].PlanKey == planKey {
+			cp := r.items[i]
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 func (r *testOrderRepo) Create(_ context.Context, item *entity.OrderRecord) error {
 	r.items = append(r.items, *item)
 	return nil
@@ -204,5 +263,61 @@ func TestReverseSide(t *testing.T) {
 	}
 	if got := reverseSide("UNKNOWN"); got != "UNKNOWN" {
 		t.Fatalf("expected unknown side to remain unchanged, got %s", got)
+	}
+}
+
+func TestShouldAutoCloseRecord_OnlyAllowsOpenedStates(t *testing.T) {
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpened}) {
+		t.Fatal("expected opened record to be auto-close eligible")
+	}
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: "dry_run_opened"}) {
+		t.Fatal("expected dry_run_opened record to be auto-close eligible")
+	}
+	if shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpenPartial}) {
+		t.Fatal("expected open_partial_failed to be excluded from auto-close")
+	}
+	if shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpenHedging}) {
+		t.Fatal("expected open_hedging to be excluded from auto-close")
+	}
+}
+
+func TestRunAutoClose_SkipsOpenPartialFailedRecords(t *testing.T) {
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-1",
+				Symbol:           "BTCUSDT",
+				LongExchange:     "longex",
+				ShortExchange:    "shortex",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          1,
+				ShortQty:         1,
+				LongEntryPrice:   100,
+				ShortEntryPrice:  100,
+				ExitMode:         "taker",
+			},
+		},
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:           "plan-1",
+				Status:            executionStateOpenPartial,
+				AutoClose:         true,
+				TargetCloseTimeMs: time.Now().Add(-time.Minute).UnixMilli(),
+			},
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.planRepo = planRepo
+	svc.execRepo = execRepo
+
+	svc.runAutoClose(context.Background())
+
+	if len(longAdapter.closed) != 0 || len(shortAdapter.closed) != 0 {
+		t.Fatalf("expected auto-close to skip open_partial_failed records, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
 	}
 }
