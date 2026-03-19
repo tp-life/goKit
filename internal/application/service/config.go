@@ -6,12 +6,20 @@ import (
 )
 
 type ExecutionConfig struct {
-	Enabled          bool          `mapstructure:"enabled"`
-	AutoEntry        bool          `mapstructure:"auto_entry"`
-	AutoClose        bool          `mapstructure:"auto_close"`
-	CloseGracePeriod time.Duration `mapstructure:"close_grace_period"`
-	LoopInterval     time.Duration `mapstructure:"loop_interval"`
-	MaxLatestPlans   int           `mapstructure:"max_latest_plans"`
+	Enabled                       bool          `mapstructure:"enabled"`
+	AutoEntry                     bool          `mapstructure:"auto_entry"`
+	AutoClose                     bool          `mapstructure:"auto_close"`
+	CloseGracePeriod              time.Duration `mapstructure:"close_grace_period"`
+	LoopInterval                  time.Duration `mapstructure:"loop_interval"`
+	MaxLatestPlans                int           `mapstructure:"max_latest_plans"`
+	MaxSingleSymbolExposureUSDT   float64       `mapstructure:"max_single_symbol_exposure_usdt"`
+	MaxSingleExchangeExposureUSDT float64       `mapstructure:"max_single_exchange_exposure_usdt"`
+	MinAccountEquityUSDT          float64       `mapstructure:"min_account_equity_usdt"`
+	MinAvailableBalanceRatio      float64       `mapstructure:"min_available_balance_ratio"`
+	APIFailureThreshold           int           `mapstructure:"api_failure_threshold"`
+	APIFailureCooldown            time.Duration `mapstructure:"api_failure_cooldown"`
+	OrderStatusPollAttempts       int           `mapstructure:"order_status_poll_attempts"`
+	OrderStatusPollInterval       time.Duration `mapstructure:"order_status_poll_interval"`
 }
 
 type Config struct {
@@ -182,6 +190,21 @@ func (c Config) normalize() Config {
 	}
 	if c.Execution.MaxLatestPlans <= 0 {
 		c.Execution.MaxLatestPlans = 50
+	}
+	if c.Execution.MinAvailableBalanceRatio <= 0 || c.Execution.MinAvailableBalanceRatio > 1 {
+		c.Execution.MinAvailableBalanceRatio = 0.1
+	}
+	if c.Execution.APIFailureThreshold <= 0 {
+		c.Execution.APIFailureThreshold = 3
+	}
+	if c.Execution.APIFailureCooldown <= 0 {
+		c.Execution.APIFailureCooldown = 2 * time.Minute
+	}
+	if c.Execution.OrderStatusPollAttempts <= 0 {
+		c.Execution.OrderStatusPollAttempts = 3
+	}
+	if c.Execution.OrderStatusPollInterval <= 0 {
+		c.Execution.OrderStatusPollInterval = 1500 * time.Millisecond
 	}
 	return c
 }

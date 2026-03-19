@@ -140,26 +140,78 @@ func normalizeAllowed(allowed map[string]struct{}, keys ...string) bool {
 		return true
 	}
 	for _, key := range keys {
-		key = strings.TrimSpace(strings.ToUpper(key))
-		if key == "" {
-			continue
-		}
-		if _, ok := allowed[key]; ok {
-			return true
+		for _, normalized := range allowedLookupKeys(key) {
+			if _, ok := allowed[normalized]; ok {
+				return true
+			}
 		}
 	}
 	return false
 }
 
+// symbolAliasTable 定义“同一个 canonical asset 的常见别名”。
+//
+// 当前先只保留低风险、跨所里最常见的一类别名：
+// - XBT <-> BTC
+//
+// 之所以暂时不在这里激进地把更多 ticker 全部揉在一起，是因为某些交易所的
+// 同名/近名资产并不总能安全视为一类；错误 alias 比缺少 alias 更危险。
+// 因此这里采用“少而准”的策略，先解决最确定、最常见的跨所映射问题。
+var symbolAliasTable = map[string]string{
+	"XBT": "BTC",
+}
+
+// normalizeSymbolAlias 把 symbol/base asset 归一到策略内部使用的 canonical asset key。
+//
+// 规则：
+// 1. 统一 trim + upper；
+// 2. 命中 alias 表时映射到主 canonical 名称；
+// 3. 未命中则原样返回。
+//
+// 这层归一化的目的，是让：
+// - canonicalFrom() 在构建全市场 watchlist 时不会把 BTC / XBT 错分成两个币；
+// - normalizeAllowed() 在处理 AllowedSymbols 白名单时，也能接受用户写 BTC 或 XBT。
+func normalizeSymbolAlias(symbol string) string {
+	key := strings.TrimSpace(strings.ToUpper(symbol))
+	if key == "" {
+		return ""
+	}
+	if canonical, ok := symbolAliasTable[key]; ok {
+		return canonical
+	}
+	return key
+}
+
+// allowedLookupKeys 返回一个输入 symbol 在 allowlist 匹配时应该尝试的全部 key。
+//
+// 例如：
+// - 输入 BTC => [BTC]
+// - 输入 XBT => [XBT, BTC]
+//
+// 这样用户配置 `allowed_symbols: [BTC]` 时，交易所若返回 `XBTUSDT` 也能匹配上；
+// 同时用户若明确写 `XBT`，也依然兼容。
+func allowedLookupKeys(symbol string) []string {
+	raw := strings.TrimSpace(strings.ToUpper(symbol))
+	if raw == "" {
+		return nil
+	}
+	canonical := normalizeSymbolAlias(raw)
+	if canonical == "" || canonical == raw {
+		return []string{raw}
+	}
+	return []string{raw, canonical}
+}
+
 func canonicalFrom(raw, base string) string {
-	base = strings.ToUpper(strings.TrimSpace(base))
+	base = normalizeSymbolAlias(base)
 	if base != "" {
 		return base
 	}
 	raw = strings.ToUpper(strings.TrimSpace(raw))
 	raw = strings.TrimSuffix(raw, "USDT")
 	raw = strings.TrimSuffix(raw, "USDC")
-	return raw
+	raw = strings.TrimSuffix(raw, "USD")
+	return normalizeSymbolAlias(raw)
 }
 
 func stepFromDecimals(decimals int) string {
