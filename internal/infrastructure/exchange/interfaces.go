@@ -88,6 +88,40 @@ type AccountSnapshot struct {
 	RawResponse      string
 }
 
+// OrderEvent 表示一条从交易所私有流、用户流或恢复流程进入系统的订单事件。
+//
+// 它和同步下单后的 `TradeOrderResult` 不同：
+// 1. `TradeOrderResult` 更像“本次请求立刻返回了什么”；
+// 2. `OrderEvent` 更像“订单后来又发生了一个新事实”。
+//
+// 因此这里显式保留了 source / occurredAt / terminal / canceled 等字段，
+// 方便上层把它接到真正的事件驱动状态机，而不只是做一次性的响应解析。
+type OrderEvent struct {
+	Source        string
+	Exchange      string
+	ClientOrderID string
+	VenueOrderID  string
+	Status        string
+	ExecutedQty   float64
+	AveragePrice  float64
+	Terminal      bool
+	Canceled      bool
+	ErrorMessage  string
+	RawPayload    string
+	OccurredAtMs  int64
+}
+
+// OrderEventSink 是订单事件流向上游应用层的最小输出接口。
+//
+// 之所以不让交易所适配器直接依赖具体 service，是为了让：
+// - 适配器层只负责“如何拿到事件”；
+// - 应用层只负责“拿到事件后如何推进状态机”。
+//
+// 这使得未来无论是 websocket、轮询回放还是测试注入，都可以复用同一条事件管道。
+type OrderEventSink interface {
+	PublishOrderEvent(event OrderEvent)
+}
+
 type Position struct {
 	Exchange      string
 	Symbol        string
@@ -98,14 +132,34 @@ type Position struct {
 	UnrealizedPnL float64
 }
 
+type TradeCapabilities struct {
+	MakerLimitTIF            string
+	TakerOrderType           string
+	TakerTimeInForce         string
+	TakerUsesAggressiveIOC   bool
+	SupportsOrderEventStream bool
+}
+
 type TradeAdapter interface {
 	Name() string
 	Enabled() bool
+	Capabilities() TradeCapabilities
 	PlaceOrder(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error)
 	ClosePosition(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error)
 	GetPosition(ctx context.Context, canonicalSymbol, venueSymbol, assetID string) (Position, error)
 	GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error)
 	GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error)
+}
+
+// TradeOrderEventStreamer 是一个可选能力接口。
+//
+// 并不是所有交易所适配器在当前阶段都必须实现它：
+// - 只做同步下单/轮询的适配器可以先不实现；
+// - 已经具备用户流或私有订单回报的适配器，则可以实现它并把事件推给上层。
+//
+// 这样做的好处是，系统已经具备事件流接入口，但不会强迫所有交易所在同一时刻补齐。
+type TradeOrderEventStreamer interface {
+	StartOrderEventStream(ctx context.Context, sink OrderEventSink) error
 }
 
 func BuildMarketMap(items []MarketAdapter) map[string]MarketAdapter {

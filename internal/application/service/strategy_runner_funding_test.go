@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"goKit/internal/domain/entity"
+	"goKit/internal/infrastructure/exchange"
 )
 
 func TestFundingEventCountUntil(t *testing.T) {
@@ -413,5 +414,34 @@ func TestVenueProfileRegistry_DefaultFundingClampAndPenalty(t *testing.T) {
 	}
 	if got := registry.ExecutionPenaltyMultiplier("unknown"); got != 1.05 {
 		t.Fatalf("expected default penalty multiplier 1.05, got %.2f", got)
+	}
+}
+
+func TestBuildVenueProfileRegistry_MapsConfiguredExchangeToVenueFamily(t *testing.T) {
+	registry := BuildVenueProfileRegistry(exchange.ConfigSet{
+		Additional: map[string]exchange.ExchangeConfig{
+			"bybit": {
+				Enabled:     true,
+				AdapterKind: exchange.AdapterKindBinanceLike,
+			},
+			"myhl": {
+				Enabled:     true,
+				AdapterKind: "hyperliquid",
+			},
+			"customaster": {
+				Enabled:   true,
+				VenueKind: "aster",
+			},
+		},
+	})
+
+	if got := registry.ExecutionPenaltyMultiplier("bybit"); got != 1.00 {
+		t.Fatalf("expected bybit to inherit binance-like multiplier 1.00, got %.2f", got)
+	}
+	if floor, cap, source := registry.FundingClamp("myhl", 1); source != "hyperliquid_cap" || floor != -0.004 || cap != 0.004 {
+		t.Fatalf("expected myhl to inherit hyperliquid profile, got source=%s floor=%.6f cap=%.6f", source, floor, cap)
+	}
+	if got := registry.ExecutionPenaltyMultiplier("customaster"); got != 1.10 {
+		t.Fatalf("expected explicit aster venue kind multiplier 1.10, got %.2f", got)
 	}
 }

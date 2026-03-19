@@ -33,3 +33,17 @@ func TestNormalizeAllowed_StillMatchesRawSymbolWhenConfigured(t *testing.T) {
 		t.Fatalf("expected allowlist XBT to keep matching raw alias symbol")
 	}
 }
+
+func TestCanonicalFrom_StripsContractAndQuoteSuffixes(t *testing.T) {
+	got := canonicalFrom("BTC-USDT-SWAP", "")
+	if got != "BTC" {
+		t.Fatalf("expected BTC-USDT-SWAP to normalize to BTC, got %s", got)
+	}
+}
+
+func TestCanonicalFrom_StripsPerpAndNormalizesAlias(t *testing.T) {
+	got := canonicalFrom("XBT_PERP", "")
+	if got != "BTC" {
+		t.Fatalf("expected XBT_PERP to normalize to BTC, got %s", got)
+	}
+}

@@ -3,6 +3,8 @@ package service
 import (
 	"math"
 	"strings"
+
+	"goKit/internal/infrastructure/exchange"
 )
 
 // VenueProfile 描述某个交易所（venue）在策略层真正关心的“规则画像”。
@@ -33,11 +35,13 @@ type VenueProfile struct {
 // 而不是继续修改 funding / execution 两条主流程代码。
 type VenueProfileRegistry struct {
 	profiles map[string]VenueProfile
+	aliases  map[string]string
 }
 
 func NewVenueProfileRegistry(profiles ...VenueProfile) *VenueProfileRegistry {
 	registry := &VenueProfileRegistry{
 		profiles: make(map[string]VenueProfile, len(profiles)),
+		aliases:  make(map[string]string),
 	}
 	for _, profile := range profiles {
 		key := normalizeVenueName(profile.Name)
@@ -45,6 +49,7 @@ func NewVenueProfileRegistry(profiles ...VenueProfile) *VenueProfileRegistry {
 			continue
 		}
 		registry.profiles[key] = profile
+		registry.aliases[key] = key
 	}
 	return registry
 }
@@ -81,6 +86,23 @@ var defaultVenueProfiles = NewVenueProfileRegistry(
 		ExecutionPenaltyMultiplier:     1.10,
 	},
 	VenueProfile{
+		Name:               "bybit",
+		FundingClampSource: "bybit_cap",
+		FundingClampFunc: func(intervalHours int) (floorRate, capRate float64, source string) {
+			intervalHours = maxInt(intervalHours, 1)
+			// Bybit instruments-info 会返回每个合约自己的 upper/lowerFundingRate。
+			// 这里先给一个保守的 venue-level 默认护栏：按照 8h 0.375% 线性缩放。
+			//
+			// 这不是为了声称“所有 Bybit 合约上限完全一致”，而是为了让：
+			// - 新接入 Bybit 时不会退回完全无 venue 护栏的 history-only 模式；
+			// - 后续若要升级到按 symbol 读取上下限，也只需要替换这里的规则来源。
+			perHourCap := 0.00375 / 8.0
+			cap := perHourCap * float64(intervalHours)
+			return -cap, cap, "bybit_cap"
+		},
+		ExecutionPenaltyMultiplier: 1.02,
+	},
+	VenueProfile{
 		Name:               "hyperliquid",
 		FundingClampSource: "hyperliquid_cap",
 		FundingClampFunc: func(intervalHours int) (floorRate, capRate float64, source string) {
@@ -91,16 +113,76 @@ var defaultVenueProfiles = NewVenueProfileRegistry(
 	},
 )
 
+func init() {
+	defaultVenueProfiles.RegisterAlias("binance_like", "binance")
+	defaultVenueProfiles.RegisterAlias("bybit_v5", "bybit")
+	defaultVenueProfiles.RegisterAlias("hl", "hyperliquid")
+	defaultVenueProfiles.RegisterAlias("hyperliquid_like", "hyperliquid")
+}
+
 func defaultVenueProfileRegistry() *VenueProfileRegistry {
 	return defaultVenueProfiles
+}
+
+func BuildVenueProfileRegistry(cfg exchange.ConfigSet) *VenueProfileRegistry {
+	registry := defaultVenueProfileRegistry().Clone()
+	for name, exCfg := range cfg.Items() {
+		venueKind := inferVenueKind(name, exCfg)
+		if venueKind == "" {
+			continue
+		}
+		registry.RegisterAlias(name, venueKind)
+	}
+	return registry
 }
 
 func (r *VenueProfileRegistry) Profile(exchangeName string) (VenueProfile, bool) {
 	if r == nil {
 		return VenueProfile{}, false
 	}
-	profile, ok := r.profiles[normalizeVenueName(exchangeName)]
+	key := normalizeVenueName(exchangeName)
+	if canonical, ok := r.aliases[key]; ok {
+		key = canonical
+	}
+	profile, ok := r.profiles[key]
 	return profile, ok
+}
+
+func (r *VenueProfileRegistry) Clone() *VenueProfileRegistry {
+	if r == nil {
+		return NewVenueProfileRegistry()
+	}
+	cloned := &VenueProfileRegistry{
+		profiles: make(map[string]VenueProfile, len(r.profiles)),
+		aliases:  make(map[string]string, len(r.aliases)),
+	}
+	for key, profile := range r.profiles {
+		cloned.profiles[key] = profile
+	}
+	for alias, canonical := range r.aliases {
+		cloned.aliases[alias] = canonical
+	}
+	return cloned
+}
+
+func (r *VenueProfileRegistry) RegisterAlias(alias, canonical string) {
+	if r == nil {
+		return
+	}
+	alias = normalizeVenueName(alias)
+	canonical = normalizeVenueName(canonical)
+	if alias == "" || canonical == "" {
+		return
+	}
+	if _, ok := r.profiles[canonical]; !ok {
+		if resolved, ok := r.aliases[canonical]; ok {
+			canonical = resolved
+		}
+	}
+	if _, ok := r.profiles[canonical]; !ok {
+		return
+	}
+	r.aliases[alias] = canonical
 }
 
 func (r *VenueProfileRegistry) FundingClamp(exchangeName string, intervalHours int) (floorRate, capRate float64, source string) {
@@ -129,6 +211,28 @@ func (r *VenueProfileRegistry) ExecutionPenaltyMultiplier(exchangeName string) f
 
 func normalizeVenueName(exchangeName string) string {
 	return strings.ToLower(strings.TrimSpace(exchangeName))
+}
+
+func inferVenueKind(name string, cfg exchange.ExchangeConfig) string {
+	if kind := normalizeVenueName(cfg.VenueKind); kind != "" {
+		return kind
+	}
+	name = normalizeVenueName(name)
+	switch name {
+	case "binance", "aster", "hyperliquid":
+		return name
+	}
+
+	switch normalizeVenueName(cfg.AdapterKind) {
+	case "hyperliquid", "hl":
+		return "hyperliquid"
+	case "bybit_v5":
+		return "bybit"
+	case "binance_like":
+		return "binance_like"
+	default:
+		return ""
+	}
 }
 
 // binanceLikeAdaptiveShortIntervalClamp 用来处理 Binance/Aster 这类“规则来源相似、

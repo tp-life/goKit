@@ -15,9 +15,23 @@ type ExecutionRecord struct {
 	TargetCloseTimeMs  int64  `json:"target_close_time_ms"`
 	OpenedAtMs         int64  `json:"opened_at_ms"`
 	ClosedAtMs         int64  `json:"closed_at_ms"`
-	LastError          string `gorm:"type:text" json:"last_error,omitempty"`
-	OpenOrderCount     int    `json:"open_order_count"`
-	CloseOrderCount    int    `json:"close_order_count"`
+
+	// LastTransitionAtMs 记录最近一次 execution 状态迁移发生的时间。
+	// 后续若引入 websocket 事件或事件回放，这个字段可以帮助快速定位
+	// “record 最近一次是何时被推进到当前状态的”。
+	LastTransitionAtMs int64 `json:"last_transition_at_ms"`
+
+	// LastTransitionEvent 记录最近一次驱动状态变化的事件名，
+	// 例如 `open_requested` / `open_results_applied` / `open_circuit_blocked`。
+	// 它是 execution 状态机与未来事件驱动模型之间的一层轻量连接点。
+	LastTransitionEvent string `gorm:"size:64" json:"last_transition_event,omitempty"`
+
+	// StatusReason 保存最近一次状态变化的人类可读摘要，
+	// 用于排障、前端展示和后续状态回放时快速理解“为什么变成这样”。
+	StatusReason    string `gorm:"type:text" json:"status_reason,omitempty"`
+	LastError       string `gorm:"type:text" json:"last_error,omitempty"`
+	OpenOrderCount  int    `json:"open_order_count"`
+	CloseOrderCount int    `json:"close_order_count"`
 	TimestampModel
 }
 

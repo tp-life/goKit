@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 
@@ -59,6 +60,31 @@ func (h *ExecutionHandler) Close(c *fiber.Ctx) error {
 	item, err := h.svc.CloseByPlanKey(c.UserContext(), planKey)
 	if err != nil {
 		return response.ErrInternal(err, "执行平仓失败")
+	}
+	return response.Success(c, item)
+}
+
+func (h *ExecutionHandler) InjectOrderEvent(c *fiber.Ctx) error {
+	var req service.ExternalOrderEvent
+	if err := c.BodyParser(&req); err != nil {
+		return response.ErrBadRequest("JSON解析失败，请检查订单事件请求体")
+	}
+	if strings.TrimSpace(req.Exchange) == "" {
+		return response.ErrBadRequest("缺少 exchange")
+	}
+	if strings.TrimSpace(req.ClientOrderID) == "" && strings.TrimSpace(req.VenueOrderID) == "" {
+		return response.ErrBadRequest("缺少 client_order_id 或 venue_order_id")
+	}
+
+	item, err := h.svc.ApplyExternalOrderEvent(c.UserContext(), req)
+	if err != nil {
+		if errors.Is(err, service.ErrExternalOrderTargetNotFound) {
+			return response.ErrNotFound("未找到匹配的订单或执行记录")
+		}
+		if errors.Is(err, service.ErrExternalOrderEventInvalid) {
+			return response.ErrBadRequest("订单事件字段不完整")
+		}
+		return response.ErrInternal(err, "注入订单事件失败")
 	}
 	return response.Success(c, item)
 }

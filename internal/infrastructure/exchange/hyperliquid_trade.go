@@ -24,6 +24,7 @@ import (
 )
 
 type HyperliquidTradeClient struct {
+	name           string
 	cfg            ExchangeConfig
 	logger         *slog.Logger
 	httpClient     *http.Client
@@ -33,7 +34,11 @@ type HyperliquidTradeClient struct {
 }
 
 func NewHyperliquidTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
-	c := normalizeExchangeConfig("hyperliquid", cfg.Hyperliquid)
+	return NewHyperliquidTradeAdapter("hyperliquid", cfg.Hyperliquid, logger)
+}
+
+func NewHyperliquidTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) TradeAdapter {
+	c := normalizeExchangeConfig(name, cfg)
 	if c.RestBaseURL == "" {
 		c.RestBaseURL = "https://api.hyperliquid.xyz"
 	}
@@ -46,23 +51,33 @@ func NewHyperliquidTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter 
 		}
 	}
 	return &HyperliquidTradeClient{
+		name:           name,
 		cfg:            c,
 		logger:         logger,
-		httpClient:     newHTTPClient(c, appCfg, logger, "hyperliquid-trade"),
+		httpClient:     newHTTPClient(c, appCfg, logger, name+"-trade"),
 		privateKey:     pk,
 		accountAddress: strings.ToLower(readEnvByName(c.Auth.AccountAddressEnv)),
 		vaultAddress:   strings.ToLower(readEnvByName(c.Auth.VaultAddressEnv)),
 	}
 }
 
-func (c *HyperliquidTradeClient) Name() string { return "hyperliquid" }
+func (c *HyperliquidTradeClient) Name() string { return c.name }
 func (c *HyperliquidTradeClient) Enabled() bool {
 	return c.cfg.Enabled && c.privateKey != nil && c.accountAddress != ""
+}
+func (c *HyperliquidTradeClient) Capabilities() TradeCapabilities {
+	return TradeCapabilities{
+		MakerLimitTIF:            "ALO",
+		TakerOrderType:           "LIMIT",
+		TakerTimeInForce:         "IOC",
+		TakerUsesAggressiveIOC:   true,
+		SupportsOrderEventStream: false,
+	}
 }
 
 func (c *HyperliquidTradeClient) PlaceOrder(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error) {
 	if !c.Enabled() {
-		return TradeOrderResult{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
+		return TradeOrderResult{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
 	asset, err := strconv.Atoi(req.AssetID)
 	if err != nil {
@@ -108,7 +123,7 @@ func (c *HyperliquidTradeClient) PlaceOrder(ctx context.Context, req TradeOrderR
 		}
 	}
 	return TradeOrderResult{
-		Exchange:        "hyperliquid",
+		Exchange:        c.name,
 		CanonicalSymbol: req.CanonicalSymbol,
 		VenueSymbol:     req.VenueSymbol,
 		ClientOrderID:   req.ClientOrderID,
@@ -125,14 +140,9 @@ func (c *HyperliquidTradeClient) ClosePosition(ctx context.Context, req TradeOrd
 	if err != nil {
 		return TradeOrderResult{}, err
 	}
-	qty := pos.Quantity
-	if qty == 0 {
-		return TradeOrderResult{Exchange: "hyperliquid", CanonicalSymbol: req.CanonicalSymbol, VenueSymbol: req.VenueSymbol, Status: "NO_POSITION"}, nil
-	}
-	side := "SELL"
-	if qty < 0 {
-		side = "BUY"
-		qty = -qty
+	side, qty, ok := closeSideAndQuantity(pos.Quantity, req.Quantity)
+	if !ok {
+		return TradeOrderResult{Exchange: c.name, CanonicalSymbol: req.CanonicalSymbol, VenueSymbol: req.VenueSymbol, Status: "NO_POSITION"}, nil
 	}
 	price := req.Price
 	if price <= 0 {
@@ -166,7 +176,7 @@ func (c *HyperliquidTradeClient) ClosePosition(ctx context.Context, req TradeOrd
 
 func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error) {
 	if !c.Enabled() {
-		return OrderStatus{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
+		return OrderStatus{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
 	payload := map[string]any{"type": "orderStatus", "user": c.accountAddress}
 	if req.VenueOrderID != "" {
@@ -190,7 +200,7 @@ func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLo
 		avg = firstPositive(avg, parseNullableFloat(data["avgPx"]))
 	}
 	return OrderStatus{
-		Exchange:      "hyperliquid",
+		Exchange:      c.name,
 		Status:        firstNonEmpty(status, "SUBMITTED"),
 		ExecutedQty:   filled,
 		AveragePrice:  avg,
@@ -204,7 +214,7 @@ func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLo
 
 func (c *HyperliquidTradeClient) GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error) {
 	if !c.Enabled() {
-		return AccountSnapshot{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
+		return AccountSnapshot{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
 	payload := map[string]any{"type": "userState", "user": c.accountAddress}
 	var resp map[string]any
@@ -227,7 +237,7 @@ func (c *HyperliquidTradeClient) GetAccountSnapshot(ctx context.Context) (Accoun
 		}
 	}
 	return AccountSnapshot{
-		Exchange:         "hyperliquid",
+		Exchange:         c.name,
 		Equity:           hyperliquidEquity(resp),
 		AvailableBalance: parseNullableFloat(resp["withdrawable"]),
 		MarginUsed:       margin,
@@ -237,7 +247,7 @@ func (c *HyperliquidTradeClient) GetAccountSnapshot(ctx context.Context) (Accoun
 
 func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbol, venueSymbol, _ string) (Position, error) {
 	if !c.Enabled() {
-		return Position{}, fmt.Errorf("hyperliquid trade client disabled or missing credentials")
+		return Position{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
 	payload := map[string]any{"type": "clearinghouseState", "user": c.accountAddress}
 	var resp map[string]any
@@ -260,7 +270,7 @@ func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbo
 			continue
 		}
 		return Position{
-			Exchange:      "hyperliquid",
+			Exchange:      c.name,
 			Symbol:        canonicalSymbol,
 			VenueSymbol:   venueSymbol,
 			Quantity:      parseNullableFloat(posMap["szi"]),
@@ -269,7 +279,7 @@ func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbo
 			UnrealizedPnL: parseNullableFloat(posMap["unrealizedPnl"]),
 		}, nil
 	}
-	return Position{Exchange: "hyperliquid", Symbol: canonicalSymbol, VenueSymbol: venueSymbol}, nil
+	return Position{Exchange: c.name, Symbol: canonicalSymbol, VenueSymbol: venueSymbol}, nil
 }
 
 type hlLimitOrderType struct {
@@ -402,7 +412,7 @@ func (c *HyperliquidTradeClient) post(ctx context.Context, path string, payload 
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
-		return string(body), fmt.Errorf("hyperliquid %s failed status=%d body=%s", path, resp.StatusCode, string(body))
+		return string(body), fmt.Errorf("%s %s failed status=%d body=%s", c.name, path, resp.StatusCode, string(body))
 	}
 	if out != nil {
 		if err := json.Unmarshal(body, out); err != nil {

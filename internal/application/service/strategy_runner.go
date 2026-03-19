@@ -36,6 +36,7 @@ type StrategyRunnerParams struct {
 	fx.In
 
 	Cfg        Config
+	Exchanges  exchange.ConfigSet
 	Logger     *slog.Logger
 	Store      *MarketStore
 	SymbolRepo repository.SymbolRepository
@@ -122,7 +123,7 @@ func NewStrategyRunner(p StrategyRunnerParams) *StrategyRunner {
 	// 这里显式构造并复用同一份 venue registry，
 	// 这样 StrategyRunner 自己的 execution penalty 逻辑与 FundingForecaster
 	// 的 funding clamp 逻辑会共享一套规则来源，避免两边默认值各自漂移。
-	venues := defaultVenueProfileRegistry()
+	venues := BuildVenueProfileRegistry(p.Exchanges)
 	return &StrategyRunner{
 		cfg:                      cfg,
 		logger:                   p.Logger,

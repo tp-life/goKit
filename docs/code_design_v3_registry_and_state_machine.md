@@ -31,16 +31,30 @@ v3 的核心目标有两个：
 
 - `VenueProfileRegistry`
 - 基础 alias 归一化
+- `TradeCapabilities`
 - 一批 execution states
+
+并且 execution 层已经开始把：
+
+- phase policy
+- action short-circuit
+- action startable status guard
+- explicit transition graph
+- transition metadata（event name / reason / timestamp）
+- external order event ingest entry
+- optional trade order event streamer interface
+
+收敛到统一 helper，而不再散落在 `openPlan/closePlan` 里直接比较字符串。
 
 但它们还没有形成完整的“registry + state machine”体系。
 
 因此 v3 需要补：
 
 1. 更完整的 alias / symbol family registry
-2. execution state transition graph
-3. websocket 事件驱动的状态推进
-4. hedge rollback 完成确认
+2. 更完整的 venue family / exchange instance 映射
+3. execution state transition graph
+4. websocket 事件驱动的状态推进
+5. hedge rollback 完成确认
 
 ---
 
@@ -58,4 +72,3 @@ v3 的核心目标有两个：
 - `code_design_v1_scanner_to_planner.md`：解释如何从 scanner 走到 planner
 - `code_design_v2_execution_safety.md`：解释执行安全基础版
 - 本文：解释 registry 化和状态机的下一阶段设计方向
-

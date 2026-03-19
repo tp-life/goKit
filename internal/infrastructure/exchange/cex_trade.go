@@ -13,13 +13,23 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
+// CEXTradeClient 是保留了历史命名的实现类型。
+//
+// 它的真实职责不是“适配任意中心化交易所”，而是：
+// 适配 Binance / Aster 这类 Binance-like 永续合约私有交易协议。
+//
+// 这层纠偏非常重要，因为后续如果继续接入 OKX / Bybit / Bitget，
+// 我们应该先判断它们是否真的属于同一协议族，而不是被 `CEX` 这个宽泛名字误导。
 type CEXTradeClient struct {
 	name         string
 	cfg          ExchangeConfig
 	logger       *slog.Logger
 	httpClient   *http.Client
+	wsDialer     *websocket.Dialer
 	apiKey       string
 	apiSecret    string
 	orderPath    string
@@ -28,45 +38,83 @@ type CEXTradeClient struct {
 }
 
 func NewBinanceTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
-	c := normalizeExchangeConfig("binance", cfg.Binance)
-	if c.RestBaseURL == "" {
-		c.RestBaseURL = "https://fapi.binance.com"
-	}
-	appCfg := loadAppConfig()
-	return &CEXTradeClient{
-		name:         "binance",
-		cfg:          c,
-		logger:       logger,
-		httpClient:   newHTTPClient(c, appCfg, logger, "binance-trade"),
-		apiKey:       readEnvByName(c.Auth.APIKeyEnv),
-		apiSecret:    readEnvByName(c.Auth.APISecretEnv),
-		orderPath:    "/fapi/v1/order",
-		positionPath: "/fapi/v2/positionRisk",
-		accountPath:  "/fapi/v2/account",
-	}
+	return NewCEXTradeAdapter("binance", cfg.Binance, logger)
 }
 
 func NewAsterTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
-	c := normalizeExchangeConfig("aster", cfg.Aster)
+	return NewCEXTradeAdapter("aster", cfg.Aster, logger)
+}
+
+// NewBinanceLikeTradeAdapter 是 registry 层应该优先使用的交易适配器构造入口。
+//
+// 它的命名刻意强调：这份实现只覆盖 Binance Futures 风格的私有交易协议，
+// 例如 API Key + HMAC 签名、`/fapi/...` 路径、Binance 风格字段名等。
+//
+// 这能帮助后续接入新交易所时更快看清边界：
+// - 如果新交易所真的是 Binance-like，可以复用这份实现；
+// - 如果不是，就应该新增新的协议族适配器，而不是继续往这里堆特殊分支。
+func NewBinanceLikeTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) TradeAdapter {
+	return NewCEXTradeAdapter(name, cfg, logger)
+}
+
+// NewCEXTradeAdapter 是保留给现有代码的兼容构造入口。
+//
+// 名字虽然还是 `CEX`，但不要把它理解成“所有 CEX 通用适配器”；
+// 它现在只代表 `binance_like` 协议族。
+func NewCEXTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) TradeAdapter {
+	c := normalizeExchangeConfig(name, cfg)
 	if c.RestBaseURL == "" {
-		c.RestBaseURL = "https://fapi.asterdex.com"
+		switch name {
+		case "aster":
+			c.RestBaseURL = "https://fapi.asterdex.com"
+		default:
+			c.RestBaseURL = "https://fapi.binance.com"
+		}
+	}
+	if c.PublicWSBaseURL == "" {
+		switch name {
+		case "aster":
+			c.PublicWSBaseURL = "wss://fstream.asterdex.com"
+		default:
+			c.PublicWSBaseURL = "wss://fstream.binance.com"
+		}
+	}
+	if c.PrivateWSBaseURL == "" {
+		c.PrivateWSBaseURL = c.PublicWSBaseURL
 	}
 	appCfg := loadAppConfig()
+	orderPath := "/fapi/v1/order"
+	positionPath := "/fapi/v2/positionRisk"
+	accountPath := "/fapi/v2/account"
+	if name == "aster" {
+		orderPath = "/fapi/v3/order"
+		positionPath = "/fapi/v3/positionRisk"
+		accountPath = "/fapi/v3/account"
+	}
 	return &CEXTradeClient{
-		name:         "aster",
+		name:         name,
 		cfg:          c,
 		logger:       logger,
-		httpClient:   newHTTPClient(c, appCfg, logger, "aster-trade"),
+		httpClient:   newHTTPClient(c, appCfg, logger, name+"-trade"),
+		wsDialer:     newWebSocketDialer(c, appCfg, logger, name+"-trade"),
 		apiKey:       readEnvByName(c.Auth.APIKeyEnv),
 		apiSecret:    readEnvByName(c.Auth.APISecretEnv),
-		orderPath:    "/fapi/v3/order",
-		positionPath: "/fapi/v3/positionRisk",
-		accountPath:  "/fapi/v3/account",
+		orderPath:    orderPath,
+		positionPath: positionPath,
+		accountPath:  accountPath,
 	}
 }
 
 func (c *CEXTradeClient) Name() string  { return c.name }
 func (c *CEXTradeClient) Enabled() bool { return c.cfg.Enabled && c.apiKey != "" && c.apiSecret != "" }
+func (c *CEXTradeClient) Capabilities() TradeCapabilities {
+	return TradeCapabilities{
+		MakerLimitTIF:            "GTX",
+		TakerOrderType:           "MARKET",
+		TakerUsesAggressiveIOC:   false,
+		SupportsOrderEventStream: c.supportsOrderEventStream(),
+	}
+}
 
 func (c *CEXTradeClient) PlaceOrder(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error) {
 	if !c.Enabled() {
@@ -120,14 +168,9 @@ func (c *CEXTradeClient) ClosePosition(ctx context.Context, req TradeOrderReques
 	if err != nil {
 		return TradeOrderResult{}, err
 	}
-	qty := pos.Quantity
-	if qty == 0 {
+	side, qty, ok := closeSideAndQuantity(pos.Quantity, req.Quantity)
+	if !ok {
 		return TradeOrderResult{Exchange: c.name, CanonicalSymbol: req.CanonicalSymbol, VenueSymbol: req.VenueSymbol, Status: "NO_POSITION"}, nil
-	}
-	side := "SELL"
-	if qty < 0 {
-		side = "BUY"
-		qty = -qty
 	}
 	return c.PlaceOrder(ctx, TradeOrderRequest{
 		CanonicalSymbol: req.CanonicalSymbol,
@@ -280,7 +323,7 @@ func asString(v any) string {
 
 func isTerminalOrderStatus(status string) bool {
 	switch strings.ToUpper(strings.TrimSpace(status)) {
-	case "FILLED", "CANCELED", "REJECTED", "EXPIRED", "NO_POSITION":
+	case "FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "NO_POSITION":
 		return true
 	default:
 		return false

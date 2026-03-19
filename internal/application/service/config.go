@@ -6,20 +6,24 @@ import (
 )
 
 type ExecutionConfig struct {
-	Enabled                       bool          `mapstructure:"enabled"`
-	AutoEntry                     bool          `mapstructure:"auto_entry"`
-	AutoClose                     bool          `mapstructure:"auto_close"`
-	CloseGracePeriod              time.Duration `mapstructure:"close_grace_period"`
-	LoopInterval                  time.Duration `mapstructure:"loop_interval"`
-	MaxLatestPlans                int           `mapstructure:"max_latest_plans"`
-	MaxSingleSymbolExposureUSDT   float64       `mapstructure:"max_single_symbol_exposure_usdt"`
-	MaxSingleExchangeExposureUSDT float64       `mapstructure:"max_single_exchange_exposure_usdt"`
-	MinAccountEquityUSDT          float64       `mapstructure:"min_account_equity_usdt"`
-	MinAvailableBalanceRatio      float64       `mapstructure:"min_available_balance_ratio"`
-	APIFailureThreshold           int           `mapstructure:"api_failure_threshold"`
-	APIFailureCooldown            time.Duration `mapstructure:"api_failure_cooldown"`
-	OrderStatusPollAttempts       int           `mapstructure:"order_status_poll_attempts"`
-	OrderStatusPollInterval       time.Duration `mapstructure:"order_status_poll_interval"`
+	Enabled                           bool          `mapstructure:"enabled"`
+	AutoEntry                         bool          `mapstructure:"auto_entry"`
+	AutoClose                         bool          `mapstructure:"auto_close"`
+	CloseGracePeriod                  time.Duration `mapstructure:"close_grace_period"`
+	LoopInterval                      time.Duration `mapstructure:"loop_interval"`
+	MaxLatestPlans                    int           `mapstructure:"max_latest_plans"`
+	MaxSingleSymbolExposureUSDT       float64       `mapstructure:"max_single_symbol_exposure_usdt"`
+	MaxSingleExchangeExposureUSDT     float64       `mapstructure:"max_single_exchange_exposure_usdt"`
+	MinAccountEquityUSDT              float64       `mapstructure:"min_account_equity_usdt"`
+	MinAvailableBalanceRatio          float64       `mapstructure:"min_available_balance_ratio"`
+	MaxUnrealizedLossUSDT             float64       `mapstructure:"max_unrealized_loss_usdt"`
+	MaxUnwindBasisBps                 float64       `mapstructure:"max_unwind_basis_bps"`
+	EmergencyMinAvailableBalanceRatio float64       `mapstructure:"emergency_min_available_balance_ratio"`
+	PrimaryLegTimeout                 time.Duration `mapstructure:"primary_leg_timeout"`
+	APIFailureThreshold               int           `mapstructure:"api_failure_threshold"`
+	APIFailureCooldown                time.Duration `mapstructure:"api_failure_cooldown"`
+	OrderStatusPollAttempts           int           `mapstructure:"order_status_poll_attempts"`
+	OrderStatusPollInterval           time.Duration `mapstructure:"order_status_poll_interval"`
 }
 
 type Config struct {
@@ -193,6 +197,18 @@ func (c Config) normalize() Config {
 	}
 	if c.Execution.MinAvailableBalanceRatio <= 0 || c.Execution.MinAvailableBalanceRatio > 1 {
 		c.Execution.MinAvailableBalanceRatio = 0.1
+	}
+	if c.Execution.MaxUnrealizedLossUSDT < 0 {
+		c.Execution.MaxUnrealizedLossUSDT = 0
+	}
+	if c.Execution.MaxUnwindBasisBps < 0 {
+		c.Execution.MaxUnwindBasisBps = 0
+	}
+	if c.Execution.EmergencyMinAvailableBalanceRatio < 0 || c.Execution.EmergencyMinAvailableBalanceRatio > 1 {
+		c.Execution.EmergencyMinAvailableBalanceRatio = 0
+	}
+	if c.Execution.PrimaryLegTimeout < 0 {
+		c.Execution.PrimaryLegTimeout = 0
 	}
 	if c.Execution.APIFailureThreshold <= 0 {
 		c.Execution.APIFailureThreshold = 3

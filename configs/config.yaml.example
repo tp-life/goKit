@@ -147,9 +147,33 @@ strategy:
     loop_interval: 3s
     # 每轮最多读取多少条最新执行计划/记录。
     max_latest_plans: 50
+    # 持仓期间允许承受的最大“按当前可成交方向估算”的浮亏（USDT）。
+    # =0 表示关闭这条提前平仓护栏。
+    max_unrealized_loss_usdt: 0
+    # 若当前解仓方向的跨所 basis 恶化超过该阈值（bps），则提前触发自动平仓。
+    # =0 表示关闭这条基差恶化护栏。
+    max_unwind_basis_bps: 0
+    # 持仓期间的紧急可用余额比例下限。
+    # 例如设为 0.05 表示 available_balance / equity 低于 5% 时提前平仓。
+    # =0 表示关闭这条保证金缓冲护栏。
+    emergency_min_available_balance_ratio: 0
+    # 每条主腿从发请求到拿到同步结果，最多允许等待多久。
+    # 超时后系统不会无限卡住，而会立刻用 client_order_id 做 best-effort 查单/查仓。
+    # =0 表示不额外加这层腿级超时。
+    primary_leg_timeout: 0
 
 exchanges:
   binance:
+    # 该交易所实例复用哪类接入协议族。
+    # 当前这份实现并不是“通用 CEX”，而是 Binance Futures 风格协议族。
+    adapter_kind: "binance_like"
+    # 某些协议族（例如 OKX 一类）还可能使用：
+    # - auth.passphrase_env
+    # - auth.extra_env
+    # - adapter_options
+    # 该交易所实例在策略层复用哪类 venue 规则画像；
+    # 为空时会优先按交易所名匹配，再按 adapter_kind 推断。
+    venue_kind: "binance"
     # 交易所适配器开关。
     enabled: true
     # 展示名称。
@@ -162,6 +186,8 @@ exchanges:
     market_ws_base_url: "wss://fstream.binance.com"
     # 公共 WS 基地址（交易/订阅可能复用）。
     public_ws_base_url: "wss://fstream.binance.com"
+    # 私有订单/用户流 WS 基地址。
+    private_ws_base_url: "wss://fstream.binance.com"
     # 请求超时。
     request_timeout: 10s
     # 默认 funding 周期（小时），当接口未返回时兜底。
@@ -183,6 +209,8 @@ exchanges:
       api_secret_env: "BINANCE_API_SECRET"
 
   aster:
+    adapter_kind: "binance_like"
+    venue_kind: "aster"
     enabled: true
     label: "Aster"
     settle_asset: "USDT"
@@ -201,7 +229,45 @@ exchanges:
       api_key_env: "ASTER_API_KEY"
       api_secret_env: "ASTER_API_SECRET"
 
+  # Bybit 目前作为一个独立协议族接入，而不是继续复用 binance_like。
+  # 这样做的原因是：Bybit V5 的签名头、REST 路径、订单/持仓字段和 Binance Futures 明显不同。
+  bybit:
+    adapter_kind: "bybit_v5"
+    venue_kind: "bybit"
+    enabled: false
+    label: "Bybit"
+    settle_asset: "USDT"
+    rest_base_url: "https://api.bybit.com"
+    # Bybit V5 public linear market stream。
+    # 当前实现会在这条连接上同时订阅 `tickers.{symbol}` 与 `orderbook.1.{symbol}`：
+    # - ticker 负责 funding / mark / index
+    # - orderbook.1 负责更细的 top-of-book
+    market_ws_base_url: "wss://stream.bybit.com/v5/public/linear"
+    # Bybit V5 private order stream 官方入口。
+    private_ws_base_url: "wss://stream.bybit.com/v5/private"
+    request_timeout: 10s
+    default_funding_interval_hours: 8
+    proxy:
+      enabled: false
+      url: "http://127.0.0.1:7890"
+    fees:
+      maker_bps: 1.0
+      taker_bps: 5.5
+    auth:
+      api_key_env: "BYBIT_API_KEY"
+      api_secret_env: "BYBIT_API_SECRET"
+      # broker 用户如需附加 X-Referer，可通过 extra_env 传入。
+      # extra_env:
+      #   referer: "BYBIT_REFERER"
+    adapter_options:
+      # Bybit V5 当前默认按 linear perpetual 工作。
+      category: "linear"
+      # 统一账户默认走 UNIFIED；如你的账户模型不同，可在这里覆盖。
+      account_type: "UNIFIED"
+
   hyperliquid:
+    adapter_kind: "hyperliquid"
+    venue_kind: "hyperliquid"
     enabled: true
     label: "Hyperliquid"
     settle_asset: "USDC"

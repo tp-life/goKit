@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"goKit/internal/domain/entity"
@@ -19,7 +18,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// CEXMarketClient 适配 Binance / Aster 这类“Binance-like”永续市场：
+// CEXMarketClient 是一个保留了历史命名的实现类型。
+//
+// 虽然名字里有 `CEX`，但它的真实语义并不是“任何中心化交易所都能复用”，
+// 而是专门服务于 Binance / Aster 这类 Binance-like 永续合约协议族。
+//
+// 之所以暂时保留旧名字，是为了减少这轮架构纠偏对现有调用面的冲击；
+// 但从 adapter_kind 语义上，它现在应该被理解成 `binance_like`，而不是通用 `cex`。
+//
+// 这个实现当前假设：
 // - exchangeInfo / fundingInfo 走 REST
 // - mark price 走全市场 websocket
 // - best bid / ask 只对策略层指定的深扫池 symbol 建立 combined stream
@@ -36,32 +43,52 @@ type CEXMarketClient struct {
 }
 
 func NewBinanceMarketClient(cfg ConfigSet, logger *slog.Logger) MarketAdapter {
-	c := normalizeExchangeConfig("binance", cfg.Binance)
-	if c.RestBaseURL == "" {
-		c.RestBaseURL = "https://fapi.binance.com"
-	}
-	if c.MarketWSBaseURL == "" {
-		c.MarketWSBaseURL = "wss://fstream.binance.com/market"
-	}
-	if c.PublicWSBaseURL == "" {
-		c.PublicWSBaseURL = "wss://fstream.binance.com/public"
-	}
-	return newCEXMarketClient("binance", c, logger)
+	return NewCEXMarketAdapter("binance", cfg.Binance, logger)
 }
 
 func NewAsterMarketClient(cfg ConfigSet, logger *slog.Logger) MarketAdapter {
-	c := normalizeExchangeConfig("aster", cfg.Aster)
+	return NewCEXMarketAdapter("aster", cfg.Aster, logger)
+}
+
+// NewBinanceLikeMarketAdapter 是 registry 层应该优先使用的构造入口。
+//
+// 它明确表达“当前这份实现服务的是 Binance-like 协议族”，
+// 而不是所有 CEX 交易所。
+func NewBinanceLikeMarketAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) MarketAdapter {
+	return NewCEXMarketAdapter(name, cfg, logger)
+}
+
+// NewCEXMarketAdapter 是保留给现有代码的兼容构造入口。
+//
+// 名称虽然沿用了旧叫法，但真实语义已经被收窄为 `binance_like` 协议族。
+func NewCEXMarketAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) MarketAdapter {
+	c := normalizeExchangeConfig(name, cfg)
 	if c.RestBaseURL == "" {
-		c.RestBaseURL = "https://fapi.asterdex.com"
+		switch name {
+		case "aster":
+			c.RestBaseURL = "https://fapi.asterdex.com"
+		default:
+			c.RestBaseURL = "https://fapi.binance.com"
+		}
 	}
-	// Aster 当前沿用 Binance-like 的 ws 基地址，没有 public / market 的强制分流。
 	if c.MarketWSBaseURL == "" {
-		c.MarketWSBaseURL = "wss://fstream.asterdex.com"
+		switch name {
+		case "aster":
+			c.MarketWSBaseURL = "wss://fstream.asterdex.com"
+		default:
+			c.MarketWSBaseURL = "wss://fstream.binance.com/market"
+		}
 	}
 	if c.PublicWSBaseURL == "" {
-		c.PublicWSBaseURL = "wss://fstream.asterdex.com"
+		switch name {
+		case "aster":
+			// Aster 当前沿用 Binance-like 的 ws 基地址，没有 public / market 的强制分流。
+			c.PublicWSBaseURL = "wss://fstream.asterdex.com"
+		default:
+			c.PublicWSBaseURL = "wss://fstream.binance.com/public"
+		}
 	}
-	return newCEXMarketClient("aster", c, logger)
+	return newCEXMarketClient(name, c, logger)
 }
 
 func newCEXMarketClient(name string, cfg ExchangeConfig, logger *slog.Logger) *CEXMarketClient {
@@ -306,98 +333,34 @@ func (c *CEXMarketClient) runMarkPriceLoop(ctx context.Context, symbols []entity
 func (c *CEXMarketClient) runBookTickerLoop(ctx context.Context, provider MarketSubscriptionProvider, sink MarketSink) {
 	base := strings.TrimRight(c.cfg.PublicWSBaseURL, "/")
 	endpoint := base + "/ws/!bookTicker"
-	backoff := time.Second
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// 初始先取一次当前 book watch。
-		// 如果当前为空，说明还没有任何需要深扫/落盘口的 symbol，
-		// 先短暂等待，再重试，不建立无意义连接。
-		initialWatch := c.resolveBookWatch(provider)
-		if len(initialWatch) == 0 {
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		conn, _, err := c.wsDialer.DialContext(ctx, endpoint, nil)
-		if err != nil {
-			c.logger.Warn("ws_dial_failed",
+	runDynamicPublicStream(ctx, dynamicPublicStreamConfig[map[string]entity.Symbol]{
+		Endpoint: endpoint,
+		Dial: func(ctx context.Context, endpoint string) (*websocket.Conn, error) {
+			conn, _, err := c.wsDialer.DialContext(ctx, endpoint, nil)
+			return conn, err
+		},
+		ResolveSnapshot: func() (map[string]entity.Symbol, bool) {
+			watch := c.resolveBookWatch(provider)
+			return watch, len(watch) > 0
+		},
+		OnConnected: func() {
+			c.updateStatus(func(s *ConnectorStatus) { s.LastError = "" })
+			sink.UpdateStatus(c.currentStatus())
+		},
+		OnDisconnected: func(err error) {
+			c.logger.Warn("dynamic_public_stream_stopped",
 				slog.String("exchange", c.name),
 				slog.String("kind", "book"),
 				slog.Any("err", err),
 			)
 			c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
 			sink.UpdateStatus(c.currentStatus())
-
-			time.Sleep(backoff)
-			if backoff < 15*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-
-		backoff = time.Second
-		c.updateStatus(func(s *ConnectorStatus) { s.LastError = "" })
-		sink.UpdateStatus(c.currentStatus())
-
-		// 用 atomic.Value 存当前 watch，避免：
-		// - 刷新 goroutine 在更新 watch
-		// - 读消息 goroutine 在同时读取 watch
-		// 带来的数据竞争问题。
-		var watchRef atomic.Value
-		watchRef.Store(initialWatch)
-
-		// 固定周期刷新本地过滤集合。
-		// 这里不重连 websocket，只更新“哪些 symbol 的数据要写入 store”。
-		refreshTicker := time.NewTicker(2 * time.Second)
-		stopRefresh := make(chan struct{})
-
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-stopRefresh:
-					return
-				case <-refreshTicker.C:
-					newWatch := c.resolveBookWatch(provider)
-
-					// resolveBookWatch 保证返回的是非 nil map。
-					// 即使当前为空，也应该覆盖旧值，避免旧的深扫池残留。
-					watchRef.Store(newWatch)
-				}
-			}
-		}()
-
-		for {
-			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				// 读超时不一定表示连接坏了。
-				// 对于全市场 !bookTicker，正常情况下消息会持续到来；
-				// 但如果代理或链路短暂抖动，先不给连接判死刑，继续等下一条。
-				if isTimeoutErr(err) {
-					continue
-				}
-
-				refreshTicker.Stop()
-				close(stopRefresh)
-				_ = conn.Close()
-
-				c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
-				sink.UpdateStatus(c.currentStatus())
-				break
-			}
-
-			currentWatch, _ := watchRef.Load().(map[string]entity.Symbol)
-			c.handleBookTickerMessage(msg, currentWatch, sink)
-		}
-	}
+		},
+		OnMessage: func(msg []byte, watch map[string]entity.Symbol) {
+			c.handleBookTickerMessage(msg, watch, sink)
+		},
+		ReadTimeout: 30 * time.Second,
+	})
 }
 
 // readLoop 是 CEX 公共的 websocket 读取循环。

@@ -96,6 +96,24 @@ if exchange == hyperliquid { ... }
 - 先接公共能力，后补私有能力；
 - 行情与交易分别演进。
 
+在工程装配层，当前又补了一层 **Adapter Registry**：
+
+- 配置层通过 `exchanges.<name>.adapter_kind` 声明“该交易所属于哪一种接入协议族”；
+- 运行时由注册表统一实例化对应的 `MarketAdapter` / `TradeAdapter`；
+- 因而“支持第 N 家交易所”的默认路径变成“补配置或补适配器”，而不是继续给主流程加 if/switch。
+
+这里的 `adapter_kind` 必须尽量具体，例如 `binance_like`、`bybit_v5`、`hyperliquid`，
+而不应该继续使用过宽的 `cex / dex` 场所分类。否则“装配层已抽象”这件事会被表面化，
+系统看起来支持任意交易所，实际上只是把不同协议硬塞进同一个实现。
+
+同时，新增协议族的路径也应该是：
+
+1. 在新模块里提供自己的 `AdapterFactory`
+2. 通过工厂 group 注入运行时注册表
+3. 由注册表统一实例化 Market / Trade adapter
+
+而不是每接一类新协议，都继续修改中心化装配逻辑。
+
 ### 3.2 Canonicalization Layer
 
 这一层负责解决跨所 symbol 对齐问题，包括：

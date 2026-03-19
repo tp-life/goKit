@@ -63,6 +63,26 @@ func newWebSocketDialer(cfg ExchangeConfig, appCfg AppConfig, logger *slog.Logge
 	return dialer
 }
 
+// resolvePrivateWSBaseURL 统一挑选“私有订单/用户流”应该连接到哪个 websocket 地址。
+//
+// 这里故意把私有流地址单独抽出来，而不是继续复用 `public_ws_base_url`，原因有两点：
+// 1. 有些交易所公有 market ws 和私有 order ws 根本不是同一个入口，例如 Bybit V5；
+// 2. 就算当前某个交易所二者恰好相同，把私有流地址显式配置出来，后续扩族时也更不容易误连。
+//
+// 选择优先级：
+// 1. `private_ws_base_url`
+// 2. 调用方传入的 family-level fallback
+// 3. `public_ws_base_url`
+func resolvePrivateWSBaseURL(cfg ExchangeConfig, fallback string) string {
+	if value := strings.TrimSpace(cfg.PrivateWSBaseURL); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(fallback); value != "" {
+		return value
+	}
+	return strings.TrimSpace(cfg.PublicWSBaseURL)
+}
+
 func applyProxyToHTTPTransport(transport *http.Transport, proxyCfg ProxyConfig, logger *slog.Logger, exchangeName string) {
 	if !proxyCfg.Enabled || strings.TrimSpace(proxyCfg.URL) == "" {
 		return
@@ -149,18 +169,6 @@ func normalizeAllowed(allowed map[string]struct{}, keys ...string) bool {
 	return false
 }
 
-// symbolAliasTable 定义“同一个 canonical asset 的常见别名”。
-//
-// 当前先只保留低风险、跨所里最常见的一类别名：
-// - XBT <-> BTC
-//
-// 之所以暂时不在这里激进地把更多 ticker 全部揉在一起，是因为某些交易所的
-// 同名/近名资产并不总能安全视为一类；错误 alias 比缺少 alias 更危险。
-// 因此这里采用“少而准”的策略，先解决最确定、最常见的跨所映射问题。
-var symbolAliasTable = map[string]string{
-	"XBT": "BTC",
-}
-
 // normalizeSymbolAlias 把 symbol/base asset 归一到策略内部使用的 canonical asset key。
 //
 // 规则：
@@ -172,14 +180,7 @@ var symbolAliasTable = map[string]string{
 // - canonicalFrom() 在构建全市场 watchlist 时不会把 BTC / XBT 错分成两个币；
 // - normalizeAllowed() 在处理 AllowedSymbols 白名单时，也能接受用户写 BTC 或 XBT。
 func normalizeSymbolAlias(symbol string) string {
-	key := strings.TrimSpace(strings.ToUpper(symbol))
-	if key == "" {
-		return ""
-	}
-	if canonical, ok := symbolAliasTable[key]; ok {
-		return canonical
-	}
-	return key
+	return defaultSymbolRegistry.NormalizeAsset(symbol)
 }
 
 // allowedLookupKeys 返回一个输入 symbol 在 allowlist 匹配时应该尝试的全部 key。
@@ -191,27 +192,11 @@ func normalizeSymbolAlias(symbol string) string {
 // 这样用户配置 `allowed_symbols: [BTC]` 时，交易所若返回 `XBTUSDT` 也能匹配上；
 // 同时用户若明确写 `XBT`，也依然兼容。
 func allowedLookupKeys(symbol string) []string {
-	raw := strings.TrimSpace(strings.ToUpper(symbol))
-	if raw == "" {
-		return nil
-	}
-	canonical := normalizeSymbolAlias(raw)
-	if canonical == "" || canonical == raw {
-		return []string{raw}
-	}
-	return []string{raw, canonical}
+	return defaultSymbolRegistry.AllowedLookupKeys(symbol)
 }
 
 func canonicalFrom(raw, base string) string {
-	base = normalizeSymbolAlias(base)
-	if base != "" {
-		return base
-	}
-	raw = strings.ToUpper(strings.TrimSpace(raw))
-	raw = strings.TrimSuffix(raw, "USDT")
-	raw = strings.TrimSuffix(raw, "USDC")
-	raw = strings.TrimSuffix(raw, "USD")
-	return normalizeSymbolAlias(raw)
+	return defaultSymbolRegistry.CanonicalAsset(raw, base)
 }
 
 func stepFromDecimals(decimals int) string {

@@ -21,13 +21,10 @@ var Module = fx.Options(
 
 		service.NewMarketStore,
 
-		fx.Annotate(exchange.NewBinanceMarketClient, fx.ResultTags(`group:"markets"`)),
-		fx.Annotate(exchange.NewAsterMarketClient, fx.ResultTags(`group:"markets"`)),
-		fx.Annotate(exchange.NewHyperliquidMarketClient, fx.ResultTags(`group:"markets"`)),
-
-		fx.Annotate(exchange.NewBinanceTradeClient, fx.ResultTags(`group:"trades"`)),
-		fx.Annotate(exchange.NewAsterTradeClient, fx.ResultTags(`group:"trades"`)),
-		fx.Annotate(exchange.NewHyperliquidTradeClient, fx.ResultTags(`group:"trades"`)),
+		fx.Annotate(exchange.DefaultAdapterFactories, fx.ResultTags(`group:"exchange_adapter_factories,flatten"`)),
+		exchange.NewProvidedAdapterRegistry,
+		fx.Annotate(exchange.ProvideMarketAdapters, fx.ResultTags(`group:"markets,flatten"`)),
+		fx.Annotate(exchange.ProvideTradeAdapters, fx.ResultTags(`group:"trades,flatten"`)),
 
 		service.NewSymbolService,
 		service.NewOpportunityQueryService,

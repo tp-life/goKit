@@ -7,6 +7,7 @@
 - 市场侧抽象：`MarketAdapter`
 - 交易侧抽象：`TradeAdapter`
 - 规范化交易对：`canonical symbol`
+- 交易所接入注册表：`adapter registry`（通过 `adapter_kind + exchanges.<name>` 组装）
 - 执行记录 / 订单记录落库
 - 手动与自动开平仓接口
 
@@ -14,6 +15,7 @@
 
 - SQLite 持久化
 - Binance / Aster / Hyperliquid 公共行情接入
+- Bybit V5 public websocket 行情接入（`tickers.{symbol}` + `orderbook.1.{symbol}`）
 - 多交易所共同交易对自动发现
 - 规范化交易对映射（如 `BTCUSDT -> BTC`，`BTC -> BTC`）
 - 任意两两交易所组合的 funding 套利机会计算
@@ -21,15 +23,17 @@
 - 真实执行层抽象：
   - Binance 下单 / 平仓 / 查持仓
   - Aster 下单 / 平仓 / 查持仓
+  - Bybit 下单 / 平仓 / 查持仓
   - Hyperliquid 下单 / 平仓 / 查持仓
 - 执行记录表 / 订单记录表
 - 自动开仓 / 自动平仓循环
+- Binance / Bybit 私有订单事件流基础接入（最小可用版）
 - 手动 HTTP 接口：开仓 / 平仓 / 查执行记录 / 查订单记录
 - 前端页面改为动态展示多交易所数据
 
 ## 当前仍然不包含
 
-- 私有用户流 / 订单状态 websocket 回补
+- 更多交易所的私有用户流 / 完整订单状态 websocket 回补
 - 完整的撤单 / 改单 / 重试编排
 - 双腿成交一致性校验与对冲补单
 - 更细的风控（最大持仓、单交易所熔断、账户权益检查、黑名单 symbol 等）
@@ -41,8 +45,11 @@
 
 - `internal/infrastructure/exchange`
   - `interfaces.go`：统一市场/交易接口
-  - `cex_market.go`：Binance/Aster 公共行情适配器
-  - `cex_trade.go`：Binance/Aster 下单适配器
+  - `registry.go`：交易所适配器注册表，负责按配置组装 Market/Trade adapter
+  - `cex_market.go`：Binance-like 公共行情适配器（文件名保留历史命名）
+  - `cex_trade.go`：Binance-like 下单适配器（文件名保留历史命名）
+  - `bybit_market.go`：Bybit V5 perpetual 行情适配器
+  - `bybit_trade.go`：Bybit V5 perpetual 交易适配器
   - `hyperliquid_market.go`：Hyperliquid 行情适配器
   - `hyperliquid_trade.go`：Hyperliquid 交易适配器
 - `internal/application/service`
@@ -78,15 +85,44 @@
 - `GET /api/v1/executions/:planKey/orders`
 - `POST /api/v1/executions/:planKey/open`
 - `POST /api/v1/executions/:planKey/close`
+- `POST /api/v1/executions/events/order`
 - `GET /api/v1/market/:symbol`
 - `GET /api/v1/system/status`
 - `GET /api/v1/snapshot-stats`
+
+`POST /api/v1/executions/events/order` 可用于：
+
+- 本地调试回放某笔订单事件
+- 给尚未接入私有 websocket 的交易所临时做人工补录
+- 验证 execution 状态机在异步订单更新下是否按预期推进
+
+示例：
+
+```json
+{
+  "source": "debug_http",
+  "exchange": "binance",
+  "client_order_id": "cid-123",
+  "status": "FILLED",
+  "executed_qty": 1,
+  "average_price": 101.5,
+  "terminal": true,
+  "occurred_at_ms": 1710000000123
+}
+```
 
 ## 配置
 
 配置文件见 `configs/config.yaml.example`。
 
 重点参数：
+
+- `exchanges.<name>.adapter_kind`：声明该交易所复用哪类接入协议族；当前内置 `binance_like`、`bybit_v5` 与 `hyperliquid`
+- `exchanges.<name>.venue_kind`：声明该交易所在策略层复用哪类 venue profile；为空时按交易所名或 `adapter_kind` 推断
+- `exchanges.<name>.auth.passphrase_env` / `auth.extra_env` / `adapter_options`：留给 OKX、Bybit 这类协议族的扩展配置位
+- `exchanges.<name>.private_ws_base_url`：显式指定私有订单/用户流 websocket 地址；像 Bybit 这类公私有流不共址的交易所应优先配置它
+- 当前私有订单事件流最小实现已在 `binance` 与 `bybit_v5` 上启用；其他协议族仍可沿同一 `TradeOrderEventStreamer` 接口继续扩展
+- 自定义交易所必须显式配置 `adapter_kind`；系统不再把未知交易所默认归到某个“通用 cex”实现
 
 - `strategy.allowed_symbols`：规范化 symbol 列表，建议写基础币 `BTC/ETH/SOL`
 - `strategy.entry_mode`：`maker / mixed / taker`
@@ -140,3 +176,21 @@ go build ./...
 2. 双腿执行的一致性状态机
 3. 风控与余额/权益校验
 4. 更完整的交易对 alias 管理
+
+## 新增交易所的最小接入方式
+
+如果新交易所与现有接入族兼容，通常只需要下面这几步：
+
+1. 在 `configs/config.yaml` 的 `exchanges.<new_name>` 下新增配置，并设置 `adapter_kind`。
+2. 若它在策略层能复用现有规则族，可直接补 `venue_kind`；否则再补新的 `VenueProfile`。
+3. 如果它的协议与现有族不兼容，再新增一个 `AdapterFactory`，实现 `MarketAdapter/TradeAdapter` 后通过 `exchange_adapter_factories` group 注入。
+
+其中 `adapter_kind` 的语义要尽量具体，例如：
+
+- `binance_like`
+- `bybit_v5`
+- `hyperliquid`
+
+不要再把它理解成宽泛的 `cex / dex` 场所分类，否则会重新回到“接口长得不一样却被误判为可复用”的问题。
+
+这意味着策略层、机会计算、执行计划与执行服务都不需要为“第 N 家交易所”新增分支。

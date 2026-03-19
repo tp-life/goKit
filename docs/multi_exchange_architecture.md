@@ -99,6 +99,48 @@
 - `ExecutionService`：负责自动开平仓、风控、对冲回滚、订单/执行记录更新；
 - `MarketStore`：负责最新 symbol/funding/book snapshot 的内存态。  
 
+### 2.3.1 新增：Adapter Registry 组装层
+
+为了让“继续新增交易所”不再依赖 `fx` 模块里逐家硬编码 provider，当前实现新增了一层轻量注册表：
+
+- `exchanges.<name>`：描述一个交易所实例；
+- `exchanges.<name>.adapter_kind`：描述它属于哪类接入协议族；
+- `exchanges.<name>.venue_kind`：描述它在策略层复用哪类 venue 规则画像；
+- `AdapterRegistry`：根据 `adapter_kind` 把该实例装配成 `MarketAdapter` / `TradeAdapter`。
+
+这里特别强调一条纠偏原则：
+
+> `adapter_kind` 必须表示“真实可复用的协议族”，而不是宽泛的场所类型。
+
+例如当前仓库内置的是：
+
+- `binance_like`
+- `bybit_v5`
+- `hyperliquid`
+
+而不是：
+
+- `cex`
+- `dex`
+
+因为 `cex / dex` 只说明交易场所形态，并不能说明 REST / WS / 签名 / symbol / 订单状态语义真的兼容。
+因此新交易所如果不是已知内置实例，就必须显式配置 `adapter_kind`；系统不再对未知交易所做“默认归到通用 cex”的推断。
+
+同时，注册表现在不仅仅是“中心文件里写死两项”：
+
+- 默认协议族通过 `exchange_adapter_factories` 注入；
+- 新协议族可以在自己的模块里提供新的 `AdapterFactory`；
+- 运行时注册表再统一收口这些工厂并实例化 `MarketAdapter / TradeAdapter`。
+
+这样后续接入 `okx_v5_swap`、`bitget_mix` 这类协议族时，不需要再回到同一个中心文件硬改装配逻辑。
+
+这样带来的直接收益是：
+
+1. **新增同协议族交易所时，不必改策略层，也不必改 DI 主模块；**
+2. **新增不同协议族交易所时，只需补一组新适配器 + 注册表项；**
+3. **同协议族但不同品牌的交易所，可在策略层继续复用同一套 venue profile；**
+4. **系统扩展点从“按交易所名称散落硬编码”收敛为“按协议族 + venue 规则族集中注册”。**
+
 
 ---
 
@@ -162,7 +204,8 @@
 当前实现已经有一层基础 alias 归一化：
 
 - `XBT -> BTC`
-- `canonicalFrom()` 与 `normalizeAllowed()` 共用同一套 alias 规则。  
+- `canonicalFrom()` 与 `normalizeAllowed()` 共用同一套 alias 规则；
+- 基础的 quote / contract suffix 归一，例如 `BTC-USDT-SWAP -> BTC`、`XBT_PERP -> BTC`。
 
 
 但这只是 **第一阶段**，不是完整 alias 平台。后续仍需要：
@@ -375,4 +418,3 @@
 - 本文：解释 **系统架构、模块边界、演进原则**；
 - `arbitrage_algorithm_and_funding_timeline.md`：解释 **套利算法、资金费率时间轴、自动执行时序**；
 - `task_breakdown_v1.md`：解释 **实施任务拆解、阶段目标、完成标准与当前进度**。
-

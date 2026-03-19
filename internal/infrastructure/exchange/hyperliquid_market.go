@@ -22,6 +22,7 @@ import (
 // 这正好匹配“全市场粗筛 + 候选深扫”的策略设计。
 type HyperliquidMarketClient struct {
 	baseStatusHolder
+	name       string
 	cfg        ExchangeConfig
 	logger     *slog.Logger
 	httpClient *http.Client
@@ -29,7 +30,11 @@ type HyperliquidMarketClient struct {
 }
 
 func NewHyperliquidMarketClient(cfg ConfigSet, logger *slog.Logger) MarketAdapter {
-	c := normalizeExchangeConfig("hyperliquid", cfg.Hyperliquid)
+	return NewHyperliquidMarketAdapter("hyperliquid", cfg.Hyperliquid, logger)
+}
+
+func NewHyperliquidMarketAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) MarketAdapter {
+	c := normalizeExchangeConfig(name, cfg)
 	if c.RestBaseURL == "" {
 		c.RestBaseURL = "https://api.hyperliquid.xyz"
 	}
@@ -38,15 +43,16 @@ func NewHyperliquidMarketClient(cfg ConfigSet, logger *slog.Logger) MarketAdapte
 	}
 	appCfg := loadAppConfig()
 	return &HyperliquidMarketClient{
+		name:             name,
 		cfg:              c,
 		logger:           logger,
-		httpClient:       newHTTPClient(c, appCfg, logger, "hyperliquid"),
-		wsDialer:         newWebSocketDialer(c, appCfg, logger, "hyperliquid"),
-		baseStatusHolder: baseStatusHolder{status: ConnectorStatus{Exchange: "hyperliquid"}},
+		httpClient:       newHTTPClient(c, appCfg, logger, name),
+		wsDialer:         newWebSocketDialer(c, appCfg, logger, name),
+		baseStatusHolder: baseStatusHolder{status: ConnectorStatus{Exchange: name}},
 	}
 }
 
-func (c *HyperliquidMarketClient) Name() string           { return "hyperliquid" }
+func (c *HyperliquidMarketClient) Name() string           { return c.name }
 func (c *HyperliquidMarketClient) Enabled() bool          { return c.cfg.Enabled }
 func (c *HyperliquidMarketClient) Fees() FeeConfig        { return c.cfg.Fees }
 func (c *HyperliquidMarketClient) Config() ExchangeConfig { return c.cfg }
@@ -66,7 +72,7 @@ func (c *HyperliquidMarketClient) FetchTradableSymbols(ctx context.Context, quot
 			continue
 		}
 		out = append(out, entity.Symbol{
-			Exchange:             "hyperliquid",
+			Exchange:             c.name,
 			Symbol:               canonical,
 			VenueSymbol:          canonical,
 			BaseAsset:            canonical,
@@ -172,7 +178,7 @@ func (c *HyperliquidMarketClient) runAssetCtxPollingLoop(ctx context.Context, sy
 				}
 				ctxItem := ctxs[idx]
 				sink.UpsertFunding(entity.FundingSnapshot{
-					Exchange:             "hyperliquid",
+					Exchange:             c.name,
 					Symbol:               item.Symbol,
 					VenueSymbol:          item.VenueSymbol,
 					MarkPrice:            mustFloat(ctxItem.MarkPx),
@@ -305,7 +311,7 @@ func (c *HyperliquidMarketClient) runBBOLoop(ctx context.Context, provider Marke
 				continue
 			}
 			sink.UpsertBookTop(entity.BookTopSnapshot{
-				Exchange:    "hyperliquid",
+				Exchange:    c.name,
 				Symbol:      meta.Symbol,
 				VenueSymbol: meta.VenueSymbol,
 				BidPrice:    bidPx,
