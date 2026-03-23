@@ -118,6 +118,7 @@ func (c *BybitV5TradeClient) runPrivateOrderStream(ctx context.Context, sink Ord
 		return err
 	}
 	defer conn.Close()
+	configureWebSocketReadDeadline(conn, 30*time.Second)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -193,9 +194,6 @@ func (c *BybitV5TradeClient) awaitPrivateControlAck(conn *websocket.Conn, op str
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
-			if isTimeoutErr(err) {
-				continue
-			}
 			return err
 		}
 
@@ -238,9 +236,6 @@ func (c *BybitV5TradeClient) readPrivateOrderStream(ctx context.Context, conn *w
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
-			if isTimeoutErr(err) {
-				continue
-			}
 			return err
 		}
 

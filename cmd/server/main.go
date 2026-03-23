@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"goKit/internal"
 	"goKit/internal/application/service"
 	"goKit/internal/infrastructure/exchange"
@@ -11,10 +13,13 @@ import (
 	"goKit/pkg/kit/rpc"
 	"goKit/pkg/kit/web"
 	frontend "goKit/web"
+	"os"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/spf13/viper"
+	"github.com/subosito/gotenv"
 	"go.uber.org/fx"
 )
 
@@ -27,10 +32,31 @@ type AppConfig struct {
 	Exchanges exchange.ConfigSet `mapstructure:"exchanges"`
 }
 
+func loadDotEnvFiles(paths ...string) error {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if err := gotenv.Load(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("load env file %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
 func LoadConfig() (*AppConfig, error) {
+	viper.Reset()
+	if err := loadDotEnvFiles(".env"); err != nil {
+		return nil, err
+	}
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath("./configs")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, err
 	}

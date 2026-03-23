@@ -156,6 +156,7 @@ func (c *CEXTradeClient) readUserDataStream(ctx context.Context, listenKey strin
 		return err
 	}
 	defer conn.Close()
+	configureWebSocketReadDeadline(conn, 30*time.Second)
 
 	// websocket.DialContext 只约束建连阶段，不会在建连成功后自动把 ctx.Done() 传递到 ReadMessage。
 	// 这里单独起一个很薄的 goroutine，在 ctx 结束时主动关闭连接，
@@ -169,14 +170,17 @@ func (c *CEXTradeClient) readUserDataStream(ctx context.Context, listenKey strin
 		case <-done:
 		}
 	}()
+	go keepaliveWebSocketControlPingLoop(ctx, conn, 15*time.Second, done, func(err error) {
+		if c.logger != nil {
+			c.logger.Warn("cex_user_stream_ping_failed", "exchange", c.name, "listen_key", listenKey, "err", err)
+		}
+		_ = conn.Close()
+	})
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			if isTimeoutErr(err) {
-				continue
-			}
 			return err
 		}
 

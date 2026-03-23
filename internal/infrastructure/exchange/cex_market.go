@@ -385,19 +385,17 @@ func (c *CEXMarketClient) readLoop(ctx context.Context, endpoint string, markPri
 			continue
 		}
 		backoff = time.Second
+		configureWebSocketReadDeadline(conn, 10*time.Second)
 		c.updateStatus(func(s *ConnectorStatus) { s.LastError = "" })
 		sink.UpdateStatus(c.currentStatus())
 		for {
+			if reconnectCheck != nil && reconnectCheck() {
+				_ = conn.Close()
+				break
+			}
 			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				if isTimeoutErr(err) {
-					if reconnectCheck != nil && reconnectCheck() {
-						_ = conn.Close()
-						break
-					}
-					continue
-				}
 				_ = conn.Close()
 				c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
 				sink.UpdateStatus(c.currentStatus())

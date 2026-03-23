@@ -63,6 +63,41 @@ func newWebSocketDialer(cfg ExchangeConfig, appCfg AppConfig, logger *slog.Logge
 	return dialer
 }
 
+func configureWebSocketReadDeadline(conn *websocket.Conn, timeout time.Duration) {
+	if conn == nil || timeout <= 0 {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(timeout))
+	})
+}
+
+func keepaliveWebSocketControlPingLoop(ctx context.Context, conn *websocket.Conn, interval time.Duration, stop <-chan struct{}, onError func(error)) {
+	if conn == nil || interval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-ticker.C:
+			if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
+				if onError != nil {
+					onError(err)
+				}
+				return
+			}
+		}
+	}
+}
+
 // resolvePrivateWSBaseURL 统一挑选“私有订单/用户流”应该连接到哪个 websocket 地址。
 //
 // 这里故意把私有流地址单独抽出来，而不是继续复用 `public_ws_base_url`，原因有两点：

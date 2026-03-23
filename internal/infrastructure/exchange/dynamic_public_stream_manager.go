@@ -103,6 +103,7 @@ func runDynamicPublicStream[T any](ctx context.Context, cfg dynamicPublicStreamC
 				continue
 			}
 		}
+		configureWebSocketReadDeadline(conn, readTimeout)
 
 		backoff = time.Second
 		if cfg.OnConnected != nil {
@@ -156,9 +157,6 @@ func runDynamicPublicStream[T any](ctx context.Context, cfg dynamicPublicStreamC
 			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				if isTimeoutErr(err) {
-					continue
-				}
 				close(stopAux)
 				_ = conn.Close()
 				if cfg.OnDisconnected != nil {

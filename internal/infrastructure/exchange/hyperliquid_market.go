@@ -230,75 +230,58 @@ type hyperBBOData struct {
 // - 深扫池变化时，只发送 subscribe / unsubscribe 增量指令；
 // - 这样可以明显降低 websocket 抖动和代理层握手压力。
 func (c *HyperliquidMarketClient) runBBOLoop(ctx context.Context, provider MarketSubscriptionProvider, sink MarketSink) {
-	backoff := time.Second
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		desired := makeSymbolWatch(provider.BookSymbols(c.Name()))
-		if len(desired) == 0 {
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		conn, _, err := c.wsDialer.DialContext(ctx, c.cfg.PublicWSBaseURL, nil)
-		if err != nil {
-			c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
-			sink.UpdateStatus(c.currentStatus())
-			time.Sleep(backoff)
-			if backoff < 15*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-
-		currentSubs := make(map[string]entity.Symbol)
-		if err := c.syncBBOSubscriptions(conn, currentSubs, desired); err != nil {
-			_ = conn.Close()
-			c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
-			sink.UpdateStatus(c.currentStatus())
-			time.Sleep(backoff)
-			continue
-		}
-		backoff = time.Second
-
-		for {
-			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				if isTimeoutErr(err) {
-					desired = makeSymbolWatch(provider.BookSymbols(c.Name()))
-					if err := c.syncBBOSubscriptions(conn, currentSubs, desired); err != nil {
-						_ = conn.Close()
-						c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
-						sink.UpdateStatus(c.currentStatus())
-						break
-					}
-					continue
+	currentSubs := make(map[string]entity.Symbol)
+	runDynamicPublicStream(ctx, dynamicPublicStreamConfig[map[string]entity.Symbol]{
+		Endpoint: c.cfg.PublicWSBaseURL,
+		Dial: func(ctx context.Context, endpoint string) (*websocket.Conn, error) {
+			conn, _, err := c.wsDialer.DialContext(ctx, endpoint, nil)
+			return conn, err
+		},
+		ResolveSnapshot: func() (map[string]entity.Symbol, bool) {
+			desired := makeSymbolWatch(provider.BookSymbols(c.Name()))
+			return desired, len(desired) > 0
+		},
+		OnConnect: func(conn *websocket.Conn, snapshot map[string]entity.Symbol) error {
+			clear(currentSubs)
+			return c.syncBBOSubscriptions(conn, currentSubs, snapshot)
+		},
+		OnRefresh: func(conn *websocket.Conn, snapshot map[string]entity.Symbol) error {
+			return c.syncBBOSubscriptions(conn, currentSubs, snapshot)
+		},
+		Keepalive: func(ctx context.Context, conn *websocket.Conn, stop <-chan struct{}) {
+			keepaliveWebSocketControlPingLoop(ctx, conn, 2*time.Second, stop, func(err error) {
+				if c.logger != nil {
+					c.logger.Warn("hyperliquid_bbo_ping_failed", slog.String("exchange", c.name), slog.Any("err", err))
 				}
 				_ = conn.Close()
-				c.updateStatus(func(s *ConnectorStatus) { s.LastError = err.Error() })
-				sink.UpdateStatus(c.currentStatus())
-				break
-			}
-
+			})
+		},
+		OnConnected: func() {
+			c.updateStatus(func(s *ConnectorStatus) { s.LastError = "" })
+			sink.UpdateStatus(c.currentStatus())
+		},
+		OnDisconnected: func(err error) {
+			c.updateStatus(func(s *ConnectorStatus) {
+				s.LastError = err.Error()
+				s.BookTickerConnected = false
+			})
+			sink.UpdateStatus(c.currentStatus())
+		},
+		OnMessage: func(msg []byte, watch map[string]entity.Symbol) {
 			var packet hyperWSMessage
 			if err := json.Unmarshal(msg, &packet); err != nil {
-				continue
+				return
 			}
 			if packet.Channel != "bbo" {
-				continue
+				return
 			}
 			var data hyperBBOData
 			if err := json.Unmarshal(packet.Data, &data); err != nil {
-				continue
+				return
 			}
-			meta, ok := currentSubs[strings.ToUpper(data.Coin)]
+			meta, ok := watch[strings.ToUpper(data.Coin)]
 			if !ok {
-				continue
+				return
 			}
 			var bidPx, bidQty, askPx, askQty float64
 			if data.BBO[0] != nil {
@@ -308,7 +291,7 @@ func (c *HyperliquidMarketClient) runBBOLoop(ctx context.Context, provider Marke
 				askPx, askQty = mustFloat(data.BBO[1].Px), mustFloat(data.BBO[1].Sz)
 			}
 			if bidPx <= 0 && askPx <= 0 {
-				continue
+				return
 			}
 			sink.UpsertBookTop(entity.BookTopSnapshot{
 				Exchange:    c.name,
@@ -326,8 +309,12 @@ func (c *HyperliquidMarketClient) runBBOLoop(ctx context.Context, provider Marke
 				s.LastBookEventAt = time.Now().UTC()
 			})
 			sink.UpdateStatus(c.currentStatus())
-		}
-	}
+		},
+		ReadTimeout:     8 * time.Second,
+		RefreshInterval: 2 * time.Second,
+		IdleWait:        2 * time.Second,
+		MaxBackoff:      15 * time.Second,
+	})
 }
 
 // syncBBOSubscriptions 将“当前已订阅集合”同步到“目标订阅集合”。
