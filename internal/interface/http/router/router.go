@@ -5,6 +5,7 @@ import (
 
 	"goKit/internal/interface/http/handler"
 	"goKit/internal/interface/http/middleware"
+	"goKit/pkg/kit/web"
 
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/fx"
@@ -17,6 +18,7 @@ type Router struct {
 type RouterIn struct {
 	fx.In
 	Logger               *slog.Logger
+	WebConfig            web.Config
 	HealthHandler        *handler.HealthHandler
 	SymbolHandler        *handler.SymbolHandler
 	OpportunityHandler   *handler.OpportunityHandler
@@ -44,10 +46,12 @@ func (r *Router) Register(app *fiber.App) {
 	v1.Get("/plans", r.params.ExecutionPlanHandler.List)
 	v1.Get("/executions", r.params.ExecutionHandler.List)
 	v1.Get("/executions/:planKey/orders", r.params.ExecutionHandler.Orders)
-	v1.Post("/executions/:planKey/open", r.params.ExecutionHandler.Open)
-	v1.Post("/executions/:planKey/close", r.params.ExecutionHandler.Close)
-	v1.Post("/executions/events/order", r.params.ExecutionHandler.InjectOrderEvent)
 	v1.Get("/market/:symbol", r.params.MarketHandler.Snapshot)
 	v1.Get("/system/status", r.params.SystemHandler.Status)
 	v1.Get("/snapshot-stats", r.params.SnapshotStatsHandler.Get)
+
+	protected := v1.Group("", middleware.RequireExecutionAuth(r.params.WebConfig))
+	protected.Post("/executions/:planKey/open", r.params.ExecutionHandler.Open)
+	protected.Post("/executions/:planKey/close", r.params.ExecutionHandler.Close)
+	protected.Post("/executions/events/order", r.params.ExecutionHandler.InjectOrderEvent)
 }

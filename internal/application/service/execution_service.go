@@ -58,8 +58,7 @@ type ExecutionService struct {
 	orderRepo    repository.OrderRepository
 	trades       map[string]exchange.TradeAdapter
 	orderEventCh chan exchange.OrderEvent
-
-	mu              sync.Mutex
+	mu           sync.Mutex
 	exchangeFailure map[string]exchangeFailureState
 }
 
@@ -128,7 +127,11 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 		if !plan.ReadyNow || strings.ToLower(plan.Status) != "ready" {
 			continue
 		}
-		rec, _ := s.execRepo.FindByPlanKey(ctx, plan.PlanKey)
+		rec, err := s.execRepo.FindByPlanKey(ctx, plan.PlanKey)
+		if err != nil {
+			s.logger.Error("execution_auto_open_load_record_failed", slog.String("plan_key", plan.PlanKey), slog.Any("err", err))
+			continue
+		}
 		if rec != nil {
 			continue
 		}
@@ -155,6 +158,10 @@ func (s *ExecutionService) runAutoClose(ctx context.Context) {
 		plan, err := s.planRepo.FindByPlanKey(ctx, rec.PlanKey)
 		if err != nil {
 			s.logger.Error("execution_auto_close_load_plan_failed", slog.String("plan_key", rec.PlanKey), slog.Any("err", err))
+			continue
+		}
+		if plan == nil {
+			s.logger.Warn("execution_auto_close_plan_missing", slog.String("plan_key", rec.PlanKey))
 			continue
 		}
 		// 自动平仓现在不再只看“目标时间是否到了”。
@@ -223,6 +230,9 @@ func (s *ExecutionService) OpenByPlanKey(ctx context.Context, planKey string) (*
 	if err != nil {
 		return nil, err
 	}
+	if plan == nil {
+		return nil, ErrExecutionPlanNotFound
+	}
 	return s.openPlan(ctx, plan, "manual", s.cfg.Execution.Enabled)
 }
 
@@ -231,10 +241,15 @@ func (s *ExecutionService) CloseByPlanKey(ctx context.Context, planKey string) (
 	if err != nil {
 		return nil, err
 	}
+	if plan == nil {
+		return nil, ErrExecutionPlanNotFound
+	}
 	live := s.cfg.Execution.Enabled
 	// 手动 close 和 auto close 一样，优先尊重“这条 execution record 当初是不是 live 仓位”。
 	// 这样即使后续把 execution.enabled 关成 false，人工处理历史 live 仓位时也不会误走 dry-run。
-	if rec, err := s.execRepo.FindByPlanKey(ctx, planKey); err == nil && rec != nil && rec.LiveTrading {
+	if rec, err := s.execRepo.FindByPlanKey(ctx, planKey); err != nil {
+		return nil, err
+	} else if rec != nil && rec.LiveTrading {
 		live = true
 	}
 	return s.closePlan(ctx, plan, "manual", live)
@@ -244,9 +259,15 @@ func (s *ExecutionService) openPlan(ctx context.Context, plan *entity.ExecutionP
 	if plan == nil {
 		return nil, fmt.Errorf("nil execution plan")
 	}
-	rec, _ := s.execRepo.FindByPlanKey(ctx, plan.PlanKey)
+	rec, err := s.execRepo.FindByPlanKey(ctx, plan.PlanKey)
+	if err != nil {
+		return nil, err
+	}
 	if rec != nil && shouldShortCircuitExecutionAction(rec.Status, openExecutionPolicy.phase) {
 		return rec, nil
+	}
+	if rec != nil && isExecutionActionPending(rec.Status, openExecutionPolicy.phase) {
+		return rec, fmt.Errorf("%w: plan_key=%s status=%s", ErrExecutionActionInFlight, plan.PlanKey, rec.Status)
 	}
 	if err := validateExecutionAction(rec != nil, pickExecutionStatus(rec), openExecutionPolicy); err != nil {
 		if rec == nil {
@@ -325,17 +346,25 @@ func (s *ExecutionService) openPlan(ctx context.Context, plan *entity.ExecutionP
 		_ = s.execRepo.Upsert(ctx, rec)
 		return rec, err
 	}
-	if err := s.execRepo.Upsert(ctx, rec); err != nil {
+	claimedRec, claimed, err := s.execRepo.TryClaimAction(ctx, rec, executionClaimableStatuses(openExecutionPolicy))
+	if err != nil {
 		return nil, err
 	}
+	if !claimed {
+		if claimedRec != nil {
+			return claimedRec, nil
+		}
+		return rec, nil
+	}
+	rec = claimedRec
 
 	results, errMsg := s.placePlanOrders(ctx, plan, openExecutionPolicy.phase, trigger)
-	if shouldRecordOpenedAt(openExecutionPolicy.phase) {
+	finalStatus := summarizeExecutionStatus(results, openExecutionPolicy.phase)
+	if shouldRecordOpenedAt(openExecutionPolicy.phase) && (finalStatus == executionStateOpened || finalStatus == executionStateOpenPartial || finalStatus == executionStateOpenHedging) {
 		rec.OpenedAtMs = time.Now().UnixMilli()
 	}
 	rec.OpenOrderCount = len(results)
 	rec.LastError = errMsg
-	finalStatus := summarizeExecutionStatus(results, openExecutionPolicy.phase)
 	if err := applyExecutionEvent(rec, executionEvent{
 		Name:         "open_results_applied",
 		TargetStatus: finalStatus,
@@ -358,9 +387,15 @@ func (s *ExecutionService) closePlan(ctx context.Context, plan *entity.Execution
 	if plan == nil {
 		return nil, fmt.Errorf("nil execution plan")
 	}
-	rec, _ := s.execRepo.FindByPlanKey(ctx, plan.PlanKey)
+	rec, err := s.execRepo.FindByPlanKey(ctx, plan.PlanKey)
+	if err != nil {
+		return nil, err
+	}
 	if rec != nil && shouldShortCircuitExecutionAction(rec.Status, closeExecutionPolicy.phase) {
 		return rec, nil
+	}
+	if rec != nil && isExecutionActionPending(rec.Status, closeExecutionPolicy.phase) {
+		return rec, fmt.Errorf("%w: plan_key=%s status=%s", ErrExecutionActionInFlight, plan.PlanKey, rec.Status)
 	}
 	if err := validateExecutionAction(rec != nil, pickExecutionStatus(rec), closeExecutionPolicy); err != nil {
 		if rec == nil {
@@ -402,16 +437,24 @@ func (s *ExecutionService) closePlan(ctx context.Context, plan *entity.Execution
 		_ = s.execRepo.Upsert(ctx, rec)
 		return rec, err
 	}
-	if err := s.execRepo.Upsert(ctx, rec); err != nil {
+	claimedRec, claimed, err := s.execRepo.TryClaimAction(ctx, rec, executionClaimableStatuses(closeExecutionPolicy))
+	if err != nil {
 		return nil, err
 	}
+	if !claimed {
+		if claimedRec != nil {
+			return claimedRec, nil
+		}
+		return rec, nil
+	}
+	rec = claimedRec
 	results, errMsg := s.placePlanOrders(ctx, plan, closeExecutionPolicy.phase, trigger)
-	if shouldRecordClosedAt(closeExecutionPolicy.phase) {
+	finalStatus := summarizeExecutionStatus(results, closeExecutionPolicy.phase)
+	if shouldRecordClosedAt(closeExecutionPolicy.phase) && finalStatus == executionStateClosed {
 		rec.ClosedAtMs = time.Now().UnixMilli()
 	}
 	rec.CloseOrderCount += len(results)
 	rec.LastError = errMsg
-	finalStatus := summarizeExecutionStatus(results, closeExecutionPolicy.phase)
 	if err := applyExecutionEvent(rec, executionEvent{
 		Name:         "close_results_applied",
 		TargetStatus: finalStatus,
@@ -497,7 +540,7 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 	// open 阶段如果出现“一条腿成功、一条腿失败”，系统需要基于这里保存的请求信息
 	// 发起 hedge rollback。这个结构故意只保留 hedge 所需的最小信息，
 	// 避免后续 rollback 再去从其他对象里反推。
-	type successfulLeg struct {
+	type exposedLeg struct {
 		role     string
 		exchange string
 		req      exchange.TradeOrderRequest
@@ -512,9 +555,9 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 	// 3. 汇总 successes / errors；
 	// 4. 决定是否进入 hedge rollback。
 	type primaryLegResult struct {
-		record     entity.OrderRecord
-		errText    string
-		successLeg *successfulLeg
+		record      entity.OrderRecord
+		errText     string
+		exposureLeg *exposedLeg
 	}
 
 	// 对套利来说，两条主腿之间的时间差本身就是风险来源。
@@ -606,15 +649,15 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 					orderRecord.Status = "TIMEOUT"
 					orderRecord.ErrorMessage = err.Error()
 					orderRecord = s.reconcileTimedOutPrimaryLeg(ctx, adapter, orderRecord, req)
-					if isSuccessfulOrderStatus(orderRecord.Status, orderRecord.ExecutedQty) {
+					if isOrderFullySatisfied(orderRecord) {
 						s.registerAPISuccess(leg.exchange)
-						var success *successfulLeg
-						if phase == "open" {
-							success = &successfulLeg{role: leg.role, exchange: leg.exchange, req: req}
+						var exposure *exposedLeg
+						if phase == "open" && orderHasOpenExposure(orderRecord) {
+							exposure = &exposedLeg{role: leg.role, exchange: leg.exchange, req: req}
 						}
 						legResults[index] = primaryLegResult{
-							record:     orderRecord,
-							successLeg: success,
+							record:      orderRecord,
+							exposureLeg: exposure,
 						}
 						return
 					}
@@ -623,9 +666,14 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 					orderRecord.ErrorMessage = err.Error()
 				}
 				s.registerAPIFailure(leg.exchange)
+				var exposure *exposedLeg
+				if phase == "open" && orderHasOpenExposure(orderRecord) {
+					exposure = &exposedLeg{role: leg.role, exchange: leg.exchange, req: req}
+				}
 				legResults[index] = primaryLegResult{
-					record:  orderRecord,
-					errText: fmt.Sprintf("%s:%s", leg.exchange, err.Error()),
+					record:      orderRecord,
+					errText:     pickNonEmpty(orderRecord.ErrorMessage, fmt.Sprintf("%s:%s", leg.exchange, err.Error())),
+					exposureLeg: exposure,
 				}
 				return
 			}
@@ -638,13 +686,18 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 			orderRecord.RawResponse = resp.RawResponse
 			orderRecord = s.reconcileOrder(ctx, adapter, orderRecord, req)
 
-			var success *successfulLeg
-			if phase == "open" && orderRecord.ErrorMessage == "" && isSuccessfulOrderStatus(orderRecord.Status, orderRecord.ExecutedQty) {
-				success = &successfulLeg{role: leg.role, exchange: leg.exchange, req: req}
+			var exposure *exposedLeg
+			if phase == "open" && orderHasOpenExposure(orderRecord) {
+				exposure = &exposedLeg{role: leg.role, exchange: leg.exchange, req: req}
+			}
+			errText := ""
+			if !isOrderFullySatisfied(orderRecord) {
+				errText = describeOrderAttention(orderRecord)
 			}
 			legResults[index] = primaryLegResult{
-				record:     orderRecord,
-				successLeg: success,
+				record:      orderRecord,
+				errText:     errText,
+				exposureLeg: exposure,
 			}
 		}(idx, leg)
 	}
@@ -652,14 +705,18 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 
 	results := make([]entity.OrderRecord, 0, 4)
 	errors := make([]string, 0, 4)
-	successes := make([]successfulLeg, 0, 2)
+	exposures := make([]exposedLeg, 0, 2)
+	primaryNeedsRecovery := false
 	for _, legResult := range legResults {
 		orderRecord := legResult.record
+		if !isOrderFullySatisfied(orderRecord) {
+			primaryNeedsRecovery = true
+		}
 		if legResult.errText != "" {
 			errors = append(errors, legResult.errText)
 		}
-		if legResult.successLeg != nil {
-			successes = append(successes, *legResult.successLeg)
+		if legResult.exposureLeg != nil {
+			exposures = append(exposures, *legResult.exposureLeg)
 		}
 		_ = s.orderRepo.Create(ctx, &orderRecord)
 		results = append(results, orderRecord)
@@ -678,13 +735,13 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 	// 只有 open 阶段才会触发 hedge rollback。
 	// close 阶段的失败暂时仍然只做记录，不做自动反向补救，
 	// 因为“平仓失败后是否需要再开回去”在没有完整状态机时风险更高。
-	if phase == "open" && len(errors) > 0 && len(successes) > 0 {
+	if phase == "open" && primaryNeedsRecovery && len(exposures) > 0 {
 		s.logger.Warn("execution_open_partial_failure_hedge_start",
 			slog.String("plan_key", plan.PlanKey),
-			slog.Int("successful_legs", len(successes)),
+			slog.Int("exposed_legs", len(exposures)),
 			slog.Int("error_legs", len(errors)),
 		)
-		for _, okLeg := range successes {
+		for _, okLeg := range exposures {
 			adapter := s.trades[strings.ToLower(okLeg.exchange)]
 			hedgeReq := okLeg.req
 			hedgeReq.ClientOrderID = buildClientOrderID(plan, "hedge", okLeg.role)
@@ -760,8 +817,11 @@ func (s *ExecutionService) reconcileOrder(ctx context.Context, adapter exchange.
 			rec.ExecutedQty = maxFloat(rec.ExecutedQty, status.ExecutedQty)
 			rec.AvgPrice = maxFloat(rec.AvgPrice, status.AveragePrice)
 			rec.RawResponse = pickNonEmpty(status.RawResponse, rec.RawResponse)
-			if status.Terminal || isSuccessfulOrderStatus(rec.Status, rec.ExecutedQty) {
+			if isSuccessfulOrderStatus(rec.Status, rec.ExecutedQty) {
 				return rec
+			}
+			if status.Terminal {
+				break
 			}
 		}
 		if i < attempts-1 {
@@ -777,16 +837,16 @@ func (s *ExecutionService) reconcileOrder(ctx context.Context, adapter exchange.
 	pos, err := adapter.GetPosition(ctx, req.CanonicalSymbol, req.VenueSymbol, req.AssetID)
 	if err == nil {
 		if req.ReduceOnly {
-			if math.Abs(pos.Quantity) < req.Quantity*0.2 {
+			if closedPositionSatisfiesRequest(pos.Quantity, req.Quantity) {
 				rec.Status = "FILLED"
 				rec.ExecutedQty = maxFloat(rec.ExecutedQty, req.Quantity)
 			}
-		} else if math.Abs(pos.Quantity) >= req.Quantity*0.8 {
+		} else if openedPositionSatisfiesRequest(pos.Quantity, req.Quantity) {
 			rec.Status = "FILLED"
 			rec.ExecutedQty = maxFloat(rec.ExecutedQty, req.Quantity)
 		}
 	}
-	if rec.ExecutedQty > 0 && !isSuccessfulOrderStatus(rec.Status, rec.ExecutedQty) {
+	if hasMeaningfulExecutedQty(rec.ExecutedQty, req.Quantity) && !isOrderFullySatisfied(rec) {
 		// 当系统已经观察到部分成交量，但还没拿到一个明确终态时，
 		// 最保守的表达是 PARTIALLY_FILLED，而不是继续保留 NEW/PENDING。
 		rec.Status = "PARTIALLY_FILLED"
@@ -821,7 +881,7 @@ func (s *ExecutionService) isPrimaryLegTimeout(err error) bool {
 // 这样它就能重新回到正常的 execution 汇总路径。
 func (s *ExecutionService) reconcileTimedOutPrimaryLeg(ctx context.Context, adapter exchange.TradeAdapter, rec entity.OrderRecord, req exchange.TradeOrderRequest) entity.OrderRecord {
 	rec = s.reconcileOrder(ctx, adapter, rec, req)
-	if isSuccessfulOrderStatus(rec.Status, rec.ExecutedQty) {
+	if isOrderFullySatisfied(rec) {
 		rec.ErrorMessage = ""
 	}
 	return rec
@@ -1070,10 +1130,8 @@ func isSuccessfulOrderStatus(status string, executedQty float64) bool {
 	switch strings.ToUpper(strings.TrimSpace(status)) {
 	case "FILLED", "NO_POSITION":
 		return true
-	case "PARTIALLY_FILLED":
-		return executedQty > 0
 	default:
-		return executedQty > 0 && !isFailedOrderStatus(status)
+		return false
 	}
 }
 
@@ -1093,4 +1151,12 @@ func firstPositiveFloat(values ...float64) float64 {
 		}
 	}
 	return 0
+}
+
+func executionClaimableStatuses(policy executionPhasePolicy) []string {
+	out := make([]string, 0, len(policy.startableFrom))
+	for status := range policy.startableFrom {
+		out = append(out, status)
+	}
+	return out
 }

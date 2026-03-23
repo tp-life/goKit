@@ -47,6 +47,7 @@ const els = {
   opportunitySummary: document.getElementById("opportunity-summary"),
   opportunityDetail: document.getElementById("opportunity-detail"),
   opportunitiesEmpty: document.getElementById("opportunities-empty"),
+  executionBoardSummary: document.getElementById("execution-board-summary"),
   plansList: document.getElementById("plans-list"),
   plansEmpty: document.getElementById("plans-empty"),
   planViewMode: document.getElementById("plan-view-mode"),
@@ -61,7 +62,7 @@ const els = {
 // ------------------------------------------------------------
 async function apiGet(path, fallback = null) {
   try {
-    const res = await fetch(path, { headers: { Accept: "application/json" } });
+    const res = await fetch(path, { headers: buildApiHeaders() });
     if (!res.ok) return fallback;
     const json = await res.json();
     return json && typeof json === "object" && "data" in json
@@ -74,14 +75,29 @@ async function apiGet(path, fallback = null) {
 }
 
 async function apiPost(path, payload = {}) {
+  const headers = buildApiHeaders();
+  headers["Content-Type"] = "application/json";
   const res = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers,
     body: JSON.stringify(payload),
   });
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json?.message || `HTTP ${res.status}`);
   return json && typeof json === "object" && "data" in json ? json.data : json;
+}
+
+function buildApiHeaders() {
+  const headers = { Accept: "application/json" };
+  try {
+    const token = window.localStorage.getItem("execution_api_token");
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+  } catch (err) {
+    console.warn("read execution api token failed", err);
+  }
+  return headers;
 }
 
 // ------------------------------------------------------------
@@ -764,6 +780,83 @@ function syntheticPlanForOpportunity(item) {
   return synthetic;
 }
 
+function findPlanByKey(planKey) {
+  const key = String(planKey || "");
+  if (!key) return null;
+
+  for (const collection of [state.allPlans, state.batchPlans, state.plans]) {
+    const found = (collection || []).find(
+      (item) => String(item?.plan_key || "") === key,
+    );
+    if (found) return found;
+  }
+  return null;
+}
+
+function executionExpectedPnl(item) {
+  const plan = findPlanByKey(item?.plan_key);
+  if (!plan) return null;
+  const pnl = Number(plan.net_expected_pnl);
+  return Number.isFinite(pnl) ? pnl : null;
+}
+
+function isExecutedExecutionItem(item) {
+  if (!item || !item.live_trading) return false;
+  const status = String(item.status || "").toLowerCase().trim();
+  return [
+    "opened",
+    "open_partial_failed",
+    "open_hedging",
+    "pending_close",
+    "closed",
+    "close_partial_failed",
+    "close_failed",
+    "close_hedging",
+  ].includes(status);
+}
+
+function sumExpectedPnl(items, valueGetter) {
+  return (items || []).reduce((total, item) => {
+    const value = Number(valueGetter(item));
+    return Number.isFinite(value) ? total + value : total;
+  }, 0);
+}
+
+function resolvePlanViewState() {
+  const selectedOpportunity = currentSelectedOpportunity(
+    state.opportunities || [],
+  );
+  let sourcePlans = state.batchPlans || [];
+  let emptyText = state.currentOpportunityBatchId
+    ? `当前机会批次（${state.currentOpportunityBatchId}）下没有可展示的执行计划。`
+    : "当前没有执行计划。";
+  let batchBanner = "";
+
+  if (state.planViewMode === "all") {
+    sourcePlans = state.allPlans || [];
+    emptyText = "当前没有可展示的历史/最新执行计划。";
+    batchBanner =
+      '<div class="plan-batch-banner">当前展示的是最新执行计划全集，不按机会批次过滤。</div>';
+  } else if (state.planViewMode === "related") {
+    sourcePlans = selectedOpportunity
+      ? matchingPlansForOpportunity(selectedOpportunity)
+      : [];
+    emptyText = selectedOpportunity
+      ? "当前选中机会没有可展示的真实执行计划。"
+      : "请先在左侧选择一条套利机会，再查看相关执行计划。";
+    batchBanner = `<div class="plan-batch-banner">当前展示的是“${selectedOpportunity?.symbol || "--"}”对应的真实执行计划；详情里的“仅展示估算仓位”不会出现在这里。</div>`;
+  } else if (state.currentOpportunityBatchId) {
+    batchBanner = `<div class="plan-batch-banner">当前执行计划已按机会批次对齐：<strong>${state.currentOpportunityBatchId}</strong></div>`;
+  }
+
+  return {
+    selectedOpportunity,
+    sourcePlans,
+    emptyText,
+    batchBanner,
+  };
+}
+
 // ------------------------------------------------------------
 // 执行计划 / 执行记录。
 // ------------------------------------------------------------
@@ -797,11 +890,62 @@ function compactStat(label, value, extraClass = "") {
   `;
 }
 
+function renderExecutionBoardSummary(visiblePlans) {
+  if (!els.executionBoardSummary) return;
+
+  const plans = Array.isArray(visiblePlans) ? visiblePlans : [];
+  const planTotalPnl = sumExpectedPnl(plans, (item) => item?.net_expected_pnl);
+  const executedItems = (state.executions || []).filter((item) =>
+    isExecutedExecutionItem(item),
+  );
+  const executionExpectedPnls = executedItems
+    .map((item) => executionExpectedPnl(item))
+    .filter((value) => Number.isFinite(value));
+  const executionTotalPnl = executionExpectedPnls.reduce(
+    (total, value) => total + value,
+    0,
+  );
+  const matchedExecutionCount = executionExpectedPnls.length;
+  const totalExpectedPnlText = executedItems.length
+    ? matchedExecutionCount
+      ? fmtMoney(executionTotalPnl)
+      : "--"
+    : fmtMoney(0);
+  const totalExpectedPnlClass = executedItems.length
+    ? matchedExecutionCount
+      ? classForNumber(executionTotalPnl)
+      : "muted-text"
+    : classForNumber(0);
+
+  els.executionBoardSummary.innerHTML = `
+    <div class="compact-stat-grid execution-board-summary-grid">
+      ${compactStat("当前计划数", String(plans.length))}
+      ${compactStat(
+        "当前计划预期收益",
+        fmtMoney(planTotalPnl),
+        classForNumber(planTotalPnl),
+      )}
+      ${compactStat("已执行计划数", String(executedItems.length))}
+      ${compactStat(
+        "总预期收益",
+        totalExpectedPnlText,
+        totalExpectedPnlClass,
+      )}
+    </div>
+    <div class="status-desc execution-board-summary-note">
+      总预期收益按 live execution 统计，仅累计已执行的
+      <code>opened / closing / closed / recovery</code> 记录；<code>pending_open</code>
+      与 <code>dry_run</code> 不计入。若 execution 对应的历史 plan 当前未加载，
+      该条记录不会被计入收益汇总。
+    </div>
+  `;
+}
+
 function planCompactMeta(item, linkedOpp) {
   const metrics = [
     compactStat("状态", item.status || "--"),
     compactStat(
-      "净收益",
+      "预期收益",
       fmtMoney(item.net_expected_pnl),
       classForNumber(item.net_expected_pnl),
     ),
@@ -858,6 +1002,7 @@ function renderCompactPlanCard(
 function renderCompactExecutionCard(item) {
   const openCount = item.open_order_count || 0;
   const closeCount = item.close_order_count || 0;
+  const expectedPnl = executionExpectedPnl(item);
   return `
     <div class="plan-card plan-card-compact">
       <div class="plan-head plan-head-compact">
@@ -876,6 +1021,11 @@ function renderCompactExecutionCard(item) {
         ${compactStat("开仓单", String(openCount))}
         ${compactStat("平仓单", String(closeCount))}
         ${compactStat("自动平仓", item.auto_close ? "YES" : "NO")}
+        ${compactStat(
+          "预期收益",
+          expectedPnl == null ? "--" : fmtMoney(expectedPnl),
+          expectedPnl == null ? "muted-text" : classForNumber(expectedPnl),
+        )}
       </div>
       ${item.last_error ? `<div class="status-desc compact-status-desc">${item.last_error}</div>` : ""}
       ${renderExecutionControls(item.plan_key, item.status)}
@@ -884,29 +1034,13 @@ function renderCompactExecutionCard(item) {
 }
 
 function renderPlans() {
-  const selectedOpportunity = currentSelectedOpportunity(
-    state.opportunities || [],
-  );
-  let sourcePlans = state.batchPlans || [];
-  let emptyText = state.currentOpportunityBatchId
-    ? `当前机会批次（${state.currentOpportunityBatchId}）下没有可展示的执行计划。`
-    : "当前没有执行计划。";
-  if (state.planViewMode === "all") {
-    sourcePlans = state.allPlans || [];
-    emptyText = "当前没有可展示的历史/最新执行计划。";
-  } else if (state.planViewMode === "related") {
-    sourcePlans = selectedOpportunity
-      ? matchingPlansForOpportunity(selectedOpportunity)
-      : [];
-    emptyText = selectedOpportunity
-      ? "当前选中机会没有可展示的真实执行计划。"
-      : "请先在左侧选择一条套利机会，再查看相关执行计划。";
-  }
+  const { sourcePlans, emptyText, batchBanner } = resolvePlanViewState();
 
   if (!sourcePlans.length) {
     els.plansEmpty.style.display = "block";
     els.plansEmpty.textContent = emptyText;
     els.plansList.innerHTML = "";
+    renderExecutionBoardSummary([]);
     return;
   }
 
@@ -922,15 +1056,6 @@ function renderPlans() {
   });
 
   els.plansEmpty.style.display = "none";
-  let batchBanner = "";
-  if (state.planViewMode === "batch" && state.currentOpportunityBatchId) {
-    batchBanner = `<div class="plan-batch-banner">当前执行计划已按机会批次对齐：<strong>${state.currentOpportunityBatchId}</strong></div>`;
-  } else if (state.planViewMode === "all") {
-    batchBanner =
-      '<div class="plan-batch-banner">当前展示的是最新执行计划全集，不按机会批次过滤。</div>';
-  } else if (state.planViewMode === "related") {
-    batchBanner = `<div class="plan-batch-banner">当前展示的是“${selectedOpportunity?.symbol || "--"}”对应的真实执行计划；详情里的“仅展示估算仓位”不会出现在这里。</div>`;
-  }
   els.plansList.innerHTML =
     batchBanner +
     sortedPlans
@@ -942,6 +1067,7 @@ function renderPlans() {
         }),
       )
       .join("");
+  renderExecutionBoardSummary(sortedPlans);
 }
 
 function renderExecutions() {

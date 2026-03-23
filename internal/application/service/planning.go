@@ -101,8 +101,16 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 			continue
 		}
 
-		longQty := roundDownStep(plan.TargetNotionalUSDT/plan.LongEntryPrice, longMeta.StepSize)
-		shortQty := roundDownStep(plan.TargetNotionalUSDT/plan.ShortEntryPrice, shortMeta.StepSize)
+		longQty, shortQty, longNotional, shortNotional, ok := computeCommonLegQuantities(
+			plan.TargetNotionalUSDT,
+			plan.LongEntryPrice,
+			plan.ShortEntryPrice,
+			longMeta.StepSize,
+			shortMeta.StepSize,
+		)
+		if !ok {
+			continue
+		}
 		plan.LongQty = round8(longQty)
 		plan.ShortQty = round8(shortQty)
 		if plan.LongQty <= 0 || plan.ShortQty <= 0 {
@@ -112,13 +120,14 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 			continue
 		}
 
-		longNotional := plan.LongQty * plan.LongEntryPrice
-		shortNotional := plan.ShortQty * plan.ShortEntryPrice
+		longNotional = plan.LongQty * plan.LongEntryPrice
+		shortNotional = plan.ShortQty * plan.ShortEntryPrice
 		roundedNotional := math.Min(longNotional, shortNotional)
 		plan.RoundedNotionalUSDT = round2(roundedNotional)
 		if longNotional < plan.LongMinNotionalUSDT || shortNotional < plan.ShortMinNotionalUSDT {
 			continue
 		}
+		r.applyScaledPlanEconomics(&plan, opp, roundedNotional)
 
 		plan.ReadyNow = now.UnixMilli() >= plan.EntryWindowOpenMs && now.UnixMilli() <= plan.EntryWindowCloseMs
 		switch {
@@ -225,3 +234,67 @@ func round2(v float64) float64 { return math.Round(v*100) / 100 }
 func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
 func round6(v float64) float64 { return math.Round(v*1_000_000) / 1_000_000 }
 func round8(v float64) float64 { return math.Round(v*100_000_000) / 1_000_000_00 }
+
+func computeCommonLegQuantities(targetNotionalUSDT, longPrice, shortPrice float64, longStepSize, shortStepSize string) (longQty, shortQty, longNotional, shortNotional float64, ok bool) {
+	if targetNotionalUSDT <= 0 || longPrice <= 0 || shortPrice <= 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	longQty = roundDownStep(targetNotionalUSDT/longPrice, longStepSize)
+	shortQty = roundDownStep(targetNotionalUSDT/shortPrice, shortStepSize)
+	if longQty <= 0 || shortQty <= 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	commonNotional := math.Min(longQty*longPrice, shortQty*shortPrice)
+	if commonNotional <= 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	longQty = roundDownStep(commonNotional/longPrice, longStepSize)
+	shortQty = roundDownStep(commonNotional/shortPrice, shortStepSize)
+	if longQty <= 0 || shortQty <= 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	longNotional = longQty * longPrice
+	shortNotional = shortQty * shortPrice
+	commonNotional = math.Min(longNotional, shortNotional)
+	if commonNotional <= 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	// 再做一轮以共同名义价值为锚的 round-down，尽量缩小双腿名义偏差。
+	longQty = roundDownStep(commonNotional/longPrice, longStepSize)
+	shortQty = roundDownStep(commonNotional/shortPrice, shortStepSize)
+	longNotional = longQty * longPrice
+	shortNotional = shortQty * shortPrice
+	return longQty, shortQty, longNotional, shortNotional, longQty > 0 && shortQty > 0
+}
+
+func (r *StrategyRunner) applyScaledPlanEconomics(plan *entity.ExecutionPlan, opp entity.Opportunity, actualNotional float64) {
+	if plan == nil || actualNotional <= 0 {
+		return
+	}
+
+	baseNotional := plan.TargetNotionalUSDT
+	if baseNotional <= 0 {
+		baseNotional = r.cfg.EffectiveNotional()
+	}
+	if baseNotional <= 0 {
+		return
+	}
+
+	scale := actualNotional / baseNotional
+	plan.FundingCarryPNL = round2(opp.GrossFundingPNL * scale)
+	plan.EntryFeePNL = round2(opp.EntryFeePNL * scale)
+	plan.ExitFeePNL = round2(opp.ExitFeePNL * scale)
+	plan.SlippagePNL = round2(actualNotional * (opp.EntryPenaltyBps + opp.ExitPenaltyBps) / 10000)
+	plan.SafetyBufferPNL = round2(r.cfg.SafetyBufferUSDT + actualNotional*opp.HedgePenaltyBps/10000)
+	plan.NetExpectedPNL = round2(plan.FundingCarryPNL - plan.EntryFeePNL - plan.ExitFeePNL - plan.SlippagePNL - plan.SafetyBufferPNL)
+	plan.NetExpectedPNLBps = 0
+	if actualNotional > 0 {
+		plan.NetExpectedPNLBps = round4(plan.NetExpectedPNL / actualNotional * 10000)
+	}
+	plan.Score = r.scoreOpportunity(plan.NetExpectedPNL, opp.GrossEdgeHourly, plan.CrossVenueBasisBps)
+}

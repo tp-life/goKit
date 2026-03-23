@@ -2,14 +2,12 @@ package persistence
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"strings"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 	"goKit/pkg/kit/db"
-
-	"gorm.io/gorm"
 )
 
 type OrderRepo struct {
@@ -43,15 +41,64 @@ func (r *OrderRepo) FindByExternalOrderID(ctx context.Context, exchangeName, cli
 		return nil, nil
 	}
 
-	var out entity.OrderRecord
-	err := query.Order("created_at desc").First(&out).Error
+	var items []entity.OrderRecord
+	err := query.Order("created_at desc").Find(&items).Error
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	return &out, nil
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	bestIndex := -1
+	bestScore := -1
+	ambiguous := false
+	for i := range items {
+		score, ok := externalOrderMatchScore(items[i], clientOrderID, venueOrderID)
+		if !ok {
+			continue
+		}
+		if score > bestScore {
+			bestIndex = i
+			bestScore = score
+			ambiguous = false
+			continue
+		}
+		if score == bestScore {
+			ambiguous = true
+		}
+	}
+	if bestIndex < 0 {
+		return nil, nil
+	}
+	if ambiguous {
+		return nil, fmt.Errorf("ambiguous external order reference for exchange=%s client_order_id=%s venue_order_id=%s", exchangeName, clientOrderID, venueOrderID)
+	}
+	return &items[bestIndex], nil
+}
+
+func externalOrderMatchScore(order entity.OrderRecord, clientOrderID, venueOrderID string) (int, bool) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	venueOrderID = strings.TrimSpace(venueOrderID)
+
+	score := 0
+	if clientOrderID != "" {
+		switch {
+		case strings.TrimSpace(order.ClientOrderID) == clientOrderID:
+			score += 10
+		case strings.TrimSpace(order.ClientOrderID) != "":
+			return 0, false
+		}
+	}
+	if venueOrderID != "" {
+		switch {
+		case strings.TrimSpace(order.VenueOrderID) == venueOrderID:
+			score += 10
+		case strings.TrimSpace(order.VenueOrderID) != "":
+			return 0, false
+		}
+	}
+	return score, score > 0
 }
 
 func (r *OrderRepo) ListByPlanKey(ctx context.Context, planKey string) ([]entity.OrderRecord, error) {

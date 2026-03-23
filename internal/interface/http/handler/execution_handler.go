@@ -47,6 +47,12 @@ func (h *ExecutionHandler) Open(c *fiber.Ctx) error {
 	}
 	item, err := h.svc.OpenByPlanKey(c.UserContext(), planKey)
 	if err != nil {
+		if errors.Is(err, service.ErrExecutionPlanNotFound) {
+			return response.ErrNotFound("未找到匹配的执行计划")
+		}
+		if errors.Is(err, service.ErrExecutionActionInFlight) {
+			return response.ErrConflict("该执行计划正在开仓处理中，请稍后刷新")
+		}
 		return response.ErrInternal(err, "执行开仓失败")
 	}
 	return response.Success(c, item)
@@ -59,6 +65,12 @@ func (h *ExecutionHandler) Close(c *fiber.Ctx) error {
 	}
 	item, err := h.svc.CloseByPlanKey(c.UserContext(), planKey)
 	if err != nil {
+		if errors.Is(err, service.ErrExecutionPlanNotFound) {
+			return response.ErrNotFound("未找到匹配的执行计划")
+		}
+		if errors.Is(err, service.ErrExecutionActionInFlight) {
+			return response.ErrConflict("该执行计划正在平仓处理中，请稍后刷新")
+		}
 		return response.ErrInternal(err, "执行平仓失败")
 	}
 	return response.Success(c, item)

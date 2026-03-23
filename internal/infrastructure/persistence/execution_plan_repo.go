@@ -2,11 +2,13 @@ package persistence
 
 import (
 	"context"
+	"errors"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 	"goKit/pkg/kit/db"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -36,6 +38,8 @@ func (r *ExecutionPlanRepo) SaveBatch(ctx context.Context, batchID, opportunityB
 				"long_entry_price", "short_entry_price", "long_qty", "short_qty", "long_min_qty",
 				"short_min_qty", "long_min_notional_usdt", "short_min_notional_usdt", "cross_venue_basis_bps",
 				"funding_carry_pnl", "entry_fee_pnl", "exit_fee_pnl", "slippage_pnl", "safety_buffer_pnl",
+				"entry_penalty_bps", "exit_penalty_bps", "hedge_penalty_bps", "execution_penalty_bps",
+				"execution_penalty_model", "execution_penalty_bucket",
 				"net_expected_pnl", "net_expected_pnl_bps", "score", "earliest_funding_time_ms",
 				"latest_funding_time_ms", "projected_funding_time_ms", "required_entry_by_funding_time_ms",
 				"long_funding_event_count", "short_funding_event_count", "funding_window_hours", "funding_computation_mode",
@@ -88,6 +92,9 @@ func (r *ExecutionPlanRepo) ListByOpportunityBatch(ctx context.Context, opportun
 func (r *ExecutionPlanRepo) FindByPlanKey(ctx context.Context, planKey string) (*entity.ExecutionPlan, error) {
 	var out entity.ExecutionPlan
 	if err := r.client.GetDB(ctx).Where("plan_key = ?", planKey).Order("created_at desc").First(&out).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &out, nil

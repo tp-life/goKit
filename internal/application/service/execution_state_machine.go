@@ -224,6 +224,20 @@ func shouldShortCircuitExecutionAction(status, phase string) bool {
 	}
 }
 
+func isExecutionActionPending(status, phase string) bool {
+	status = normalizeExecutionStatus(status)
+	phase = normalizeExecutionStatus(phase)
+
+	switch phase {
+	case openExecutionPolicy.phase:
+		return status == executionStatePendingOpen
+	case closeExecutionPolicy.phase:
+		return status == executionStatePendingClose
+	default:
+		return false
+	}
+}
+
 // canStartExecutionAction 明确回答：
 // “当前 execution status 是否允许进入某个新动作（open / close）？”
 //
@@ -414,7 +428,7 @@ func summarizeExecutionStatusWithPolicy(results []entity.OrderRecord, policy exe
 			hasErr = true
 			continue
 		}
-		if isSuccessfulOrderStatus(item.Status, item.ExecutedQty) {
+		if isOrderFullySatisfied(item) {
 			successPrimary++
 			continue
 		}

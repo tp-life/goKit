@@ -13,6 +13,8 @@ web:
   app_name: "Funding Arbitrage Monitor"
   # Fiber prefork 开关（多进程模式，通常本地开发保持 false）。
   prefork: false
+  # 保护开平仓 / 订单事件注入接口的 Bearer Token 环境变量名。
+  execution_api_token_env: "EXECUTION_API_TOKEN"
 
 rpc:
   # gRPC 服务监听地址。

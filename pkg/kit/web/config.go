@@ -1,7 +1,8 @@
 package web
 
 type Config struct {
-	Port    string `mapstructure:"port"`
-	AppName string `mapstructure:"app_name"`
-	Prefork bool   `mapstructure:"prefork"`
+	Port                 string `mapstructure:"port"`
+	AppName              string `mapstructure:"app_name"`
+	Prefork              bool   `mapstructure:"prefork"`
+	ExecutionAPITokenEnv string `mapstructure:"execution_api_token_env"`
 }

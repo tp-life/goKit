@@ -19,6 +19,7 @@ type testOrderRepo struct {
 }
 
 type testExecRepo struct {
+	mu    sync.Mutex
 	items []entity.ExecutionRecord
 }
 
@@ -26,17 +27,72 @@ func (r *testExecRepo) Upsert(_ context.Context, item *entity.ExecutionRecord) e
 	if item == nil {
 		return nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for i := range r.items {
 		if r.items[i].PlanKey == item.PlanKey {
+			if item.ID == 0 {
+				item.ID = r.items[i].ID
+			}
 			r.items[i] = *item
 			return nil
 		}
+	}
+	if item.ID == 0 {
+		item.ID = uint(len(r.items) + 1)
 	}
 	r.items = append(r.items, *item)
 	return nil
 }
 
+func (r *testExecRepo) TryClaimAction(_ context.Context, item *entity.ExecutionRecord, allowedCurrentStatuses []string) (*entity.ExecutionRecord, bool, error) {
+	if item == nil {
+		return nil, false, fmt.Errorf("nil execution record")
+	}
+	allowed := make(map[string]struct{}, len(allowedCurrentStatuses))
+	for _, status := range allowedCurrentStatuses {
+		allowed[normalizeExecutionStatus(status)] = struct{}{}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i := range r.items {
+		if r.items[i].PlanKey != item.PlanKey {
+			continue
+		}
+		current := r.items[i]
+		if _, ok := allowed[normalizeExecutionStatus(current.Status)]; !ok {
+			cp := current
+			return &cp, false, nil
+		}
+		updated := *item
+		if updated.ID == 0 {
+			updated.ID = current.ID
+		}
+		if updated.ID == 0 {
+			updated.ID = uint(i + 1)
+		}
+		r.items[i] = updated
+		cp := r.items[i]
+		return &cp, true, nil
+	}
+
+	if _, ok := allowed[""]; !ok {
+		return nil, false, nil
+	}
+	inserted := *item
+	if inserted.ID == 0 {
+		inserted.ID = uint(len(r.items) + 1)
+	}
+	r.items = append(r.items, inserted)
+	cp := inserted
+	return &cp, true, nil
+}
+
 func (r *testExecRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for i := range r.items {
 		if r.items[i].PlanKey == planKey {
 			cp := r.items[i]
@@ -47,6 +103,8 @@ func (r *testExecRepo) FindByPlanKey(_ context.Context, planKey string) (*entity
 }
 
 func (r *testExecRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return append([]entity.ExecutionRecord(nil), r.items...), nil
 }
 
@@ -432,6 +490,57 @@ func TestPlacePlanOrders_TimeoutLegWithoutReconcileTriggersHedge(t *testing.T) {
 	}
 	if got := summarizeExecutionStatus(results, "open"); got != executionStateOpenHedging {
 		t.Fatalf("expected open_hedging status after unresolved timeout, got %s", got)
+	}
+}
+
+func TestPlacePlanOrders_PartialFillTriggersHedgeForAllExposedLegs(t *testing.T) {
+	store := NewMarketStore()
+	store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
+	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
+
+	longAdapter := &testTradeAdapter{
+		name:        "longex",
+		enabled:     true,
+		account:     exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus: exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, Terminal: true},
+	}
+	shortAdapter := &testTradeAdapter{
+		name:        "shortex",
+		enabled:     true,
+		account:     exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus: exchange.OrderStatus{Status: "PARTIALLY_FILLED", ExecutedQty: 0.4, Terminal: false},
+	}
+
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.store = store
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-partial-fill-hedge",
+		Symbol:           "BTCUSDT",
+		LongExchange:     "longex",
+		ShortExchange:    "shortex",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          1,
+		ShortQty:         1,
+		LongEntryPrice:   101,
+		ShortEntryPrice:  102,
+		EntryMode:        "taker",
+	}
+
+	results, errMsg := svc.placePlanOrders(context.Background(), plan, "open", "manual")
+	if errMsg == "" {
+		t.Fatal("expected partial fill to surface as aggregated error")
+	}
+	if got := summarizeExecutionStatus(results, "open"); got != executionStateOpenHedging {
+		t.Fatalf("expected open_hedging status, got %s", got)
+	}
+	if len(longAdapter.closed) != 1 {
+		t.Fatalf("expected long leg exposure to be hedged, got %d hedge orders", len(longAdapter.closed))
+	}
+	if len(shortAdapter.closed) != 1 {
+		t.Fatalf("expected partially filled short leg exposure to be hedged, got %d hedge orders", len(shortAdapter.closed))
 	}
 }
 
@@ -1219,6 +1328,133 @@ func TestOpenPlan_RevalidatesCurrentOpportunityBeforeLiveOpen(t *testing.T) {
 	}
 	if len(longAdapter.placed) != 0 || len(shortAdapter.placed) != 0 {
 		t.Fatalf("expected revalidation failure to block all live orders, got long=%d short=%d", len(longAdapter.placed), len(shortAdapter.placed))
+	}
+}
+
+func TestOpenPlan_ReturnsInFlightErrorWhenClaimAlreadyHeld(t *testing.T) {
+	now := time.Now().UTC()
+	release := make(chan struct{})
+	started := make(chan string, 2)
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{}
+	longAdapter := &testTradeAdapter{
+		name:         "longex",
+		enabled:      true,
+		account:      exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus:  exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, Terminal: true},
+		placeStarted: started,
+		placeBlock:   release,
+	}
+	shortAdapter := &testTradeAdapter{
+		name:         "shortex",
+		enabled:      true,
+		account:      exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus:  exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, Terminal: true},
+		placeStarted: started,
+		placeBlock:   release,
+	}
+
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.execRepo = execRepo
+	svc.cfg.MinNetPNL = 0.1
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10", FundingIntervalHours: 8})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10", FundingIntervalHours: 8})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 99.9, AskPrice: 100, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.1, AskPrice: 100.2, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "longex",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          -0.0020,
+		FundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "shortex",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          0.0020,
+		FundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-claim-guard",
+		Symbol:           "BTC",
+		LongExchange:     "longex",
+		ShortExchange:    "shortex",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          1,
+		ShortQty:         1,
+		LongEntryPrice:   100,
+		ShortEntryPrice:  100.1,
+		EntryMode:        "taker",
+		ExitMode:         "taker",
+	}
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		_, err := svc.openPlan(context.Background(), plan, "manual", true)
+		firstErrCh <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatal("expected first openPlan call to reach primary leg placement")
+		}
+	}
+
+	rec, err := svc.openPlan(context.Background(), plan, "manual", true)
+	if !errors.Is(err, ErrExecutionActionInFlight) {
+		t.Fatalf("expected ErrExecutionActionInFlight, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected second openPlan call to return current execution record")
+	}
+	if rec.Status != executionStatePendingOpen {
+		t.Fatalf("expected in-flight record to stay pending_open, got %s", rec.Status)
+	}
+
+	close(release)
+
+	if err := <-firstErrCh; err != nil {
+		t.Fatalf("expected first openPlan call to finish successfully, got %v", err)
+	}
+	if len(longAdapter.placed) != 1 || len(shortAdapter.placed) != 1 {
+		t.Fatalf("expected only one live order per leg, got long=%d short=%d", len(longAdapter.placed), len(shortAdapter.placed))
+	}
+}
+
+func TestOpenByPlanKey_MissingPlanReturnsNotFound(t *testing.T) {
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
+	svc.planRepo = &testPlanRepo{}
+	svc.execRepo = &testExecRepo{}
+
+	rec, err := svc.OpenByPlanKey(context.Background(), "missing-plan")
+	if !errors.Is(err, ErrExecutionPlanNotFound) {
+		t.Fatalf("expected ErrExecutionPlanNotFound, got %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected no execution record for missing plan, got %#v", rec)
+	}
+}
+
+func TestCloseByPlanKey_MissingPlanReturnsNotFound(t *testing.T) {
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
+	svc.planRepo = &testPlanRepo{}
+	svc.execRepo = &testExecRepo{}
+
+	rec, err := svc.CloseByPlanKey(context.Background(), "missing-plan")
+	if !errors.Is(err, ErrExecutionPlanNotFound) {
+		t.Fatalf("expected ErrExecutionPlanNotFound, got %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected no execution record for missing plan, got %#v", rec)
 	}
 }
 

@@ -6,6 +6,7 @@ const (
 	CodeSuccess        = 0
 	CodeParamError     = 40000
 	CodeUnauthorized   = 40100
+	CodeConflict       = 40900
 	CodeForbidden      = 40300
 	CodeNotFound       = 40400
 	CodeInternalServer = 50000
@@ -27,6 +28,20 @@ func (e *AppError) Error() string {
 
 func ErrBadRequest(msg string) *AppError {
 	return &AppError{HTTPCode: 400, BusinessCode: CodeParamError, Message: msg}
+}
+
+func ErrUnauthorized(msg string) *AppError {
+	if msg == "" {
+		msg = "unauthorized"
+	}
+	return &AppError{HTTPCode: 401, BusinessCode: CodeUnauthorized, Message: msg}
+}
+
+func ErrConflict(msg string) *AppError {
+	if msg == "" {
+		msg = "request conflict"
+	}
+	return &AppError{HTTPCode: 409, BusinessCode: CodeConflict, Message: msg}
 }
 
 func ErrNotFound(msg string) *AppError {

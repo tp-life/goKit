@@ -122,6 +122,7 @@ func (s *MarketStore) UpsertFunding(item entity.FundingSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ex := strings.ToLower(item.Exchange)
+	item.Symbol = strings.ToUpper(strings.TrimSpace(item.Symbol))
 	if s.funding[ex] == nil {
 		s.funding[ex] = make(map[string]entity.FundingSnapshot)
 	}
@@ -135,7 +136,9 @@ func (s *MarketStore) UpsertFunding(item entity.FundingSnapshot) {
 			}
 		}
 	}
-	s.funding[ex][item.Symbol] = item
+	if prev, ok := s.funding[ex][item.Symbol]; !ok || shouldReplaceFundingSnapshot(prev, item) {
+		s.funding[ex][item.Symbol] = item
+	}
 	status := s.statuses[ex]
 	status.Exchange = ex
 	status.MarkPriceConnected = true
@@ -148,6 +151,7 @@ func (s *MarketStore) UpsertBookTop(item entity.BookTopSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ex := strings.ToLower(item.Exchange)
+	item.Symbol = strings.ToUpper(strings.TrimSpace(item.Symbol))
 	if s.bookTop[ex] == nil {
 		s.bookTop[ex] = make(map[string]entity.BookTopSnapshot)
 	}
@@ -156,7 +160,9 @@ func (s *MarketStore) UpsertBookTop(item entity.BookTopSnapshot) {
 			item.VenueSymbol = meta.VenueSymbol
 		}
 	}
-	s.bookTop[ex][item.Symbol] = item
+	if prev, ok := s.bookTop[ex][item.Symbol]; !ok || shouldReplaceBookTopSnapshot(prev, item) {
+		s.bookTop[ex][item.Symbol] = item
+	}
 	status := s.statuses[ex]
 	status.Exchange = ex
 	status.BookTickerConnected = true
@@ -182,10 +188,10 @@ func (s *MarketStore) UpdateStatus(status exchange.ConnectorStatus) {
 	if status.BookTickerConnected {
 		cur.BookTickerConnected = true
 	}
-	if !status.LastMarketEventAt.IsZero() {
+	if !status.LastMarketEventAt.IsZero() && (cur.LastMarketEventAt.IsZero() || status.LastMarketEventAt.After(cur.LastMarketEventAt)) {
 		cur.LastMarketEventAt = status.LastMarketEventAt
 	}
-	if !status.LastBookEventAt.IsZero() {
+	if !status.LastBookEventAt.IsZero() && (cur.LastBookEventAt.IsZero() || status.LastBookEventAt.After(cur.LastBookEventAt)) {
 		cur.LastBookEventAt = status.LastBookEventAt
 	}
 	s.statuses[ex] = cur
@@ -284,4 +290,23 @@ func (s *MarketStore) Statuses() []exchange.ConnectorStatus {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Exchange < out[j].Exchange })
 	return out
+}
+
+func shouldReplaceFundingSnapshot(prev, curr entity.FundingSnapshot) bool {
+	return shouldReplaceTimedSnapshot(prev.EventTimeMs, curr.EventTimeMs)
+}
+
+func shouldReplaceBookTopSnapshot(prev, curr entity.BookTopSnapshot) bool {
+	return shouldReplaceTimedSnapshot(prev.EventTimeMs, curr.EventTimeMs)
+}
+
+func shouldReplaceTimedSnapshot(prevEventTimeMs, currEventTimeMs int64) bool {
+	switch {
+	case prevEventTimeMs <= 0:
+		return true
+	case currEventTimeMs <= 0:
+		return false
+	default:
+		return currEventTimeMs >= prevEventTimeMs
+	}
 }

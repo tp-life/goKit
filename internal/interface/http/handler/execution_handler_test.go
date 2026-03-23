@@ -26,7 +26,9 @@ type executionHandlerTestExecRepo struct {
 	items []entity.ExecutionRecord
 }
 
-type executionHandlerTestPlanRepo struct{}
+type executionHandlerTestPlanRepo struct {
+	items []entity.ExecutionPlan
+}
 
 func (r *executionHandlerTestOrderRepo) Create(_ context.Context, item *entity.OrderRecord) error {
 	if item != nil {
@@ -97,6 +99,41 @@ func (r *executionHandlerTestExecRepo) Upsert(_ context.Context, item *entity.Ex
 	return nil
 }
 
+func (r *executionHandlerTestExecRepo) TryClaimAction(_ context.Context, item *entity.ExecutionRecord, allowedCurrentStatuses []string) (*entity.ExecutionRecord, bool, error) {
+	if item == nil {
+		return nil, false, nil
+	}
+	allowed := make(map[string]struct{}, len(allowedCurrentStatuses))
+	for _, status := range allowedCurrentStatuses {
+		allowed[strings.ToLower(strings.TrimSpace(status))] = struct{}{}
+	}
+	for i := range r.items {
+		if r.items[i].PlanKey != item.PlanKey {
+			continue
+		}
+		current := r.items[i]
+		if _, ok := allowed[strings.ToLower(strings.TrimSpace(current.Status))]; !ok {
+			cp := current
+			return &cp, false, nil
+		}
+		if item.ID == 0 {
+			item.ID = current.ID
+		}
+		r.items[i] = *item
+		cp := r.items[i]
+		return &cp, true, nil
+	}
+	if _, ok := allowed[""]; !ok {
+		return nil, false, nil
+	}
+	if item.ID == 0 {
+		item.ID = uint(len(r.items) + 1)
+	}
+	r.items = append(r.items, *item)
+	cp := r.items[len(r.items)-1]
+	return &cp, true, nil
+}
+
 func (r *executionHandlerTestExecRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionRecord, error) {
 	for i := range r.items {
 		if r.items[i].PlanKey == planKey {
@@ -111,29 +148,38 @@ func (r *executionHandlerTestExecRepo) ListLatest(_ context.Context, _ int) ([]e
 	return append([]entity.ExecutionRecord(nil), r.items...), nil
 }
 
-func (executionHandlerTestPlanRepo) SaveBatch(context.Context, string, string, []entity.ExecutionPlan) error {
+func (*executionHandlerTestPlanRepo) SaveBatch(context.Context, string, string, []entity.ExecutionPlan) error {
 	return nil
 }
 
-func (executionHandlerTestPlanRepo) ListLatest(context.Context, int) ([]entity.ExecutionPlan, error) {
+func (*executionHandlerTestPlanRepo) ListLatest(context.Context, int) ([]entity.ExecutionPlan, error) {
 	return nil, nil
 }
 
-func (executionHandlerTestPlanRepo) ListByOpportunityBatch(context.Context, string, int) ([]entity.ExecutionPlan, error) {
+func (*executionHandlerTestPlanRepo) ListByOpportunityBatch(context.Context, string, int) ([]entity.ExecutionPlan, error) {
 	return nil, nil
 }
 
-func (executionHandlerTestPlanRepo) FindByPlanKey(context.Context, string) (*entity.ExecutionPlan, error) {
+func (r *executionHandlerTestPlanRepo) FindByPlanKey(_ context.Context, planKey string) (*entity.ExecutionPlan, error) {
+	for i := range r.items {
+		if r.items[i].PlanKey == planKey {
+			cp := r.items[i]
+			return &cp, nil
+		}
+	}
 	return nil, nil
 }
 
-func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRepo *executionHandlerTestExecRepo) *fiber.App {
+func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRepo *executionHandlerTestExecRepo, planRepo *executionHandlerTestPlanRepo) *fiber.App {
+	if planRepo == nil {
+		planRepo = &executionHandlerTestPlanRepo{}
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.NewExecutionService(service.ExecutionServiceParams{
 		Cfg:       service.Config{},
 		Logger:    logger,
 		Store:     service.NewMarketStore(),
-		PlanRepo:  executionHandlerTestPlanRepo{},
+		PlanRepo:  planRepo,
 		ExecRepo:  execRepo,
 		OrderRepo: orderRepo,
 		Trades:    []exchange.TradeAdapter{},
@@ -141,6 +187,8 @@ func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRe
 
 	app := fiber.New()
 	app.Use(middleware.ErrorHandler(logger))
+	app.Post("/api/v1/executions/:planKey/open", NewExecutionHandler(svc).Open)
+	app.Post("/api/v1/executions/:planKey/close", NewExecutionHandler(svc).Close)
 	app.Post("/api/v1/executions/events/order", NewExecutionHandler(svc).InjectOrderEvent)
 	return app
 }
@@ -163,7 +211,7 @@ func TestInjectOrderEvent_AcceptsSnakeCaseJSON(t *testing.T) {
 			Status:  "pending_open",
 		}},
 	}
-	app := newExecutionHandlerTestApp(orderRepo, execRepo)
+	app := newExecutionHandlerTestApp(orderRepo, execRepo, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/events/order", strings.NewReader(`{
 		"source":"debug_http",
@@ -209,7 +257,7 @@ func TestInjectOrderEvent_AcceptsSnakeCaseJSON(t *testing.T) {
 }
 
 func TestInjectOrderEvent_NotFoundReturns404(t *testing.T) {
-	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, &executionHandlerTestExecRepo{})
+	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, &executionHandlerTestExecRepo{}, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/events/order", strings.NewReader(`{
 		"exchange":"binance",
@@ -234,5 +282,93 @@ func TestInjectOrderEvent_NotFoundReturns404(t *testing.T) {
 	}
 	if code, _ := body["code"].(float64); code != 40400 {
 		t.Fatalf("expected not found business code 40400, got %v", body["code"])
+	}
+}
+
+func TestOpen_MissingPlanReturns404(t *testing.T) {
+	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, &executionHandlerTestExecRepo{}, &executionHandlerTestPlanRepo{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/missing-plan/open", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestClose_MissingPlanReturns404(t *testing.T) {
+	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, &executionHandlerTestExecRepo{}, &executionHandlerTestPlanRepo{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/missing-plan/close", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestOpen_InFlightExecutionReturns409(t *testing.T) {
+	app := newExecutionHandlerTestApp(
+		&executionHandlerTestOrderRepo{},
+		&executionHandlerTestExecRepo{
+			items: []entity.ExecutionRecord{{
+				PlanKey: "plan-pending-open",
+				Status:  "pending_open",
+			}},
+		},
+		&executionHandlerTestPlanRepo{
+			items: []entity.ExecutionPlan{{
+				PlanKey: "plan-pending-open",
+				Symbol:  "BTC",
+			}},
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/plan-pending-open/open", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d", resp.StatusCode)
+	}
+}
+
+func TestClose_InFlightExecutionReturns409(t *testing.T) {
+	app := newExecutionHandlerTestApp(
+		&executionHandlerTestOrderRepo{},
+		&executionHandlerTestExecRepo{
+			items: []entity.ExecutionRecord{{
+				PlanKey: "plan-pending-close",
+				Status:  "pending_close",
+			}},
+		},
+		&executionHandlerTestPlanRepo{
+			items: []entity.ExecutionPlan{{
+				PlanKey: "plan-pending-close",
+				Symbol:  "BTC",
+			}},
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/plan-pending-close/close", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d", resp.StatusCode)
 	}
 }
