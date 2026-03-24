@@ -136,6 +136,17 @@ function fmtTime(value) {
   return new Date(n).toLocaleString("zh-CN", { hour12: false });
 }
 
+function parseTimeMs(value) {
+  if (value == null) return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const numeric = Number(text);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function fmtDuration(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n)) return "--";
@@ -150,6 +161,23 @@ function fmtDuration(ms) {
   if (hours || days) chunks.push(`${hours}小时`);
   chunks.push(`${mins}分钟`);
   return chunks.join(" ");
+}
+
+function fmtSpan(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return "--";
+  if (n <= 0) return "0秒";
+
+  const totalSeconds = Math.round(n / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+
+  if (days > 0) return `${days}天 ${hours}小时`;
+  if (hours > 0) return `${hours}小时 ${mins}分钟`;
+  if (mins > 0) return `${mins}分钟 ${secs}秒`;
+  return `${secs}秒`;
 }
 
 function priceText(value) {
@@ -296,6 +324,11 @@ function holdingDurationText(item) {
     return fmtDuration(totalMinutes * 60 * 1000);
   }
   return "--";
+}
+
+function opportunityProducedTimeMs(item) {
+  if (!item || typeof item !== "object") return 0;
+  return parseTimeMs(item.as_of_time_ms) || parseTimeMs(item.created_at);
 }
 
 function fundingIntervalText(hours) {
@@ -496,7 +529,7 @@ function opportunityPlanStatus(item) {
     return {
       text: "已生成计划",
       cls: "warn",
-      reason: `planKey=${plan.plan_key} · status=${plan.status || "--"}`,
+      reason: `planKey=${plan.plan_key} · 状态=${explainStatus(plan.status)}`,
     };
   }
   if (item.eligible_for_execution) {
@@ -532,6 +565,34 @@ function explainStatus(status) {
       return "尚未进入开仓窗口";
     case "settlement_window_passed":
       return "最近结算点已过";
+    case "pending_open":
+      return "开仓进行中";
+    case "opened":
+      return "已开仓";
+    case "open_partial_failed":
+      return "开仓部分失败";
+    case "open_failed":
+      return "开仓失败";
+    case "open_hedging":
+      return "开仓对冲中";
+    case "risk_blocked":
+      return "风控阻断";
+    case "circuit_open":
+      return "交易熔断";
+    case "pending_close":
+      return "平仓进行中";
+    case "closed":
+      return "已平仓";
+    case "close_partial_failed":
+      return "平仓部分失败";
+    case "close_failed":
+      return "平仓失败";
+    case "close_hedging":
+      return "平仓对冲中";
+    case "dry_run_opened":
+      return "模拟已开仓";
+    case "dry_run_closed":
+      return "模拟已平仓";
     default:
       return status || "--";
   }
@@ -800,6 +861,48 @@ function executionExpectedPnl(item) {
   return Number.isFinite(pnl) ? pnl : null;
 }
 
+function planExpectedHoldText(item) {
+  const targetCloseMs = Number(item?.target_close_time_ms ?? 0);
+  const entryOpenMs = Number(item?.entry_window_open_ms ?? 0);
+  const entryCloseMs = Number(item?.entry_window_close_ms ?? 0);
+  if (!Number.isFinite(targetCloseMs) || targetCloseMs <= 0) return "--";
+
+  const shortestHoldMs =
+    Number.isFinite(entryCloseMs) && entryCloseMs > 0
+      ? targetCloseMs - entryCloseMs
+      : 0;
+  const longestHoldMs =
+    Number.isFinite(entryOpenMs) && entryOpenMs > 0
+      ? targetCloseMs - entryOpenMs
+      : 0;
+
+  if (shortestHoldMs > 0 && longestHoldMs > 0) {
+    if (Math.abs(longestHoldMs - shortestHoldMs) < 1000) {
+      return fmtSpan(longestHoldMs);
+    }
+    return `${fmtSpan(shortestHoldMs)} - ${fmtSpan(longestHoldMs)}`;
+  }
+  if (shortestHoldMs > 0) return fmtSpan(shortestHoldMs);
+  if (longestHoldMs > 0) return fmtSpan(longestHoldMs);
+  return "--";
+}
+
+function executionPlannedHoldText(item) {
+  const openedAtMs = Number(item?.opened_at_ms ?? 0);
+  const targetCloseMs = Number(item?.target_close_time_ms ?? 0);
+  if (
+    Number.isFinite(openedAtMs) &&
+    openedAtMs > 0 &&
+    Number.isFinite(targetCloseMs) &&
+    targetCloseMs > openedAtMs
+  ) {
+    return fmtSpan(targetCloseMs - openedAtMs);
+  }
+
+  const plan = findPlanByKey(item?.plan_key);
+  return planExpectedHoldText(plan);
+}
+
 function isExecutedExecutionItem(item) {
   if (!item || !item.live_trading) return false;
   const status = String(item.status || "").toLowerCase().trim();
@@ -955,10 +1058,12 @@ function planCompactMeta(item, linkedOpp) {
       `${fmtNumber(planLongLeverage(item), 2)}x / ${fmtNumber(planShortLeverage(item), 2)}x`,
     ),
     compactStat("Funding", fundingEventsText(item)),
+    compactStat("预计持仓", planExpectedHoldText(item)),
     compactStat(
       "兑现",
       fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms),
     ),
+    compactStat("最晚平仓", fmtTime(item.target_close_time_ms)),
     compactStat(
       "关联机会",
       linkedOpp ? "已关联" : "--",
@@ -1011,13 +1116,15 @@ function renderCompactExecutionCard(item) {
           <div class="plan-sub">${item.plan_key}</div>
         </div>
         <div class="plan-head-right">
-          <span class="pill ${String(item.status || "").includes("closed") ? "warn" : "good"}">${item.status || "--"}</span>
+          <span class="pill ${String(item.status || "").includes("closed") ? "warn" : "good"}">${explainStatus(item.status)}</span>
           <div class="plan-pnl">${item.live_trading ? "LIVE" : "DRY"}</div>
         </div>
       </div>
       <div class="compact-stat-grid">
         ${compactStat("开仓时间", fmtTime(item.opened_at_ms))}
         ${compactStat("平仓时间", fmtTime(item.closed_at_ms))}
+        ${compactStat("计划持仓", executionPlannedHoldText(item))}
+        ${compactStat("最晚平仓", fmtTime(item.target_close_time_ms))}
         ${compactStat("开仓单", String(openCount))}
         ${compactStat("平仓单", String(closeCount))}
         ${compactStat("自动平仓", item.auto_close ? "YES" : "NO")}
@@ -1165,6 +1272,7 @@ function renderOpportunitySummary(items) {
         ${summaryMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${summaryMetric("进入计划说明", planStatus.reason || "--")}
         ${summaryMetric("建议持有时长", holdingDurationText(item))}
+        ${summaryMetric("产生时间", fmtTime(opportunityProducedTimeMs(item)))}
       </div>
     </div>
   `;
@@ -1192,6 +1300,7 @@ function renderOpportunityList(items) {
             <div><span>事件化时均 edge</span><strong>${fmtPctRatio(fundingSpreadHourly(item), 5)}</strong></div>
             <div><span>最早结算</span><strong>${fmtDuration(earliestDelta)}</strong></div>
             <div><span>建议持有</span><strong>${holdingDurationText(item)}</strong></div>
+            <div><span>产生时间</span><strong>${fmtTime(opportunityProducedTimeMs(item))}</strong></div>
           </div>
           <div class="opportunity-foot dual-pill">
             <span class="pill ${planStatus.cls}">${planStatus.text}</span>
@@ -1374,6 +1483,7 @@ function renderOpportunityDetail(items) {
         ${detailMetric("最晚入场时间", fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms))}
         ${detailMetric("Funding 事件窗口", `${fmtNumber(item.funding_window_hours || 0, 2)} h`)}
         ${detailMetric("建议持有时长", holdingDurationText(item))}
+        ${detailMetric("产生时间", fmtTime(opportunityProducedTimeMs(item)))}
         ${detailMetric("Funding 事件次数", fundingEventsText(item))}
         ${detailMetric("估算模式", fundingEstimateModeText(item))}
         ${detailMetric("估算置信度", fundingEstimateConfidenceText(item))}
@@ -1452,6 +1562,7 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">计划状态</span><span class="detail-v">${matchedPlan?.status || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">Funding 计算模式</span><span class="detail-v">${fundingModeText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">当前机会批次</span><span class="detail-v">${state.currentOpportunityBatchId || item.batch_id || "--"}</span></div>
+            <div class="detail-item"><span class="detail-k">机会产生时间</span><span class="detail-v">${fmtTime(opportunityProducedTimeMs(item))}</span></div>
             <div class="detail-item"><span class="detail-k">计划关联批次</span><span class="detail-v">${matchedPlan?.opportunity_batch_id || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">Long 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planLongNotional(matchedPlan), 2) : "--"}</span></div>
             <div class="detail-item"><span class="detail-k">Short 仓位名义</span><span class="detail-v">${matchedPlan ? fmtMoney(planShortNotional(matchedPlan), 2) : "--"}</span></div>
@@ -1559,11 +1670,13 @@ async function refreshAll() {
     : "";
 
   // 只请求“当前机会批次”对应的 plans，避免 plans 和 opportunities 不是同一批。
-  const plansPath = currentBatchId
-    ? `/api/v1/plans?limit=100&opportunity_batch_id=${encodeURIComponent(currentBatchId)}`
-    : `/api/v1/plans?limit=100`;
   const [plans, allPlans] = await Promise.all([
-    apiGet(plansPath, []),
+    currentBatchId
+      ? apiGet(
+          `/api/v1/plans?limit=100&opportunity_batch_id=${encodeURIComponent(currentBatchId)}`,
+          [],
+        )
+      : Promise.resolve([]),
     apiGet("/api/v1/plans?limit=100", []),
   ]);
 

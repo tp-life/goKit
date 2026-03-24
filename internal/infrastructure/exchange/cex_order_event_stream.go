@@ -272,24 +272,20 @@ func sleepContext(ctx context.Context, wait time.Duration) bool {
 // 它和 signedDo 的边界不同，故意单独拆开，避免把“签名交易请求”和“用户流管理请求”
 // 混成一套 helper，降低后续维护时的心智负担。
 func (c *CEXTradeClient) apiKeyRequest(ctx context.Context, method, path string, out any) (string, error) {
-	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-MBX-APIKEY", c.apiKey)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
+	resp, body, err := c.performAPIKeyRequest(ctx, method, path)
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
+		if c.logger != nil {
+			c.logger.Warn("cex_api_key_request_failed",
+				"exchange", c.name,
+				"path", path,
+				"method", method,
+				"status_code", resp.StatusCode,
+				"response_body", string(body),
+			)
+		}
 		return string(body), fmt.Errorf("%s api-key request failed status=%d body=%s", c.name, resp.StatusCode, string(body))
 	}
 	if out != nil {
@@ -298,4 +294,23 @@ func (c *CEXTradeClient) apiKeyRequest(ctx context.Context, method, path string,
 		}
 	}
 	return string(body), nil
+}
+
+func (c *CEXTradeClient) performAPIKeyRequest(ctx context.Context, method, path string) (*http.Response, []byte, error) {
+	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("X-MBX-APIKEY", c.apiKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	return resp, body, nil
 }

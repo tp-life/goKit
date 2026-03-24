@@ -262,7 +262,7 @@ func projectFundingCarryFromCurrentSnapshots(cfg Config, now time.Time, longFund
 		EffectiveCapRate:   shortFunding.FundingRate,
 	}
 	projections := buildFundingProjections(now, cfg.HoldHours, longFunding, longForecast, shortFunding, shortForecast)
-	return selectBestFundingProjection(projections)
+	return selectPrimaryFundingProjection(projections)
 }
 
 func buildFundingProjections(now time.Time, holdHours float64, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
@@ -308,13 +308,16 @@ func buildFundingProjections(now time.Time, holdHours float64, longFunding entit
 		})
 	}
 	sort.Slice(projections, func(i, j int) bool {
+		if projections[i].ProjectedFundingTimeMs != projections[j].ProjectedFundingTimeMs {
+			return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
+		}
 		if projections[i].CarryRate != projections[j].CarryRate {
 			return projections[i].CarryRate > projections[j].CarryRate
 		}
 		if projections[i].CarryRateHourlyEquivalent != projections[j].CarryRateHourlyEquivalent {
 			return projections[i].CarryRateHourlyEquivalent > projections[j].CarryRateHourlyEquivalent
 		}
-		return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
+		return projections[i].RequiredEntryByFundingTimeMs < projections[j].RequiredEntryByFundingTimeMs
 	})
 	return projections
 }

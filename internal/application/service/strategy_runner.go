@@ -836,17 +836,18 @@ func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA enti
 // - shortFunding: 假设做空腿所在交易所的 funding 快照
 //
 // 这里不把 funding 先统一小时化后线性外推，而是优先按事件时间轴逐点估算：
-// - 候选结算点 = 两侧 funding 事件时间轴上、直到 max(nextLong, nextShort) 之前的所有结算点
+// - 候选结算点 = 两侧 funding 事件时间轴上、直到 holdHours horizon 之前的所有结算点
 // - 对每个候选结算点，计算到该时点时双腿各自会发生几次 funding（会考虑多次结算）
-// - 选择 CarryRate 最大的那个时点
+// - 主视图 / 主计划默认选择“当前时间窗里最早兑现的那个时点”
+// - 多窗口 projection details 仍然会保留后续候选，便于观察更远窗口的 carry 变化
 //
 // 这样可以正确覆盖：
 // - 一边 1h 结算，一边 4h / 8h 结算；
 // - 两边 funding 都为负，但负得不一样；
-// - 最优方向和最优退出点不一定是“最早结算点”。
+// - 当前主显示收益严格对应“当前事件窗口”而不是更远退出点。
 func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) (fundingProjection, bool) {
 	projections := r.projectFundingCarryVariants(now, longFunding, longForecast, shortFunding, shortForecast)
-	return selectBestFundingProjection(projections)
+	return selectPrimaryFundingProjection(projections)
 }
 
 func (r *StrategyRunner) projectFundingCarryVariants(now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
@@ -901,18 +902,21 @@ func (r *StrategyRunner) projectFundingCarryVariants(now time.Time, longFunding 
 		projections = append(projections, projection)
 	}
 	sort.Slice(projections, func(i, j int) bool {
+		if projections[i].ProjectedFundingTimeMs != projections[j].ProjectedFundingTimeMs {
+			return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
+		}
 		if projections[i].CarryRate != projections[j].CarryRate {
 			return projections[i].CarryRate > projections[j].CarryRate
 		}
 		if projections[i].CarryRateHourlyEquivalent != projections[j].CarryRateHourlyEquivalent {
 			return projections[i].CarryRateHourlyEquivalent > projections[j].CarryRateHourlyEquivalent
 		}
-		return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
+		return projections[i].RequiredEntryByFundingTimeMs < projections[j].RequiredEntryByFundingTimeMs
 	})
 	return projections
 }
 
-func selectBestFundingProjection(projections []fundingProjection) (fundingProjection, bool) {
+func selectPrimaryFundingProjection(projections []fundingProjection) (fundingProjection, bool) {
 	if len(projections) == 0 {
 		return fundingProjection{}, false
 	}

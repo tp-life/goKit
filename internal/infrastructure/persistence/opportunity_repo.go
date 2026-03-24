@@ -29,9 +29,6 @@ func (r *OpportunityRepo) SaveBatch(ctx context.Context, batchID string, items [
 }
 
 func (r *OpportunityRepo) ListLatest(ctx context.Context, limit int) ([]entity.Opportunity, error) {
-	if limit <= 0 {
-		limit = 20
-	}
 	var latest entity.Opportunity
 	if err := r.client.GetDB(ctx).Order("as_of_time_ms desc").First(&latest).Error; err != nil {
 		return []entity.Opportunity{}, nil
@@ -39,8 +36,7 @@ func (r *OpportunityRepo) ListLatest(ctx context.Context, limit int) ([]entity.O
 	var out []entity.Opportunity
 	err := r.client.GetDB(ctx).
 		Where("batch_id = ?", latest.BatchID).
-		Order("score desc, net_expected_pnl desc").
-		Limit(limit).
+		Order("score desc, net_expected_pnl desc, as_of_time_ms desc").
 		Find(&out).Error
 	return out, err
 }

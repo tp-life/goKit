@@ -91,7 +91,7 @@ func NewCEXTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) Tr
 		positionPath = "/fapi/v3/positionRisk"
 		accountPath = "/fapi/v3/account"
 	}
-	return &CEXTradeClient{
+	client := &CEXTradeClient{
 		name:         name,
 		cfg:          c,
 		logger:       logger,
@@ -103,6 +103,7 @@ func NewCEXTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) Tr
 		positionPath: positionPath,
 		accountPath:  accountPath,
 	}
+	return client
 }
 
 func (c *CEXTradeClient) Name() string  { return c.name }
@@ -276,26 +277,20 @@ func (c *CEXTradeClient) signedPOST(ctx context.Context, path string, params url
 }
 
 func (c *CEXTradeClient) signedDo(ctx context.Context, method, path string, params url.Values, out any) (string, error) {
-	payload := params.Encode()
-	mac := hmac.New(sha256.New, []byte(c.apiSecret))
-	_, _ = mac.Write([]byte(payload))
-	signature := hex.EncodeToString(mac.Sum(nil))
-	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path + "?" + payload + "&signature=" + signature
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-MBX-APIKEY", c.apiKey)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	resp, body, err := c.performSignedRequest(ctx, method, path, params)
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
+		if c.logger != nil {
+			c.logger.Warn("cex_signed_request_failed",
+				"exchange", c.name,
+				"path", path,
+				"method", method,
+				"status_code", resp.StatusCode,
+				"response_body", string(body),
+			)
+		}
 		return string(body), fmt.Errorf("%s signed request failed status=%d body=%s", c.name, resp.StatusCode, string(body))
 	}
 	if out != nil {
@@ -304,6 +299,29 @@ func (c *CEXTradeClient) signedDo(ctx context.Context, method, path string, para
 		}
 	}
 	return string(body), nil
+}
+
+func (c *CEXTradeClient) performSignedRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {
+	payload := params.Encode()
+	mac := hmac.New(sha256.New, []byte(c.apiSecret))
+	_, _ = mac.Write([]byte(payload))
+	signature := hex.EncodeToString(mac.Sum(nil))
+	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path + "?" + payload + "&signature=" + signature
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("X-MBX-APIKEY", c.apiKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	return resp, body, nil
 }
 
 func asString(v any) string {
