@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/infrastructure/exchange"
@@ -65,6 +66,30 @@ func TestRenderPnLBreakdownDetail_IncludesFormulaAndComponents(t *testing.T) {
 	} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("expected pnl breakdown to contain %q, got %q", needle, got)
+		}
+	}
+}
+
+func TestRenderHeader_IncludesHardLimits(t *testing.T) {
+	m := NewModel(NewClient("http://127.0.0.1:8080", "", 0), 8*time.Second)
+	m.data.System.Strategy = StrategyStatus{
+		MinNetPNL:     1.5,
+		MaxSpreadBps:  12,
+		EntryLeadTime: "45m0s",
+	}
+	m.data.System.Execution = ExecutionStatus{
+		CloseGracePeriod: "5m0s",
+	}
+
+	got := m.renderHeader(240)
+	for _, needle := range []string{
+		"min_pnl 1.500U",
+		"max_spread 12.00bps",
+		"entry_lead 45m0s",
+		"close_grace 5m0s",
+	} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("expected header to contain %q, got %q", needle, got)
 		}
 	}
 }

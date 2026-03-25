@@ -248,7 +248,7 @@ const (
 )
 
 const (
-	tuiHeaderLines  = 4
+	tuiHeaderLines  = 5
 	tuiFooterLines  = 1
 	listHeaderLines = 5
 	listRowHeight   = 3

@@ -81,6 +81,8 @@ func (m Model) View() string {
 
 func (m Model) renderHeader(width int) string {
 	title := fmt.Sprintf("Funding Arbitrage TUI  [%s]", m.view.String())
+	strategy := m.data.System.Strategy
+	exec := m.data.System.Execution
 	statusLine := strings.Join([]string{
 		m.chip("mode "+m.interactionModeLabel(), m.interactionModeTone()),
 		m.chip("refresh "+m.refreshInterval.String(), "accent"),
@@ -90,6 +92,12 @@ func (m Model) renderHeader(width int) string {
 		m.chip("live "+boolWord(m.data.System.Execution.LiveTradingEnabled), boolTone(m.data.System.Execution.LiveTradingEnabled, true)),
 		m.chip("auto_entry "+boolWord(m.data.System.Execution.AutoEntry), boolTone(m.data.System.Execution.AutoEntry, false)),
 		m.chip("auto_close "+boolWord(m.data.System.Execution.AutoClose), boolTone(m.data.System.Execution.AutoClose, false)),
+	}, "  ")
+	limitLine := strings.Join([]string{
+		m.chip("min_pnl "+compactUSDT(strategy.MinNetPNL, 3), "good"),
+		m.chip("max_spread "+compactBps(strategy.MaxSpreadBps, 2), "warn"),
+		m.chip("entry_lead "+orDefault(strategy.EntryLeadTime, "--"), "accent"),
+		m.chip("close_grace "+orDefault(exec.CloseGracePeriod, "--"), "accent"),
 	}, "  ")
 
 	metrics := strings.Join([]string{
@@ -122,6 +130,7 @@ func (m Model) renderHeader(width int) string {
 	lines := []string{
 		ui.header.Width(width).Render(title),
 		clip(statusLine, width),
+		clip(limitLine, width),
 		clip(metrics, width),
 		clip(strings.Join(stateParts, "  "), width),
 	}
@@ -1085,6 +1094,20 @@ func fmtSignedBps(value float64, digits int) string {
 		sign = "+"
 	}
 	return fmt.Sprintf("%s%.*f bps", sign, digits, value)
+}
+
+func compactUSDT(value float64, digits int) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return "--"
+	}
+	return fmt.Sprintf("%.*fU", digits, value)
+}
+
+func compactBps(value float64, digits int) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return "--"
+	}
+	return fmt.Sprintf("%.*fbps", digits, value)
 }
 
 func fmtTime(ms int64) string {
