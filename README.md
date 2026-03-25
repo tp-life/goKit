@@ -30,6 +30,7 @@
 - Binance / Bybit 私有订单事件流基础接入（最小可用版）
 - 手动 HTTP 接口：开仓 / 平仓 / 查执行记录 / 查订单记录
 - 前端页面改为动态展示多交易所数据
+- 基于 TUI 的终端控制台（机会列表 / 详情 / 执行 / 系统状态）
 
 ## 当前仍然不包含
 
@@ -152,6 +153,40 @@
 go mod tidy
 go run ./cmd/server
 ```
+
+启动 TUI：
+
+```bash
+go run ./cmd/tui
+```
+
+也可以使用 Makefile：
+
+```bash
+make run
+make run-tui
+```
+
+说明：
+
+- `cmd/tui` 当前复用现有 HTTP API，因此需要先启动 `cmd/server`。
+- TUI 默认连接 `http://127.0.0.1:8080`，可通过 `FUNDING_TUI_BASE_URL` 或 `-base-url` 覆盖。
+- TUI 默认每轮只拉取前 `200` 条机会，避免终端首屏被超大批次数据拖慢；可通过 `-opportunity-limit` 调整。
+- 若要在 TUI 中执行手动开/平仓，需提供 `EXECUTION_API_TOKEN` 或 `-token`。
+
+TUI 主要交互：
+
+- `j/k` 或方向键：移动选择
+- `tab`：切换详情 Tab / 执行视图模式
+- `/`：搜索 symbol / exchange / venue symbol
+- `f` / `F`：切换交易所组合过滤
+- `s`：切换排序（`net / score / edge`）
+- `o`：开仓确认
+- `c`：平仓确认
+- `1` / `2` / `3`：切换 `Scanner / Execution / System`
+- `r`：刷新
+- `?`：帮助
+- `q`：退出
 
 SQLite 默认文件：
 

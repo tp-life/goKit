@@ -1,8 +1,9 @@
-.PHONY: all build run test clean tidy docker-build help
+.PHONY: all build run build-tui run-tui test clean tidy docker-build help
 
 PROJECT_NAME := nexus
 APP_NAME := server
 MAIN_FILE := cmd/server/main.go
+TUI_MAIN_FILE := cmd/tui/main.go
 
 # 默认目标
 all: build
@@ -20,10 +21,19 @@ tidy:
 run:
 	go run $(MAIN_FILE)
 
+## run-tui: 启动 TUI（需先启动 API 服务）
+run-tui:
+	go run $(TUI_MAIN_FILE)
+
 ## build: 编译二进制文件
 build:
 	@echo "Building $(APP_NAME)..."
 	go build -o bin/$(APP_NAME) $(MAIN_FILE)
+
+## build-tui: 编译 TUI 二进制
+build-tui:
+	@echo "Building tui..."
+	go build -o bin/tui $(TUI_MAIN_FILE)
 
 ## test: 运行单元测试
 test:

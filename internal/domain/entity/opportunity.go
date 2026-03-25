@@ -40,8 +40,8 @@ type OpportunityFundingRule struct {
 type Opportunity struct {
 	ID uint `gorm:"primaryKey" json:"id"`
 
-	BatchID    string `gorm:"index;size:64" json:"batch_id"`
-	AsOfTimeMs int64  `gorm:"index" json:"as_of_time_ms"`
+	BatchID    string `gorm:"index;index:idx_opp_batch_score_pnl_time,priority:1;size:64" json:"batch_id"`
+	AsOfTimeMs int64  `gorm:"index;index:idx_opp_batch_score_pnl_time,priority:4,sort:desc" json:"as_of_time_ms"`
 
 	Symbol           string `gorm:"index;size:64" json:"symbol"`
 	LongExchange     string `gorm:"size:32" json:"long_exchange"`
@@ -82,12 +82,12 @@ type Opportunity struct {
 	ExecutionPenaltyBps    float64 `json:"execution_penalty_bps"`
 	ExecutionPenaltyModel  string  `gorm:"size:64" json:"execution_penalty_model"`
 	ExecutionPenaltyBucket string  `gorm:"size:64" json:"execution_penalty_bucket"`
-	NetExpectedPNL         float64 `json:"net_expected_pnl"`
+	NetExpectedPNL         float64 `gorm:"index:idx_opp_batch_score_pnl_time,priority:3,sort:desc" json:"net_expected_pnl"`
 	NetExpectedBps         float64 `json:"net_expected_bps"`
 	BasisBps               float64 `json:"basis_bps"`
 	MaxAllowedBasisBps     float64 `json:"max_allowed_basis_bps"`
 
-	Score float64 `json:"score"`
+	Score float64 `gorm:"index:idx_opp_batch_score_pnl_time,priority:2,sort:desc" json:"score"`
 
 	EarliestFundingTimeMs        int64                   `json:"earliest_funding_time_ms"`
 	LatestFundingTimeMs          int64                   `json:"latest_funding_time_ms"`

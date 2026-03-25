@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"goKit/internal/domain/entity"
+	"goKit/internal/domain/repository"
 )
 
 type stubOpportunityRepo struct {
@@ -18,6 +19,51 @@ func (r stubOpportunityRepo) SaveBatch(_ context.Context, _ string, _ []entity.O
 
 func (r stubOpportunityRepo) ListLatest(_ context.Context, _ int) ([]entity.Opportunity, error) {
 	return r.items, nil
+}
+
+func (r stubOpportunityRepo) ListLatestSummary(_ context.Context, _ int) ([]repository.OpportunitySummary, error) {
+	out := make([]repository.OpportunitySummary, 0, len(r.items))
+	for _, item := range r.items {
+		out = append(out, repository.OpportunitySummary{
+			ID:                        item.ID,
+			BatchID:                   item.BatchID,
+			AsOfTimeMs:                item.AsOfTimeMs,
+			Symbol:                    item.Symbol,
+			LongExchange:              item.LongExchange,
+			ShortExchange:             item.ShortExchange,
+			LongVenueSymbol:           item.LongVenueSymbol,
+			ShortVenueSymbol:          item.ShortVenueSymbol,
+			ProjectedFundingTimeMs:    item.ProjectedFundingTimeMs,
+			EarliestFundingTimeMs:     item.EarliestFundingTimeMs,
+			LatestFundingTimeMs:       item.LatestFundingTimeMs,
+			NetExpectedPNL:            item.NetExpectedPNL,
+			GrossEdgeHourly:           item.GrossEdgeHourly,
+			Status:                    item.Status,
+			RejectReason:              item.RejectReason,
+			EligibleForExecution:      item.EligibleForExecution,
+			CreatedAt:                 item.CreatedAt,
+			UpdatedAt:                 item.UpdatedAt,
+			FundingWindowHours:        item.FundingWindowHours,
+			FundingComputationMode:    item.FundingComputationMode,
+			LongFundingRate:           item.LongFundingRate,
+			ShortFundingRate:          item.ShortFundingRate,
+			LongFundingTimeMs:         item.LongFundingTimeMs,
+			ShortFundingTimeMs:        item.ShortFundingTimeMs,
+			LongFundingIntervalHours:  item.LongFundingIntervalHours,
+			ShortFundingIntervalHours: item.ShortFundingIntervalHours,
+		})
+	}
+	return out, nil
+}
+
+func (r stubOpportunityRepo) FindByID(_ context.Context, id uint) (*entity.Opportunity, error) {
+	for i := range r.items {
+		if r.items[i].ID == id {
+			item := r.items[i]
+			return &item, nil
+		}
+	}
+	return nil, nil
 }
 
 func TestFilterOpportunitiesToCurrentSettlementCycle_KeepsNearestFutureCycle(t *testing.T) {
@@ -37,16 +83,30 @@ func TestFilterOpportunitiesToCurrentSettlementCycle_KeepsNearestFutureCycle(t *
 	}
 }
 
-func TestFilterOpportunitiesToCurrentSettlementCycle_DropsPastCycles(t *testing.T) {
+func TestFilterOpportunitiesToCurrentSettlementCycle_FallsBackToLatestPastCycle(t *testing.T) {
 	now := time.Date(2026, 3, 24, 18, 40, 0, 0, time.UTC)
 	items := []entity.Opportunity{
-		{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(-10 * time.Minute).UnixMilli()},
+		{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(-5 * time.Minute).UnixMilli()},
 		{Symbol: "ETH", EarliestFundingTimeMs: now.Add(-5 * time.Minute).UnixMilli()},
+		{Symbol: "SOL", LatestFundingTimeMs: now.Add(-25 * time.Minute).UnixMilli()},
 	}
 
 	got := filterOpportunitiesToCurrentSettlementCycle(now, items)
+	if len(got) != 2 {
+		t.Fatalf("expected latest past cycle to remain visible, got %d items", len(got))
+	}
+	if got[0].Symbol != "BTC" || got[1].Symbol != "ETH" {
+		t.Fatalf("expected latest past-cycle items in original order, got %#v", got)
+	}
+}
+
+func TestFilterOpportunitiesToCurrentSettlementCycle_DropsItemsWithoutCycle(t *testing.T) {
+	now := time.Date(2026, 3, 24, 18, 40, 0, 0, time.UTC)
+	items := []entity.Opportunity{{Symbol: "BTC"}, {Symbol: "ETH"}}
+
+	got := filterOpportunitiesToCurrentSettlementCycle(now, items)
 	if len(got) != 0 {
-		t.Fatalf("expected no opportunities when every cycle is already in the past, got %d", len(got))
+		t.Fatalf("expected no opportunities when cycle time is missing, got %d", len(got))
 	}
 }
 

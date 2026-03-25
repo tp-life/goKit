@@ -42,6 +42,8 @@ func (r *Router) Register(app *fiber.App) {
 	v1.Use(middleware.ErrorHandler(r.params.Logger))
 	v1.Get("/health", r.params.HealthHandler.Get)
 	v1.Get("/symbols", r.params.SymbolHandler.List)
+	v1.Get("/opportunities/summary", r.params.OpportunityHandler.ListSummary)
+	v1.Get("/opportunities/:id", r.params.OpportunityHandler.Detail)
 	v1.Get("/opportunities", r.params.OpportunityHandler.List)
 	v1.Get("/plans", r.params.ExecutionPlanHandler.List)
 	v1.Get("/executions", r.params.ExecutionHandler.List)
