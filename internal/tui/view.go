@@ -51,12 +51,20 @@ var ui = styles{
 	cursor:     lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Bold(true),
 }
 
+func renderPanel(width int, height int, content string) string {
+	return ui.panel.Width(panelContentWidth(width)).Height(panelContentHeight(height)).Render(content)
+}
+
+func renderModal(width int, height int, content string) string {
+	return ui.modal.Width(modalContentWidth(width)).Height(modalContentHeight(height)).Render(content)
+}
+
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "loading terminal..."
 	}
 
-	bodyHeight := maxInt(8, m.height-8)
+	bodyHeight := m.bodyHeight()
 	header := m.renderHeader(m.width)
 	var body string
 	switch {
@@ -134,10 +142,13 @@ func (m Model) renderBody(height int) string {
 func (m Model) renderScannerBody(height int) string {
 	leftWidth, rightWidth := splitWidth(m.width-2, 40)
 	if m.width < 120 {
-		listHeight := maxInt(8, height/2)
+		listHeight, detailHeight := splitStackedHeights(height)
+		if detailHeight <= 0 {
+			return m.renderOpportunityList(leftWidth+rightWidth, listHeight)
+		}
 		return lipgloss.JoinVertical(lipgloss.Left,
 			m.renderOpportunityList(leftWidth+rightWidth, listHeight),
-			m.renderScannerDetail(leftWidth+rightWidth, maxInt(8, height-listHeight)),
+			m.renderScannerDetail(leftWidth+rightWidth, detailHeight),
 		)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
@@ -149,10 +160,13 @@ func (m Model) renderScannerBody(height int) string {
 func (m Model) renderExecutionBody(height int) string {
 	leftWidth, rightWidth := splitWidth(m.width-2, 42)
 	if m.width < 120 {
-		listHeight := maxInt(8, height/2)
+		listHeight, detailHeight := splitStackedHeights(height)
+		if detailHeight <= 0 {
+			return m.renderExecutionList(leftWidth+rightWidth, listHeight)
+		}
 		return lipgloss.JoinVertical(lipgloss.Left,
 			m.renderExecutionList(leftWidth+rightWidth, listHeight),
-			m.renderExecutionDetail(leftWidth+rightWidth, maxInt(8, height-listHeight)),
+			m.renderExecutionDetail(leftWidth+rightWidth, detailHeight),
 		)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
@@ -164,10 +178,13 @@ func (m Model) renderExecutionBody(height int) string {
 func (m Model) renderSystemBody(height int) string {
 	leftWidth, rightWidth := splitWidth(m.width-2, 45)
 	if m.width < 120 {
-		leftHeight := maxInt(8, height/2)
+		topHeight, bottomHeight := splitStackedHeights(height)
+		if bottomHeight <= 0 {
+			return m.renderConnectorPanel(leftWidth+rightWidth, topHeight)
+		}
 		return lipgloss.JoinVertical(lipgloss.Left,
-			m.renderConnectorPanel(leftWidth+rightWidth, leftHeight),
-			m.renderConfigPanel(leftWidth+rightWidth, maxInt(8, height-leftHeight)),
+			m.renderConnectorPanel(leftWidth+rightWidth, topHeight),
+			m.renderConfigPanel(leftWidth+rightWidth, bottomHeight),
 		)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
@@ -186,29 +203,31 @@ func (m Model) renderOpportunityList(width int, height int) string {
 	if len(items) == 0 {
 		if m.isLoading(loadOpportunities) && len(m.data.Opportunities) == 0 {
 			lines = append(lines, ui.subtle.Render("Loading opportunities..."))
-			return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
 		lines = append(lines, ui.subtle.Render("No opportunities match the current filter."))
-		return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 
-	rowHeight := 3
-	visibleRows := maxInt(1, (height-5)/rowHeight)
+	visibleRows := maxInt(1, panelListContentHeight(height)/listRowHeight)
 	selected := m.indexOfOpportunity(items, m.selectedOpportunityKey)
 	if selected < 0 {
 		selected = 0
 	}
 	start := clampOffset(m.opportunityOffset, len(items), visibleRows)
 	end := minInt(len(items), start+visibleRows)
+	lines = append(lines, ui.subtle.Render(fmt.Sprintf("showing %d-%d", start+1, end)), "")
 	for i := start; i < end; i++ {
 		item := items[i]
 		active := i == selected
 		planLabel, planTone := m.opportunityPlanLabel(item)
 		marker := selectedMarker(active)
 		planText := toneStyle(planTone).Render(clip(planLabel, 18))
+		pnlText := alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 12)
+		edgeText := alignRightValue(renderPctValue(fundingSpreadHourly(item), 5), 10)
 		row := []string{
-			fmt.Sprintf("%s %-3d %-7s %-24s %12s", marker, i+1, clip(item.Symbol, 7), clip(opportunityDirection(item), 24), fmtMoney(item.NetExpectedPNL, 3)),
-			fmt.Sprintf("     %-18s basis %-9s edge %-10s", clip(opportunityPair(item), 18), fmtSignedBps(item.BasisBps, 2), fmtPctRatio(fundingSpreadHourly(item), 5)),
+			fmt.Sprintf("%s %-3d %-7s %-24s %s", marker, i+1, clip(item.Symbol, 7), clip(opportunityDirection(item), 24), pnlText),
+			fmt.Sprintf("     %-18s basis %-9s edge %s", clip(opportunityPair(item), 18), fmtSignedBps(item.BasisBps, 2), edgeText),
 			fmt.Sprintf("     %-14s  |  %s  |  %s", clip(holdingDurationText(item), 14), planText, clip(statusText(item.Status), 16)),
 		}
 		block := strings.Join(row, "\n")
@@ -217,27 +236,27 @@ func (m Model) renderOpportunityList(width int, height int) string {
 		}
 		lines = append(lines, block)
 	}
-	return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
 func (m Model) renderScannerDetail(width int, height int) string {
 	tabs := []string{
-		m.renderTab("Overview", m.tab == tabOverview),
-		m.renderTab("Legs", m.tab == tabLegs),
-		m.renderTab("Plan", m.tab == tabPlan),
-		m.renderTab("Projection", m.tab == tabProjection),
-		m.renderTab("Orders", m.tab == tabOrders),
+		m.renderTab("总览", m.tab == tabOverview),
+		m.renderTab("双腿", m.tab == tabLegs),
+		m.renderTab("计划", m.tab == tabPlan),
+		m.renderTab("预测", m.tab == tabProjection),
+		m.renderTab("订单", m.tab == tabOrders),
 	}
 	lines := []string{
-		ui.panelTitle.Render("Detail"),
+		ui.panelTitle.Render("套利详情"),
 		strings.Join(tabs, " "),
 		"",
 	}
 
 	item, ok := m.selectedOpportunity()
 	if !ok {
-		lines = append(lines, ui.subtle.Render("Select an opportunity to inspect its details."))
-		return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+		lines = append(lines, ui.subtle.Render("请先选择一条套利机会，再查看详情。"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 
 	detailItem, hasDetail := m.selectedOpportunityDetail()
@@ -256,10 +275,10 @@ func (m Model) renderScannerDetail(width int, height int) string {
 	case tabOrders:
 		detail = m.renderOrdersDetail(plan.PlanKey, width-4)
 	default:
-		detail = m.renderOverviewDetail(item, plan, hasPlan, rec, hasRec, width-4)
+		detail = m.renderOverviewDetail(item, detailItem, hasDetail, loadingDetail, plan, hasPlan, rec, hasRec, width-4)
 	}
 	lines = append(lines, detail)
-	return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
 func (m Model) renderExecutionList(width int, height int) string {
@@ -271,19 +290,19 @@ func (m Model) renderExecutionList(width int, height int) string {
 		if len(m.data.Executions) == 0 {
 			if m.isLoading(loadExecutions) {
 				lines = append(lines, ui.subtle.Render("Loading execution records..."))
-				return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+				return renderPanel(width, height, strings.Join(lines, "\n"))
 			}
 			lines = append(lines, ui.subtle.Render("No execution records yet."))
-			return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
-		rowHeight := 3
-		visibleRows := maxInt(1, (height-5)/rowHeight)
+		visibleRows := maxInt(1, panelListContentHeight(height)/listRowHeight)
 		selected := m.indexOfExecution(m.selectedExecutionPlanKey)
 		if selected < 0 {
 			selected = 0
 		}
 		start := clampOffset(m.executionOffset, len(m.data.Executions), visibleRows)
 		end := minInt(len(m.data.Executions), start+visibleRows)
+		lines = append(lines, ui.subtle.Render(fmt.Sprintf("showing %d-%d", start+1, end)), "")
 		for i := start; i < end; i++ {
 			item := m.data.Executions[i]
 			marker := selectedMarker(i == selected)
@@ -297,30 +316,31 @@ func (m Model) renderExecutionList(width int, height int) string {
 			}
 			lines = append(lines, block)
 		}
-		return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 
 	if len(m.data.AllPlans) == 0 {
 		if m.isLoading(loadAllPlans) {
 			lines = append(lines, ui.subtle.Render("Loading plans..."))
-			return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
 		lines = append(lines, ui.subtle.Render("No plans available."))
-		return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
-	rowHeight := 3
-	visibleRows := maxInt(1, (height-5)/rowHeight)
+	visibleRows := maxInt(1, panelListContentHeight(height)/listRowHeight)
 	selected := m.indexOfPlan(m.selectedPlanKey)
 	if selected < 0 {
 		selected = 0
 	}
 	start := clampOffset(m.planOffset, len(m.data.AllPlans), visibleRows)
 	end := minInt(len(m.data.AllPlans), start+visibleRows)
+	lines = append(lines, ui.subtle.Render(fmt.Sprintf("showing %d-%d", start+1, end)), "")
 	for i := start; i < end; i++ {
 		item := m.data.AllPlans[i]
 		marker := selectedMarker(i == selected)
+		pnlText := alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 10)
 		block := strings.Join([]string{
-			fmt.Sprintf("%s %-7s %-25s %10s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), fmtMoney(item.NetExpectedPNL, 3)),
+			fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), pnlText),
 			fmt.Sprintf("    %-18s ready %-3s status %-18s", clip(opportunityPair(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 18), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
 			fmt.Sprintf("    plan %-36s", clip(item.PlanKey, 36)),
 		}, "\n")
@@ -329,7 +349,7 @@ func (m Model) renderExecutionList(width int, height int) string {
 		}
 		lines = append(lines, block)
 	}
-	return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
 func (m Model) renderExecutionDetail(width int, height int) string {
@@ -357,7 +377,7 @@ func (m Model) renderExecutionDetail(width int, height int) string {
 		}
 	}
 	lines = append(lines, detail)
-	return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
 func (m Model) renderConnectorPanel(width int, height int) string {
@@ -369,10 +389,10 @@ func (m Model) renderConnectorPanel(width int, height int) string {
 	if len(m.data.System.Connectors) == 0 {
 		if m.isLoading(loadSystem) {
 			lines = append(lines, ui.subtle.Render("Loading system status..."))
-			return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
 		lines = append(lines, ui.subtle.Render("No connector status has been reported yet."))
-		return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 	for _, item := range m.data.System.Connectors {
 		tone := "good"
@@ -394,7 +414,7 @@ func (m Model) renderConnectorPanel(width int, height int) string {
 			lines = append(lines, ui.bad.Render("  err: "+clip(item.LastError, width-8)))
 		}
 	}
-	return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
 func (m Model) renderConfigPanel(width int, height int) string {
@@ -432,103 +452,93 @@ func (m Model) renderConfigPanel(width int, height int) string {
 	if m.isLoading(loadSystem) && len(m.data.System.Watchlist) == 0 && len(m.data.System.DeepScanWatchlist) == 0 {
 		lines = append(lines, "", ui.subtle.Render("Loading strategy and execution config..."))
 	}
-	return ui.panel.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
-func (m Model) renderOverviewDetail(item OpportunityListItem, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
+func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	planLabel, _ := m.opportunityPlanLabel(item)
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(item.Symbol), ui.subtle.Render(opportunityDirection(item))),
-		fmt.Sprintf("Net=%s  NetBps=%s  Carry=%s  HourlyEdge=%s  Basis=%s",
-			fmtMoney(item.NetExpectedPNL, 3),
-			fmtSignedBps(item.NetExpectedBps, 2),
-			fmtPctRatio(fundingSpread(item), 5),
-			fmtPctRatio(fundingSpreadHourly(item), 5),
-			fmtSignedBps(item.BasisBps, 2),
-		),
-		fmt.Sprintf("Status=%s  Eligible=%s  Plan=%s  Hold=%s",
-			statusText(item.Status),
-			boolWord(item.EligibleForExecution),
-			planLabel,
-			holdingDurationText(item),
-		),
-		fmt.Sprintf("Funding ETA long=%s  short=%s  projected=%s",
-			fmtDuration(time.Until(time.UnixMilli(item.LongFundingTimeMs))),
-			fmtDuration(time.Until(time.UnixMilli(item.ShortFundingTimeMs))),
-			fmtTime(item.ProjectedFundingTimeMs),
-		),
-		fmt.Sprintf("Produced=%s  batch=%s  settle_window=%sh  funding_mode=%s",
-			fmtTime(opportunityProducedTime(item).UnixMilli()),
-			orDefault(item.BatchID, "--"),
-			fmtNumber(item.FundingWindowHours, 2),
-			orDefault(item.FundingComputationMode, "--"),
-		),
+		strings.Join([]string{
+			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
+			renderField("净收益率", renderBpsValue(item.NetExpectedBps, 2)),
+			renderField("资金费收益", renderPctValue(fundingSpread(item), 5)),
+			renderField("时均边际", renderPctValue(fundingSpreadHourly(item), 5)),
+			renderField("基差", renderBasisValue(item.BasisBps, item.MaxAllowedBasisBps)),
+		}, "  "),
+		strings.Join([]string{
+			renderField("状态", renderStatusValue(item.Status)),
+			renderField("可执行", renderBoolValue(item.EligibleForExecution, false)),
+			renderField("计划", toneStyle(opportunityPlanTone(planLabel)).Render(planLabel)),
+			renderField("建议持有", toneStyle("accent").Render(holdingDurationText(item))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("多头结算倒计时", renderDurationValue(time.Until(time.UnixMilli(item.LongFundingTimeMs)))),
+			renderField("空头结算倒计时", renderDurationValue(time.Until(time.UnixMilli(item.ShortFundingTimeMs)))),
+			renderField("预计兑现时间", renderTimeValue(item.ProjectedFundingTimeMs, "accent")),
+		}, "  "),
+		strings.Join([]string{
+			renderField("产生时间", renderTimeValue(opportunityProducedTime(item).UnixMilli(), "subtle")),
+			renderField("批次", toneStyle("accent").Render(orDefault(item.BatchID, "--"))),
+			renderField("结算窗口", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(item.FundingWindowHours, 2)))),
+			renderField("资金费模式", toneStyle("accent").Render(orDefault(item.FundingComputationMode, "--"))),
+		}, "  "),
 		"",
-		"Market Snapshot",
+		ui.panelTitle.Render("市场快照"),
 		renderMarketSummary(m.data.Market, width),
-	}
-	if hasPlan {
-		lines = append(lines, "",
-			"Linked Plan",
-			fmt.Sprintf("plan=%s  ready=%s  status=%s  pnl=%s  target_notional=%s  leverage=%sx",
-				clip(plan.PlanKey, 28),
-				boolWord(plan.ReadyNow),
-				statusText(plan.Status),
-				fmtMoney(plan.NetExpectedPNL, 3),
-				fmtMoney(targetNotional(plan), 2),
-				fmtNumber(plan.TargetLeverage, 2),
-			),
-		)
-	}
-	if hasRec {
-		lines = append(lines,
-			fmt.Sprintf("record=%s  live=%s  open_orders=%d  close_orders=%d  reason=%s",
-				statusText(rec.Status),
-				boolWord(rec.LiveTrading),
-				rec.OpenOrderCount,
-				rec.CloseOrderCount,
-				clip(orDefault(rec.StatusReason, "--"), width-24),
-			),
-		)
+		"",
+		ui.panelTitle.Render("双腿信息"),
+		m.renderLegsDetail(item, detail, hasDetail, loading, width),
+		"",
+		ui.panelTitle.Render("计划信息"),
+		m.renderPlanDetail(item, plan, hasPlan, rec, hasRec, width),
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderLegsDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, width int) string {
 	lines := []string{
-		fmt.Sprintf("%s  venue=%s  funding=%s  future=%s  hourly=%s  next=%s  interval=%sh",
-			ui.good.Render("LONG"),
-			orDefault(item.LongVenueSymbol, "--"),
-			fmtPctRatio(item.LongFundingRate, 5),
-			fmtPctRatio(item.LongFutureFundingRate, 5),
-			fmtPctRatio(item.LongFundingHourly, 5),
-			fmtTime(item.LongFundingTimeMs),
-			fmtNumber(float64(item.LongFundingIntervalHours), 0),
+		fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s",
+			ui.good.Render("多头"),
+			renderField("合约", toneStyle("accent").Render(orDefault(item.LongVenueSymbol, "--"))),
+			renderField("当前费率", renderPctValue(item.LongFundingRate, 5)),
+			renderField("预测费率", renderPctValue(item.LongFutureFundingRate, 5)),
+			renderField("小时化", renderPctValue(item.LongFundingHourly, 5)),
+			renderField("下次结算", renderTimeValue(item.LongFundingTimeMs, "accent")),
+			renderField("结算间隔", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(float64(item.LongFundingIntervalHours), 0)))),
 		),
-		fmt.Sprintf("  bid=%s  ask=%s  mark=%s", priceText(item.LongBidPrice), priceText(item.LongAskPrice), priceText(item.LongMarkPrice)),
+		fmt.Sprintf("  %s  %s  %s",
+			renderField("买一", toneStyle("accent").Render(priceText(item.LongBidPrice))),
+			renderField("卖一", toneStyle("accent").Render(priceText(item.LongAskPrice))),
+			renderField("标记价", toneStyle("accent").Render(priceText(item.LongMarkPrice))),
+		),
 		"",
-		fmt.Sprintf("%s  venue=%s  funding=%s  future=%s  hourly=%s  next=%s  interval=%sh",
-			ui.warn.Render("SHORT"),
-			orDefault(item.ShortVenueSymbol, "--"),
-			fmtPctRatio(item.ShortFundingRate, 5),
-			fmtPctRatio(item.ShortFutureFundingRate, 5),
-			fmtPctRatio(item.ShortFundingHourly, 5),
-			fmtTime(item.ShortFundingTimeMs),
-			fmtNumber(float64(item.ShortFundingIntervalHours), 0),
+		fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s",
+			ui.warn.Render("空头"),
+			renderField("合约", toneStyle("accent").Render(orDefault(item.ShortVenueSymbol, "--"))),
+			renderField("当前费率", renderPctValue(item.ShortFundingRate, 5)),
+			renderField("预测费率", renderPctValue(item.ShortFutureFundingRate, 5)),
+			renderField("小时化", renderPctValue(item.ShortFundingHourly, 5)),
+			renderField("下次结算", renderTimeValue(item.ShortFundingTimeMs, "accent")),
+			renderField("结算间隔", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(float64(item.ShortFundingIntervalHours), 0)))),
 		),
-		fmt.Sprintf("  bid=%s  ask=%s  mark=%s", priceText(item.ShortBidPrice), priceText(item.ShortAskPrice), priceText(item.ShortMarkPrice)),
+		fmt.Sprintf("  %s  %s  %s",
+			renderField("买一", toneStyle("accent").Render(priceText(item.ShortBidPrice))),
+			renderField("卖一", toneStyle("accent").Render(priceText(item.ShortAskPrice))),
+			renderField("标记价", toneStyle("accent").Render(priceText(item.ShortMarkPrice))),
+		),
 		"",
 	}
 	switch {
 	case hasDetail:
 		lines = append(lines,
-			fmt.Sprintf("Long rule: %s", clip(ruleSummary(detail.LongFundingRule), width)),
-			fmt.Sprintf("Short rule: %s", clip(ruleSummary(detail.ShortFundingRule), width)),
+			fmt.Sprintf("%s: %s", ui.subtle.Render("多头规则"), toneStyle("accent").Render(clip(ruleSummary(detail.LongFundingRule), width))),
+			fmt.Sprintf("%s: %s", ui.subtle.Render("空头规则"), toneStyle("accent").Render(clip(ruleSummary(detail.ShortFundingRule), width))),
 		)
 	case loading:
-		lines = append(lines, ui.subtle.Render("Loading funding rule detail..."))
+		lines = append(lines, ui.subtle.Render("正在加载资金费规则详情..."))
 	default:
-		lines = append(lines, ui.subtle.Render("Funding rule detail is not available yet."))
+		lines = append(lines, ui.subtle.Render("资金费规则详情暂不可用。"))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -536,23 +546,53 @@ func (m Model) renderLegsDetail(item OpportunityListItem, detail *entity.Opportu
 func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	if !hasPlan {
 		return strings.Join([]string{
-			ui.subtle.Render("No real execution plan is currently linked to this opportunity."),
-			fmt.Sprintf("Opportunity status=%s  eligible=%s  reject_reason=%s", statusText(item.Status), boolWord(item.EligibleForExecution), orDefault(item.RejectReason, "--")),
+			ui.subtle.Render("当前机会尚未关联真实执行计划。"),
+			strings.Join([]string{
+				renderField("机会状态", renderStatusValue(item.Status)),
+				renderField("可执行", renderBoolValue(item.EligibleForExecution, false)),
+				renderField("拒绝原因", toneStyle("bad").Render(orDefault(item.RejectReason, "--"))),
+			}, "  "),
 		}, "\n")
 	}
 	lines := []string{
-		fmt.Sprintf("plan=%s", plan.PlanKey),
-		fmt.Sprintf("status=%s  ready=%s  pnl=%s  score=%s", statusText(plan.Status), boolWord(plan.ReadyNow), fmtMoney(plan.NetExpectedPNL, 3), fmtNumber(plan.Score, 2)),
-		fmt.Sprintf("capital=%s  target_notional=%s  rounded_notional=%s  leverage=%sx", fmtMoney(plan.CapitalAllocatedUSDT, 2), fmtMoney(plan.TargetNotionalUSDT, 2), fmtMoney(plan.RoundedNotionalUSDT, 2), fmtNumber(plan.TargetLeverage, 2)),
-		fmt.Sprintf("qty long=%s @ %s  short=%s @ %s", fmtNumber(plan.LongQty, 6), priceText(plan.LongEntryPrice), fmtNumber(plan.ShortQty, 6), priceText(plan.ShortEntryPrice)),
-		fmt.Sprintf("basis=%s  skew=%s  target_close=%s  entry_open=%s  entry_close=%s", fmtSignedBps(plan.CrossVenueBasisBps, 2), fmtSignedBps(planPositionSkewBps(plan), 2), fmtTime(plan.TargetCloseTimeMs), fmtTime(plan.EntryWindowOpenMs), fmtTime(plan.EntryWindowCloseMs)),
+		renderField("计划", toneStyle("accent").Render(plan.PlanKey)),
+		strings.Join([]string{
+			renderField("状态", renderStatusValue(plan.Status)),
+			renderField("就绪", renderBoolValue(plan.ReadyNow, false)),
+			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("评分", toneStyle("accent").Render(fmtNumber(plan.Score, 2))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("分配资金", renderMoneyValue(plan.CapitalAllocatedUSDT, 2)),
+			renderField("目标名义", renderMoneyValue(plan.TargetNotionalUSDT, 2)),
+			renderField("取整名义", renderMoneyValue(plan.RoundedNotionalUSDT, 2)),
+			renderField("杠杆", toneStyle("accent").Render(fmt.Sprintf("%sx", fmtNumber(plan.TargetLeverage, 2)))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("多头数量", toneStyle("accent").Render(fmtNumber(plan.LongQty, 6))),
+			renderField("多头价格", toneStyle("accent").Render(priceText(plan.LongEntryPrice))),
+			renderField("空头数量", toneStyle("accent").Render(fmtNumber(plan.ShortQty, 6))),
+			renderField("空头价格", toneStyle("accent").Render(priceText(plan.ShortEntryPrice))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
+			renderField("仓位偏斜", renderBpsValue(planPositionSkewBps(plan), 2)),
+			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+			renderField("入场开始", renderTimeValue(plan.EntryWindowOpenMs, "accent")),
+			renderField("入场截止", renderTimeValue(plan.EntryWindowCloseMs, "accent")),
+		}, "  "),
 	}
 	if hasRec {
 		lines = append(lines,
-			fmt.Sprintf("record=%s  live=%s  open_orders=%d  close_orders=%d", statusText(rec.Status), boolWord(rec.LiveTrading), rec.OpenOrderCount, rec.CloseOrderCount),
+			strings.Join([]string{
+				renderField("执行记录", renderStatusValue(rec.Status)),
+				renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+				renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
+				renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
+			}, "  "),
 		)
 		if strings.TrimSpace(rec.LastError) != "" {
-			lines = append(lines, "last_error="+clip(rec.LastError, width))
+			lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -561,16 +601,16 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 func (m Model) renderProjectionDetail(_ OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, width int) string {
 	if !hasDetail {
 		if loading {
-			return ui.subtle.Render("Loading projection detail...")
+			return ui.subtle.Render("正在加载预测详情...")
 		}
-		return ui.subtle.Render("Projection detail is not available for this opportunity.")
+		return ui.subtle.Render("当前机会暂无预测详情。")
 	}
 	if len(detail.ProjectionDetails) == 0 {
-		return ui.subtle.Render("No projection detail is available for this opportunity.")
+		return ui.subtle.Render("当前机会没有可展示的预测详情。")
 	}
-	lines := []string{"rank  funding_time          window   long short  carry       hourly      net_pnl"}
+	lines := []string{ui.accent.Render("序号  兑现时间             窗口     多头  空头  收益        时均        预期收益")}
 	for _, row := range detail.ProjectionDetails {
-		lines = append(lines, fmt.Sprintf("%-5d %-20s %-8s %-5d %-5d %-11s %-11s %-10s",
+		line := fmt.Sprintf("%-5d %-20s %-8s %-5d %-5d %-11s %-11s %-10s",
 			row.ProjectionRank,
 			clip(fmtTime(row.ProjectedFundingTimeMs), 20),
 			clip(fmt.Sprintf("%sh", fmtNumber(row.FundingWindowHours, 2)), 8),
@@ -579,25 +619,26 @@ func (m Model) renderProjectionDetail(_ OpportunityListItem, detail *entity.Oppo
 			fmtPctRatio(row.CarryRate, 5),
 			fmtPctRatio(row.CarryRateHourlyEquivalent, 5),
 			fmtMoney(row.NetExpectedPNL, 3),
-		))
+		)
+		lines = append(lines, toneStyle(signedNumberTone(row.NetExpectedPNL)).Render(line))
 	}
 	return clip(strings.Join(lines, "\n"), width*maxInt(1, len(lines)))
 }
 
 func (m Model) renderOrdersDetail(planKey string, width int) string {
 	if strings.TrimSpace(planKey) == "" {
-		return ui.subtle.Render("No real plan is selected, so there is no order stream to show.")
+		return ui.subtle.Render("当前未选中真实计划，因此没有可展示的订单流。")
 	}
 	if m.ordersLoading[planKey] {
-		return ui.subtle.Render("Loading order history...")
+		return ui.subtle.Render("正在加载订单历史...")
 	}
 	items, ok := m.orders[planKey]
 	if !ok || len(items) == 0 {
-		return ui.subtle.Render("No orders were found for this plan key yet.")
+		return ui.subtle.Render("当前计划暂无订单记录。")
 	}
-	lines := []string{"phase   leg      exchange     side   status              requested        executed         price"}
+	lines := []string{ui.accent.Render("阶段    腿       交易所       方向   状态               请求数量         成交数量         均价")}
 	for _, order := range items {
-		lines = append(lines, fmt.Sprintf("%-7s %-8s %-12s %-6s %-18s %-15s %-15s %-10s",
+		line := fmt.Sprintf("%-7s %-8s %-12s %-6s %-18s %-15s %-15s %-10s",
 			clip(order.Phase, 7),
 			clip(order.LegRole, 8),
 			clip(order.Exchange, 12),
@@ -606,9 +647,10 @@ func (m Model) renderOrdersDetail(planKey string, width int) string {
 			fmtNumber(order.RequestedQty, 6),
 			fmtNumber(order.ExecutedQty, 6),
 			priceText(order.AvgPrice),
-		))
+		)
+		lines = append(lines, toneStyle(statusTone(order.Status)).Render(line))
 		if strings.TrimSpace(order.ErrorMessage) != "" {
-			lines = append(lines, "  err="+clip(order.ErrorMessage, width))
+			lines = append(lines, renderField("错误", toneStyle("bad").Render(clip(order.ErrorMessage, width))))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -617,44 +659,89 @@ func (m Model) renderOrdersDetail(planKey string, width int) string {
 func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(plan.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: plan.LongExchange, ShortExchange: plan.ShortExchange}))),
-		fmt.Sprintf("plan=%s  ready=%s  status=%s  pnl=%s", plan.PlanKey, boolWord(plan.ReadyNow), statusText(plan.Status), fmtMoney(plan.NetExpectedPNL, 3)),
-		fmt.Sprintf("notional=%s  leverage=%sx  basis=%s  target_close=%s", fmtMoney(targetNotional(plan), 2), fmtNumber(plan.TargetLeverage, 2), fmtSignedBps(plan.CrossVenueBasisBps, 2), fmtTime(plan.TargetCloseTimeMs)),
-		fmt.Sprintf("long=%s qty=%s @ %s", plan.LongVenueSymbol, fmtNumber(plan.LongQty, 6), priceText(plan.LongEntryPrice)),
-		fmt.Sprintf("short=%s qty=%s @ %s", plan.ShortVenueSymbol, fmtNumber(plan.ShortQty, 6), priceText(plan.ShortEntryPrice)),
+		strings.Join([]string{
+			renderField("plan", toneStyle("accent").Render(plan.PlanKey)),
+			renderField("ready", renderBoolValue(plan.ReadyNow, false)),
+			renderField("status", renderStatusValue(plan.Status)),
+			renderField("pnl", renderMoneyValue(plan.NetExpectedPNL, 3)),
+		}, "  "),
+		strings.Join([]string{
+			renderField("notional", renderMoneyValue(targetNotional(plan), 2)),
+			renderField("leverage", toneStyle("accent").Render(fmt.Sprintf("%sx", fmtNumber(plan.TargetLeverage, 2)))),
+			renderField("basis", renderBpsValue(plan.CrossVenueBasisBps, 2)),
+			renderField("target_close", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+		}, "  "),
+		strings.Join([]string{
+			renderField("long", toneStyle("accent").Render(plan.LongVenueSymbol)),
+			renderField("qty", toneStyle("accent").Render(fmtNumber(plan.LongQty, 6))),
+			renderField("@", toneStyle("accent").Render(priceText(plan.LongEntryPrice))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("short", toneStyle("accent").Render(plan.ShortVenueSymbol)),
+			renderField("qty", toneStyle("accent").Render(fmtNumber(plan.ShortQty, 6))),
+			renderField("@", toneStyle("accent").Render(priceText(plan.ShortEntryPrice))),
+		}, "  "),
 	}
 	if opp, ok := m.matchingOpportunityForPlan(plan); ok {
-		lines = append(lines, fmt.Sprintf("matched_opp=%s  opp_status=%s  hold=%s", opportunityKey(opp), statusText(opp.Status), holdingDurationText(opp)))
+		lines = append(lines, strings.Join([]string{
+			renderField("matched_opp", toneStyle("accent").Render(opportunityKey(opp))),
+			renderField("opp_status", renderStatusValue(opp.Status)),
+			renderField("hold", toneStyle("accent").Render(holdingDurationText(opp))),
+		}, "  "))
 	}
 	if hasRec {
-		lines = append(lines, fmt.Sprintf("record=%s  live=%s  auto_close=%s  opened=%s  closed=%s", statusText(rec.Status), boolWord(rec.LiveTrading), boolWord(rec.AutoClose), fmtTime(rec.OpenedAtMs), fmtTime(rec.ClosedAtMs)))
+		lines = append(lines, strings.Join([]string{
+			renderField("record", renderStatusValue(rec.Status)),
+			renderField("live", renderBoolValue(rec.LiveTrading, true)),
+			renderField("auto_close", renderBoolValue(rec.AutoClose, false)),
+			renderField("opened", renderTimeValue(rec.OpenedAtMs, "accent")),
+			renderField("closed", renderTimeValue(rec.ClosedAtMs, "accent")),
+		}, "  "))
 		if strings.TrimSpace(rec.StatusReason) != "" {
-			lines = append(lines, "reason="+clip(rec.StatusReason, width))
+			lines = append(lines, renderField("reason", toneStyle("warn").Render(clip(rec.StatusReason, width))))
 		}
 		if strings.TrimSpace(rec.LastError) != "" {
-			lines = append(lines, "last_error="+clip(rec.LastError, width))
+			lines = append(lines, renderField("last_error", toneStyle("bad").Render(clip(rec.LastError, width))))
 		}
 	}
-	lines = append(lines, "", "Orders", m.renderOrdersDetail(plan.PlanKey, width))
+	lines = append(lines, "", ui.panelTitle.Render("Orders"), m.renderOrdersDetail(plan.PlanKey, width))
 	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool, width int) string {
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(rec.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: rec.LongExchange, ShortExchange: rec.ShortExchange}))),
-		fmt.Sprintf("plan=%s  status=%s  live=%s  auto_close=%s", rec.PlanKey, statusText(rec.Status), boolWord(rec.LiveTrading), boolWord(rec.AutoClose)),
-		fmt.Sprintf("opened=%s  closed=%s  transition=%s  event=%s", fmtTime(rec.OpenedAtMs), fmtTime(rec.ClosedAtMs), fmtTime(rec.LastTransitionAtMs), orDefault(rec.LastTransitionEvent, "--")),
-		fmt.Sprintf("open_orders=%d  close_orders=%d", rec.OpenOrderCount, rec.CloseOrderCount),
+		strings.Join([]string{
+			renderField("plan", toneStyle("accent").Render(rec.PlanKey)),
+			renderField("status", renderStatusValue(rec.Status)),
+			renderField("live", renderBoolValue(rec.LiveTrading, true)),
+			renderField("auto_close", renderBoolValue(rec.AutoClose, false)),
+		}, "  "),
+		strings.Join([]string{
+			renderField("opened", renderTimeValue(rec.OpenedAtMs, "accent")),
+			renderField("closed", renderTimeValue(rec.ClosedAtMs, "accent")),
+			renderField("transition", renderTimeValue(rec.LastTransitionAtMs, "accent")),
+			renderField("event", toneStyle("accent").Render(orDefault(rec.LastTransitionEvent, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("open_orders", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
+			renderField("close_orders", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
+		}, "  "),
 	}
 	if strings.TrimSpace(rec.StatusReason) != "" {
-		lines = append(lines, "reason="+clip(rec.StatusReason, width))
+		lines = append(lines, renderField("reason", toneStyle("warn").Render(clip(rec.StatusReason, width))))
 	}
 	if strings.TrimSpace(rec.LastError) != "" {
-		lines = append(lines, "last_error="+clip(rec.LastError, width))
+		lines = append(lines, renderField("last_error", toneStyle("bad").Render(clip(rec.LastError, width))))
 	}
 	if hasPlan {
-		lines = append(lines, fmt.Sprintf("plan_status=%s  expected_pnl=%s  target_close=%s", statusText(plan.Status), fmtMoney(plan.NetExpectedPNL, 3), fmtTime(plan.TargetCloseTimeMs)))
+		lines = append(lines, strings.Join([]string{
+			renderField("plan_status", renderStatusValue(plan.Status)),
+			renderField("expected_pnl", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("target_close", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+		}, "  "))
 	}
-	lines = append(lines, "", "Orders", m.renderOrdersDetail(rec.PlanKey, width))
+	lines = append(lines, "", ui.panelTitle.Render("Orders"), m.renderOrdersDetail(rec.PlanKey, width))
 	return strings.Join(lines, "\n")
 }
 
@@ -677,7 +764,7 @@ func (m Model) renderHelp(height int) string {
 		"",
 		ui.subtle.Render("Press ? or esc to return."),
 	}
-	return ui.modal.Width(minInt(m.width-4, 96)).Height(minInt(height, 18)).Render(strings.Join(lines, "\n"))
+	return renderModal(minInt(m.width-4, 96), minInt(height, 18), strings.Join(lines, "\n"))
 }
 
 func (m Model) renderConfirm(height int) string {
@@ -705,7 +792,7 @@ func (m Model) renderConfirm(height int) string {
 		lines = append(lines, "", ui.warn.Render("Submitting request..."))
 	}
 	lines = append(lines, "", ui.subtle.Render("esc cancels"))
-	return ui.modal.Width(minInt(m.width-4, 88)).Height(minInt(height, 14)).Render(strings.Join(lines, "\n"))
+	return renderModal(minInt(m.width-4, 88), minInt(height, 14), strings.Join(lines, "\n"))
 }
 
 func (m Model) renderFooter(width int) string {
@@ -781,14 +868,14 @@ func (m Model) interactionModeTone() string {
 func (m Model) opportunityPlanLabel(item OpportunityListItem) (string, string) {
 	if plan, ok := m.bestPlanForOpportunity(item); ok {
 		if plan.ReadyNow {
-			return "plan ready", "good"
+			return "计划就绪", "good"
 		}
-		return "plan staged", "warn"
+		return "计划已生成", "warn"
 	}
 	if item.EligibleForExecution {
-		return "plan candidate", "good"
+		return "可进入计划", "good"
 	}
-	return "no plan", "bad"
+	return "暂无计划", "bad"
 }
 
 func renderMarketSummary(snapshot service.SymbolMarketState, width int) string {
@@ -805,9 +892,9 @@ func renderMarketSummary(snapshot service.SymbolMarketState, width int) string {
 	}
 	sort.Strings(exchanges)
 	if len(exchanges) == 0 {
-		return ui.subtle.Render("No market snapshot for the active symbol.")
+		return ui.subtle.Render("当前活跃币种暂无市场快照。")
 	}
-	lines := []string{"exchange      venue           bid          ask          mid          mark         funding       next_funding"}
+	lines := []string{"交易所        合约            买一         卖一         中间价       标记价       资金费率      下次结算"}
 	for _, ex := range exchanges {
 		fund := snapshot.Funding[ex]
 		book := snapshot.BookTop[ex]
@@ -829,12 +916,12 @@ func ruleSummary(rule entity.OpportunityFundingRule) string {
 	parts := []string{
 		orDefault(rule.Exchange, "--"),
 		orDefault(rule.VenueSymbol, "--"),
-		fmt.Sprintf("interval=%sh", fmtNumber(float64(rule.FundingIntervalHours), 0)),
-		"next=" + fmtTime(rule.NextFundingTimeMs),
-		"rate=" + fmtPctRatio(rule.CurrentFundingRate, 5),
+		fmt.Sprintf("间隔=%sh", fmtNumber(float64(rule.FundingIntervalHours), 0)),
+		"下次=" + fmtTime(rule.NextFundingTimeMs),
+		"费率=" + fmtPctRatio(rule.CurrentFundingRate, 5),
 	}
 	if strings.TrimSpace(rule.ForecastConfidence) != "" {
-		parts = append(parts, "confidence="+rule.ForecastConfidence)
+		parts = append(parts, "置信度="+rule.ForecastConfidence)
 	}
 	if strings.TrimSpace(rule.MetadataSummary) != "" {
 		parts = append(parts, rule.MetadataSummary)
@@ -1010,49 +1097,49 @@ func boolTone(v bool, warnWhenTrue bool) string {
 func statusText(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "eligible":
-		return "eligible"
+		return "可执行"
 	case "watching":
-		return "watching"
+		return "观察中"
 	case "spread_too_small":
-		return "spread_too_small"
+		return "价差过小"
 	case "basis_too_wide":
-		return "basis_too_wide"
+		return "基差过宽"
 	case "not_profitable":
-		return "not_profitable"
+		return "收益不足"
 	case "stale_data":
-		return "stale_data"
+		return "数据过期"
 	case "outside_entry_window":
-		return "outside_entry_window"
+		return "不在入场窗口"
 	case "settlement_window_passed":
-		return "settlement_window_passed"
+		return "结算窗口已过"
 	case "pending_open":
-		return "pending_open"
+		return "待开仓"
 	case "opened":
-		return "opened"
+		return "已开仓"
 	case "open_partial_failed":
-		return "open_partial_failed"
+		return "开仓部分失败"
 	case "open_failed":
-		return "open_failed"
+		return "开仓失败"
 	case "open_hedging":
-		return "open_hedging"
+		return "开仓对冲中"
 	case "risk_blocked":
-		return "risk_blocked"
+		return "风控拦截"
 	case "api_circuit_open", "circuit_open":
-		return "circuit_open"
+		return "熔断开启"
 	case "pending_close":
-		return "pending_close"
+		return "待平仓"
 	case "closed":
-		return "closed"
+		return "已平仓"
 	case "close_partial_failed":
-		return "close_partial_failed"
+		return "平仓部分失败"
 	case "close_failed":
-		return "close_failed"
+		return "平仓失败"
 	case "close_hedging":
-		return "close_hedging"
+		return "平仓对冲中"
 	case "dry_run_opened":
-		return "dry_run_opened"
+		return "模拟已开仓"
 	case "dry_run_closed":
-		return "dry_run_closed"
+		return "模拟已平仓"
 	default:
 		if strings.TrimSpace(status) == "" {
 			return "--"
@@ -1069,8 +1156,110 @@ func toneStyle(tone string) lipgloss.Style {
 		return ui.warn
 	case "bad":
 		return ui.bad
+	case "accent":
+		return ui.accent
 	default:
 		return ui.subtle
+	}
+}
+
+func renderField(label string, value string) string {
+	return fmt.Sprintf("%s=%s", ui.subtle.Render(label), value)
+}
+
+func alignRightValue(text string, width int) string {
+	return lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(text)
+}
+
+func renderMoneyValue(value float64, digits int) string {
+	return toneStyle(signedNumberTone(value)).Render(fmtMoney(value, digits))
+}
+
+func renderPctValue(value float64, digits int) string {
+	return toneStyle(signedNumberTone(value)).Render(fmtPctRatio(value, digits))
+}
+
+func renderBpsValue(value float64, digits int) string {
+	return toneStyle(signedNumberTone(value)).Render(fmtSignedBps(value, digits))
+}
+
+func renderBasisValue(basisBps float64, maxAllowedBps float64) string {
+	if math.IsNaN(basisBps) || math.IsInf(basisBps, 0) {
+		return toneStyle("subtle").Render(fmtSignedBps(basisBps, 2))
+	}
+	absBasis := math.Abs(basisBps)
+	tone := "accent"
+	switch {
+	case maxAllowedBps > 0 && absBasis > maxAllowedBps:
+		tone = "bad"
+	case maxAllowedBps > 0 && absBasis > maxAllowedBps*0.8:
+		tone = "warn"
+	}
+	return toneStyle(tone).Render(fmtSignedBps(basisBps, 2))
+}
+
+func renderStatusValue(status string) string {
+	return toneStyle(statusTone(status)).Render(statusText(status))
+}
+
+func renderBoolValue(v bool, warnWhenTrue bool) string {
+	if v {
+		return toneStyle(boolTone(v, warnWhenTrue)).Render("是")
+	}
+	return toneStyle(boolTone(v, warnWhenTrue)).Render("否")
+}
+
+func renderDurationValue(d time.Duration) string {
+	tone := "accent"
+	switch {
+	case d < 0:
+		tone = "bad"
+	case d <= 30*time.Minute:
+		tone = "warn"
+	}
+	return toneStyle(tone).Render(fmtDuration(d))
+}
+
+func renderTimeValue(ms int64, tone string) string {
+	return toneStyle(tone).Render(fmtTime(ms))
+}
+
+func signedNumberTone(value float64) string {
+	switch {
+	case math.IsNaN(value) || math.IsInf(value, 0):
+		return "subtle"
+	case value > 0:
+		return "good"
+	case value < 0:
+		return "bad"
+	default:
+		return "subtle"
+	}
+}
+
+func statusTone(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", "--":
+		return "subtle"
+	case "eligible", "ready", "opened", "closed", "dry_run_opened", "dry_run_closed":
+		return "good"
+	case "watching", "pending_open", "pending_close", "open_partial_failed", "close_partial_failed", "open_hedging", "close_hedging", "outside_entry_window":
+		return "warn"
+	default:
+		return "bad"
+	}
+}
+
+func opportunityPlanTone(label string) string {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "计划就绪", "可进入计划":
+		return "good"
+	case "计划已生成":
+		return "warn"
+	case "暂无计划":
+		return "bad"
+	default:
+		return "accent"
 	}
 }
 

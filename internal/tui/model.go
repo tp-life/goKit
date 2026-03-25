@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"goKit/internal/application/service"
@@ -220,6 +221,22 @@ type actionErrMsg struct {
 
 type tickMsg time.Time
 
+type refreshLoadedMsg struct {
+	Seq           int
+	System        SystemStatus
+	Opportunities []OpportunityListItem
+	Executions    []entity.ExecutionRecord
+	Stats         repository.SnapshotStats
+	AllPlans      []entity.ExecutionPlan
+	BatchPlans    []entity.ExecutionPlan
+	CurrentBatch  string
+}
+
+type refreshErrMsg struct {
+	Seq int
+	Err error
+}
+
 const (
 	loadSystem        = "system"
 	loadOpportunities = "opportunities"
@@ -228,6 +245,13 @@ const (
 	loadAllPlans      = "plans"
 	loadBatchPlans    = "batch-plans"
 	loadMarket        = "market"
+)
+
+const (
+	tuiHeaderLines  = 4
+	tuiFooterLines  = 1
+	listHeaderLines = 5
+	listRowHeight   = 3
 )
 
 type Model struct {
@@ -260,6 +284,7 @@ type Model struct {
 	selectedOpportunityKey   string
 	selectedPlanKey          string
 	selectedExecutionPlanKey string
+	opportunityAutoFollow    bool
 	opportunityOffset        int
 	planOffset               int
 	executionOffset          int
@@ -270,6 +295,7 @@ type Model struct {
 	opportunityDetails       map[uint]entity.Opportunity
 	opportunityDetailLoading map[uint]bool
 	loadingSections          map[string]bool
+	refreshSeq               int
 }
 
 func NewModel(client *Client, refreshInterval time.Duration) Model {
@@ -288,6 +314,7 @@ func NewModel(client *Client, refreshInterval time.Duration) Model {
 		sort:                     sortByNet,
 		loading:                  true,
 		search:                   search,
+		opportunityAutoFollow:    true,
 		orders:                   make(map[string][]entity.OrderRecord),
 		ordersLoading:            make(map[string]bool),
 		opportunityDetails:       make(map[uint]entity.Opportunity),
@@ -308,6 +335,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
+	case refreshLoadedMsg:
+		if msg.Seq != m.refreshSeq {
+			return m, nil
+		}
+		m.data.System = msg.System
+		m.data.Opportunities = msg.Opportunities
+		m.data.Executions = msg.Executions
+		m.data.Stats = msg.Stats
+		m.data.AllPlans = msg.AllPlans
+		m.data.BatchPlans = msg.BatchPlans
+		m.data.CurrentBatchID = strings.TrimSpace(msg.CurrentBatch)
+		m.finishLoading(loadSystem)
+		m.finishLoading(loadOpportunities)
+		m.finishLoading(loadExecutions)
+		m.finishLoading(loadStats)
+		m.finishLoading(loadAllPlans)
+		m.finishLoading(loadBatchPlans)
+		m.pruneOpportunityDetails()
+		m.normalizeSelections()
+		return m, tea.Batch(m.postSelectionCmds()...)
+	case refreshErrMsg:
+		if msg.Seq != m.refreshSeq {
+			return m, nil
+		}
+		m.finishLoading(loadSystem)
+		m.finishLoading(loadOpportunities)
+		m.finishLoading(loadExecutions)
+		m.finishLoading(loadStats)
+		m.finishLoading(loadAllPlans)
+		m.finishLoading(loadBatchPlans)
+		m.lastError = msg.Err.Error()
+		return m, nil
 	case systemLoadedMsg:
 		m.data.System = msg.System
 		m.finishLoading(loadSystem)
@@ -327,14 +386,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.finishLoading(loadOpportunities)
 		m.pruneOpportunityDetails()
 		m.normalizeSelections()
-		cmds := m.postSelectionCmds()
 		if batchID := strings.TrimSpace(m.data.CurrentBatchID); batchID != "" && batchID != prevBatchID {
 			m.data.BatchPlans = nil
 		}
-		if batchID := strings.TrimSpace(m.data.CurrentBatchID); batchID != "" {
-			cmds = append(cmds, m.startBatchPlansRefreshCmd(batchID))
-		}
-		return m, tea.Batch(cmds...)
+		return m, tea.Batch(m.postSelectionCmds()...)
 	case opportunitiesErrMsg:
 		m.finishLoading(loadOpportunities)
 		m.lastError = msg.Err.Error()
@@ -461,15 +516,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "s":
 		m.sort = m.sort.next()
+		m.opportunityAutoFollow = true
 		m.opportunityOffset = 0
 		m.normalizeSelections()
 		return m, tea.Batch(m.postSelectionCmds()...)
 	case "f":
 		m.cyclePairFilter(1)
+		m.opportunityAutoFollow = true
 		m.opportunityOffset = 0
 		return m, tea.Batch(m.postSelectionCmds()...)
 	case "F":
 		m.cyclePairFilter(-1)
+		m.opportunityAutoFollow = true
 		m.opportunityOffset = 0
 		return m, tea.Batch(m.postSelectionCmds()...)
 	case "1", "m":
@@ -543,12 +601,14 @@ func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "enter":
 		m.searchMode = false
 		m.search.Blur()
+		m.opportunityAutoFollow = true
 		m.normalizeSelections()
 		return m, tea.Batch(m.postSelectionCmds()...)
 	}
 
 	var cmd tea.Cmd
 	m.search, cmd = m.search.Update(msg)
+	m.opportunityAutoFollow = true
 	m.opportunityOffset = 0
 	m.normalizeSelections()
 	return m, tea.Batch(cmd, tea.Batch(m.postSelectionCmds()...))
@@ -589,6 +649,7 @@ func (m Model) moveSelection(delta int) (tea.Model, tea.Cmd) {
 		if len(items) == 0 {
 			return m, nil
 		}
+		m.opportunityAutoFollow = false
 		idx := m.indexOfOpportunity(items, m.selectedOpportunityKey)
 		idx = clampIndex(idx+delta, len(items))
 		m.selectedOpportunityKey = opportunityKey(items[idx])
@@ -625,6 +686,7 @@ func (m Model) jumpSelection(target int) (tea.Model, tea.Cmd) {
 		if len(items) == 0 {
 			return m, nil
 		}
+		m.opportunityAutoFollow = false
 		idx := target
 		if idx < 0 {
 			idx = len(items) - 1
@@ -696,6 +758,10 @@ func (m *Model) normalizeSelections() {
 	items := m.filteredOpportunities()
 	if len(items) == 0 {
 		m.selectedOpportunityKey = ""
+		m.opportunityOffset = 0
+		m.opportunityAutoFollow = true
+	} else if m.opportunityAutoFollow {
+		m.selectedOpportunityKey = opportunityKey(items[0])
 		m.opportunityOffset = 0
 	} else if m.indexOfOpportunity(items, m.selectedOpportunityKey) < 0 {
 		m.selectedOpportunityKey = opportunityKey(items[0])
@@ -814,35 +880,17 @@ func (m Model) loadingSummary() string {
 
 func (m *Model) startRefreshCmds() []tea.Cmd {
 	m.lastError = ""
-	cmds := []tea.Cmd{
-		fetchSystemCmd(m.client),
-		fetchOpportunitySummariesCmd(m.client),
-		fetchExecutionsCmd(m.client),
-		fetchStatsCmd(m.client),
-		fetchPlansCmd(m.client, defaultPlanLimit, "", false),
-	}
+	m.refreshSeq++
+	seq := m.refreshSeq
 	m.startLoading(
 		loadSystem,
 		loadOpportunities,
 		loadExecutions,
 		loadStats,
 		loadAllPlans,
+		loadBatchPlans,
 	)
-	if symbol := m.currentSymbol(); strings.TrimSpace(symbol) != "" {
-		if cmd := m.startMarketRefreshCmd(symbol); cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-	}
-	return cmds
-}
-
-func (m *Model) startBatchPlansRefreshCmd(batchID string) tea.Cmd {
-	batchID = strings.TrimSpace(batchID)
-	if batchID == "" {
-		return nil
-	}
-	m.startLoading(loadBatchPlans)
-	return fetchPlansCmd(m.client, defaultPlanLimit, batchID, true)
+	return []tea.Cmd{fetchRefreshCmd(m.client, seq)}
 }
 
 func (m *Model) startMarketRefreshCmd(symbol string) tea.Cmd {
@@ -859,13 +907,15 @@ func (m *Model) startMarketRefreshCmd(symbol string) tea.Cmd {
 }
 
 func (m Model) bodyHeight() int {
-	return maxInt(8, m.height-8)
+	available := m.height - tuiHeaderLines - tuiFooterLines - ui.doc.GetVerticalFrameSize()
+	return maxInt(1, available)
 }
 
 func (m Model) scannerListHeight() int {
 	bodyHeight := m.bodyHeight()
 	if m.width < 120 {
-		return maxInt(8, bodyHeight/2)
+		listHeight, _ := splitStackedHeights(bodyHeight)
+		return listHeight
 	}
 	return bodyHeight
 }
@@ -873,17 +923,73 @@ func (m Model) scannerListHeight() int {
 func (m Model) executionListHeight() int {
 	bodyHeight := m.bodyHeight()
 	if m.width < 120 {
-		return maxInt(8, bodyHeight/2)
+		listHeight, _ := splitStackedHeights(bodyHeight)
+		return listHeight
 	}
 	return bodyHeight
 }
 
 func (m Model) scannerVisibleRows() int {
-	return maxInt(1, (m.scannerListHeight()-5)/3)
+	return maxInt(1, panelListContentHeight(m.scannerListHeight())/listRowHeight)
 }
 
 func (m Model) executionVisibleRows() int {
-	return maxInt(1, (m.executionListHeight()-5)/3)
+	return maxInt(1, panelListContentHeight(m.executionListHeight())/listRowHeight)
+}
+
+func panelOuterHeight(height int) int {
+	return maxInt(1, height)
+}
+
+func panelContentHeight(height int) int {
+	return maxInt(1, panelOuterHeight(height)-ui.panel.GetVerticalFrameSize())
+}
+
+func panelContentWidth(width int) int {
+	return maxInt(1, width-ui.panel.GetHorizontalFrameSize())
+}
+
+func panelListContentHeight(height int) int {
+	return maxInt(1, panelContentHeight(height)-listHeaderLines)
+}
+
+func modalContentWidth(width int) int {
+	return maxInt(1, width-ui.modal.GetHorizontalFrameSize())
+}
+
+func modalContentHeight(height int) int {
+	return maxInt(1, height-ui.modal.GetVerticalFrameSize())
+}
+
+func splitStackedHeights(total int) (top int, bottom int) {
+	total = maxInt(1, total)
+	if total == 1 {
+		return 1, 0
+	}
+
+	top = total / 2
+	bottom = total - top
+
+	const preferredMinPanelHeight = 8
+	if total >= preferredMinPanelHeight*2 {
+		if top < preferredMinPanelHeight {
+			top = preferredMinPanelHeight
+			bottom = total - top
+		}
+		if bottom < preferredMinPanelHeight {
+			bottom = preferredMinPanelHeight
+			top = total - bottom
+		}
+	}
+
+	if top <= 0 {
+		top = 1
+		bottom = total - top
+	}
+	if bottom < 0 {
+		bottom = 0
+	}
+	return top, bottom
 }
 
 func (m *Model) ensureOpportunityVisible(items []OpportunityListItem, idx int) {
@@ -1341,6 +1447,98 @@ func clampIndex(idx int, length int) int {
 		return length - 1
 	}
 	return idx
+}
+
+func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+
+		var (
+			system   SystemStatus
+			opps     []OpportunityListItem
+			execs    []entity.ExecutionRecord
+			stats    repository.SnapshotStats
+			allPlans []entity.ExecutionPlan
+		)
+
+		var (
+			wg       sync.WaitGroup
+			errOnce  sync.Once
+			firstErr error
+		)
+		setErr := func(err error) {
+			if err == nil {
+				return
+			}
+			errOnce.Do(func() {
+				firstErr = err
+				cancel()
+			})
+		}
+
+		wg.Add(5)
+		go func() {
+			defer wg.Done()
+			var err error
+			system, err = client.getSystemStatus(ctx)
+			setErr(err)
+		}()
+		go func() {
+			defer wg.Done()
+			var err error
+			opps, err = client.getOpportunitySummaries(ctx, client.opportunityLimit)
+			setErr(err)
+		}()
+		go func() {
+			defer wg.Done()
+			var err error
+			execs, err = client.getExecutions(ctx, defaultExecutionLimit)
+			setErr(err)
+		}()
+		go func() {
+			defer wg.Done()
+			var err error
+			stats, err = client.getSnapshotStats(ctx)
+			setErr(err)
+		}()
+		go func() {
+			defer wg.Done()
+			var err error
+			allPlans, err = client.getPlans(ctx, defaultPlanLimit, "")
+			setErr(err)
+		}()
+		wg.Wait()
+
+		if firstErr != nil {
+			return refreshErrMsg{Seq: seq, Err: firstErr}
+		}
+
+		currentBatch := ""
+		if len(opps) > 0 {
+			currentBatch = strings.TrimSpace(opps[0].BatchID)
+		}
+
+		var batchPlans []entity.ExecutionPlan
+		if currentBatch != "" {
+			items, err := client.getPlans(ctx, defaultPlanLimit, currentBatch)
+			if err != nil {
+				return refreshErrMsg{Seq: seq, Err: err}
+			}
+			batchPlans = items
+		}
+
+		return refreshLoadedMsg{
+			Seq:           seq,
+			System:        system,
+			Opportunities: opps,
+			Executions:    execs,
+			Stats:         stats,
+			AllPlans:      allPlans,
+			BatchPlans:    batchPlans,
+			CurrentBatch:  currentBatch,
+		}
+	}
 }
 
 func fetchSystemCmd(client *Client) tea.Cmd {

@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	defaultOpportunityLimit = 200
+	defaultOpportunityLimit = 5000
 	defaultPlanLimit        = 100
 	defaultExecutionLimit   = 50
 )

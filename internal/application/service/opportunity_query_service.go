@@ -32,7 +32,10 @@ func (s *OpportunityQueryService) ListLatest(ctx context.Context, limit int) ([]
 }
 
 func (s *OpportunityQueryService) ListLatestSummary(ctx context.Context, limit int) ([]repository.OpportunitySummary, error) {
-	items, err := s.repo.ListLatestSummary(ctx, limit)
+	// Summary consumers rely on local filtering/search across the whole current
+	// settlement cycle. Fetch the latest batch summaries first, then apply the
+	// cycle filter and client-visible limit afterwards.
+	items, err := s.repo.ListLatestSummary(ctx, 0)
 	if err != nil {
 		return nil, err
 	}

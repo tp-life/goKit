@@ -13,6 +13,11 @@ type stubOpportunityRepo struct {
 	items []entity.Opportunity
 }
 
+type limitAwareOpportunityRepo struct {
+	stubOpportunityRepo
+	summaryLimits []int
+}
+
 func (r stubOpportunityRepo) SaveBatch(_ context.Context, _ string, _ []entity.Opportunity) error {
 	return nil
 }
@@ -22,8 +27,21 @@ func (r stubOpportunityRepo) ListLatest(_ context.Context, _ int) ([]entity.Oppo
 }
 
 func (r stubOpportunityRepo) ListLatestSummary(_ context.Context, _ int) ([]repository.OpportunitySummary, error) {
-	out := make([]repository.OpportunitySummary, 0, len(r.items))
-	for _, item := range r.items {
+	return summariesFromOpportunities(r.items), nil
+}
+
+func (r *limitAwareOpportunityRepo) ListLatestSummary(_ context.Context, limit int) ([]repository.OpportunitySummary, error) {
+	r.summaryLimits = append(r.summaryLimits, limit)
+	out := summariesFromOpportunities(r.items)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func summariesFromOpportunities(items []entity.Opportunity) []repository.OpportunitySummary {
+	out := make([]repository.OpportunitySummary, 0, len(items))
+	for _, item := range items {
 		out = append(out, repository.OpportunitySummary{
 			ID:                        item.ID,
 			BatchID:                   item.BatchID,
@@ -53,7 +71,7 @@ func (r stubOpportunityRepo) ListLatestSummary(_ context.Context, _ int) ([]repo
 			ShortFundingIntervalHours: item.ShortFundingIntervalHours,
 		})
 	}
-	return out, nil
+	return out
 }
 
 func (r stubOpportunityRepo) FindByID(_ context.Context, id uint) (*entity.Opportunity, error) {
@@ -133,5 +151,33 @@ func TestOpportunityQueryService_ListLatestAppliesCurrentCycleFilterAndLimit(t *
 	}
 	if got[0].Symbol != "BTC" {
 		t.Fatalf("expected first nearest-cycle item to survive limit, got %s", got[0].Symbol)
+	}
+}
+
+func TestOpportunityQueryService_ListLatestSummaryFetchesWholeBatchBeforeLimit(t *testing.T) {
+	now := time.Now()
+	repo := &limitAwareOpportunityRepo{
+		stubOpportunityRepo: stubOpportunityRepo{
+			items: []entity.Opportunity{
+				{Symbol: "SOL", ProjectedFundingTimeMs: now.Add(30 * time.Minute).UnixMilli()},
+				{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(10 * time.Minute).UnixMilli()},
+				{Symbol: "ETH", ProjectedFundingTimeMs: now.Add(10 * time.Minute).UnixMilli()},
+			},
+		},
+	}
+	svc := NewOpportunityQueryService(repo)
+
+	got, err := svc.ListLatestSummary(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if len(repo.summaryLimits) != 1 || repo.summaryLimits[0] != 0 {
+		t.Fatalf("expected summary repo to be called without pre-limit, got %#v", repo.summaryLimits)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected limit to apply after cycle filter, got %d items", len(got))
+	}
+	if got[0].Symbol != "BTC" || got[1].Symbol != "ETH" {
+		t.Fatalf("expected nearest-cycle summaries to survive, got %#v", got)
 	}
 }

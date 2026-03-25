@@ -25,7 +25,7 @@ func main() {
 	baseURL := flag.String("base-url", defaultBaseURL, "Funding monitor API base URL")
 	token := flag.String("token", defaultToken, "Execution API bearer token")
 	refresh := flag.Duration("refresh", 8*time.Second, "Refresh interval")
-	opportunityLimit := flag.Int("opportunity-limit", 200, "How many opportunities to fetch per refresh")
+	opportunityLimit := flag.Int("opportunity-limit", 5000, "How many opportunities to fetch per refresh")
 	flag.Parse()
 
 	client := tui.NewClient(*baseURL, *token, *opportunityLimit)
