@@ -72,10 +72,41 @@ func (r *OpportunityRepo) FindByID(ctx context.Context, id uint) (*entity.Opport
 	return &item, nil
 }
 
+func (r *OpportunityRepo) DeleteOlderThan(ctx context.Context, cutoffMs int64, limit int) (int64, error) {
+	if cutoffMs <= 0 {
+		return 0, nil
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+	latestBatch := r.client.GetDB(ctx).
+		Model(&entity.Opportunity{}).
+		Select("batch_id").
+		Order("as_of_time_ms desc").
+		Limit(1)
+	candidates := r.client.GetDB(ctx).
+		Model(&entity.Opportunity{}).
+		Select("id").
+		Where("as_of_time_ms < ?", cutoffMs).
+		Where("batch_id <> (?)", latestBatch).
+		Order("id asc").
+		Limit(limit)
+	result := r.client.GetDB(ctx).
+		Where("id IN (?)", candidates).
+		Delete(&entity.Opportunity{})
+	return result.RowsAffected, result.Error
+}
+
 func (r *OpportunityRepo) latestBatchID(ctx context.Context) (string, error) {
-	var latest entity.Opportunity
-	if err := r.client.GetDB(ctx).Order("as_of_time_ms desc").First(&latest).Error; err != nil {
+	row := r.client.GetDB(ctx).
+		Model(&entity.Opportunity{}).
+		Select("batch_id").
+		Order("as_of_time_ms desc").
+		Limit(1).
+		Row()
+	var batchID string
+	if err := row.Scan(&batchID); err != nil {
 		return "", err
 	}
-	return latest.BatchID, nil
+	return batchID, nil
 }

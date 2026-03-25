@@ -66,6 +66,10 @@ func (r stubOpportunityRepo) FindByID(_ context.Context, id uint) (*entity.Oppor
 	return nil, nil
 }
 
+func (r stubOpportunityRepo) DeleteOlderThan(_ context.Context, _ int64, _ int) (int64, error) {
+	return 0, nil
+}
+
 func TestFilterOpportunitiesToCurrentSettlementCycle_KeepsNearestFutureCycle(t *testing.T) {
 	now := time.Date(2026, 3, 24, 18, 40, 0, 0, time.UTC)
 	items := []entity.Opportunity{

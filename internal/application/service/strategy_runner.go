@@ -26,6 +26,10 @@ const (
 	OpportunityStatusBasisTooWide     = "basis_too_wide"
 	OpportunityStatusStaleData        = "stale_data"
 	OpportunityStatusOutsideEntryWind = "outside_entry_window"
+
+	opportunityHistoryRetention = 30 * time.Minute
+	persistenceCleanupInterval  = 5 * time.Minute
+	persistenceDeleteBatchSize  = 5000
 )
 
 // fundingSnapshotMinPriceChangeBps 控制 funding 快照持久化的最低价格变化阈值。
@@ -1182,17 +1186,57 @@ func (r *StrategyRunner) bookSnapshotLoop(ctx context.Context) {
 }
 
 func (r *StrategyRunner) snapshotCleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour)
+	r.runPersistenceCleanup(ctx, time.Now())
+	ticker := time.NewTicker(persistenceCleanupInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cutoff := time.Now().Add(-r.cfg.SnapshotRetention)
-			_ = r.marketRepo.DeleteOldFundingSnapshots(ctx, cutoff)
-			_ = r.marketRepo.DeleteOldBookTopSnapshots(ctx, cutoff)
+			r.runPersistenceCleanup(ctx, time.Now())
 		}
+	}
+}
+
+func (r *StrategyRunner) runPersistenceCleanup(ctx context.Context, now time.Time) {
+	snapshotCutoff := now.Add(-r.cfg.SnapshotRetention)
+	if err := r.marketRepo.DeleteOldFundingSnapshots(ctx, snapshotCutoff); err != nil {
+		r.logger.Error("cleanup_old_funding_snapshots_failed", slog.Any("err", err))
+	}
+	if err := r.marketRepo.DeleteOldBookTopSnapshots(ctx, snapshotCutoff); err != nil {
+		r.logger.Error("cleanup_old_book_snapshots_failed", slog.Any("err", err))
+	}
+	deletedOpps, err := r.deleteOldOpportunities(ctx, now.Add(-opportunityHistoryRetention).UnixMilli())
+	if err != nil {
+		r.logger.Error("cleanup_old_opportunities_failed", slog.Any("err", err))
+		return
+	}
+	if deletedOpps > 0 {
+		r.logger.Info("old_opportunities_trimmed",
+			slog.Int64("deleted", deletedOpps),
+			slog.String("retention", opportunityHistoryRetention.String()),
+		)
+	}
+}
+
+func (r *StrategyRunner) deleteOldOpportunities(ctx context.Context, cutoffMs int64) (int64, error) {
+	totalDeleted := int64(0)
+	for {
+		deleted, err := r.oppRepo.DeleteOlderThan(ctx, cutoffMs, persistenceDeleteBatchSize)
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += deleted
+		if deleted < persistenceDeleteBatchSize {
+			return totalDeleted, nil
+		}
+		select {
+		case <-ctx.Done():
+			return totalDeleted, ctx.Err()
+		default:
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

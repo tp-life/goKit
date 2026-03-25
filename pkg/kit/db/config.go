@@ -17,8 +17,8 @@ func DefaultConfig() Config {
 	return Config{
 		Driver:          "sqlite",
 		DSN:             "data/arbitrage.db",
-		MaxIdleConns:    1,
-		MaxOpenConns:    1,
+		MaxIdleConns:    2,
+		MaxOpenConns:    4,
 		ConnMaxLifetime: time.Hour,
 		LogMode:         "warn",
 		SlowThreshold:   200 * time.Millisecond,

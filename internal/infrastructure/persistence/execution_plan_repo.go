@@ -54,13 +54,13 @@ func (r *ExecutionPlanRepo) ListLatest(ctx context.Context, limit int) ([]entity
 	if limit <= 0 {
 		limit = 20
 	}
-	var latest entity.ExecutionPlan
-	if err := r.client.GetDB(ctx).Order("as_of_time_ms desc").First(&latest).Error; err != nil {
+	latestBatchID, err := r.latestBatchID(ctx)
+	if err != nil {
 		return []entity.ExecutionPlan{}, nil
 	}
 	var out []entity.ExecutionPlan
-	err := r.client.GetDB(ctx).
-		Where("batch_id = ?", latest.BatchID).
+	err = r.client.GetDB(ctx).
+		Where("batch_id = ?", latestBatchID).
 		Order("ready_now desc, score desc, net_expected_pnl desc").
 		Limit(limit).
 		Find(&out).Error
@@ -98,4 +98,18 @@ func (r *ExecutionPlanRepo) FindByPlanKey(ctx context.Context, planKey string) (
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (r *ExecutionPlanRepo) latestBatchID(ctx context.Context) (string, error) {
+	row := r.client.GetDB(ctx).
+		Model(&entity.ExecutionPlan{}).
+		Select("batch_id").
+		Order("as_of_time_ms desc").
+		Limit(1).
+		Row()
+	var batchID string
+	if err := row.Scan(&batchID); err != nil {
+		return "", err
+	}
+	return batchID, nil
 }

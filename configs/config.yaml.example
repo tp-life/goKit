@@ -30,9 +30,9 @@ database:
   # 数据库连接串（sqlite 下为文件路径）。
   dsn: "data/arbitrage.db"
   # 空闲连接池大小。
-  max_idle_conns: 1
+  max_idle_conns: 2
   # 最大打开连接数。
-  max_open_conns: 1
+  max_open_conns: 4
   # ORM 日志级别（silent/error/warn/info）。
   log_mode: "warn"
   # 慢 SQL 阈值。

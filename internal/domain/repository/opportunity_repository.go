@@ -80,4 +80,5 @@ type OpportunityRepository interface {
 	ListLatest(ctx context.Context, limit int) ([]entity.Opportunity, error)
 	ListLatestSummary(ctx context.Context, limit int) ([]OpportunitySummary, error)
 	FindByID(ctx context.Context, id uint) (*entity.Opportunity, error)
+	DeleteOlderThan(ctx context.Context, cutoffMs int64, limit int) (int64, error)
 }
