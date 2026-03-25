@@ -38,3 +38,5 @@ configs/config.yaml
 tmp/
 */node_modules
 .cursor
+.env
+data
