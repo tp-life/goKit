@@ -34,7 +34,7 @@ database:
   # 最大打开连接数。
   max_open_conns: 4
   # ORM 日志级别（silent/error/warn/info）。
-  log_mode: "warn"
+  log_mode: "error"
   # 慢 SQL 阈值。
   slow_threshold: 200ms
 
