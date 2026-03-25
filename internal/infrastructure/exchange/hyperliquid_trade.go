@@ -43,7 +43,8 @@ func NewHyperliquidTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Lo
 		c.RestBaseURL = "https://api.hyperliquid.xyz"
 	}
 	appCfg := loadAppConfig()
-	pkHex := strings.TrimPrefix(readEnvByName(c.Auth.PrivateKeyEnv), "0x")
+	accountAddress, privateKeyValue := readCredentialPair(c.Auth.AccountAddressEnv, c.Auth.PrivateKeyEnv)
+	pkHex := strings.TrimPrefix(privateKeyValue, "0x")
 	var pk *ecdsa.PrivateKey
 	if pkHex != "" {
 		if parsed, err := crypto.HexToECDSA(pkHex); err == nil {
@@ -56,7 +57,7 @@ func NewHyperliquidTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Lo
 		logger:         logger,
 		httpClient:     newHTTPClient(c, appCfg, logger, name+"-trade"),
 		privateKey:     pk,
-		accountAddress: strings.ToLower(readEnvByName(c.Auth.AccountAddressEnv)),
+		accountAddress: strings.ToLower(accountAddress),
 		vaultAddress:   strings.ToLower(readEnvByName(c.Auth.VaultAddressEnv)),
 	}
 }

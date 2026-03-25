@@ -3,7 +3,10 @@ package exchange
 import (
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/subosito/gotenv"
 )
 
 const (
@@ -100,6 +103,11 @@ type AppConfig struct {
 	Debug bool `mapstructure:"debug"`
 }
 
+var (
+	dotEnvValuesOnce sync.Once
+	dotEnvValues     map[string]string
+)
+
 func normalizeExchangeConfig(name string, c ExchangeConfig) ExchangeConfig {
 	// adapter_kind 只对“仓库内置的已知交易所”提供默认值。
 	//
@@ -140,10 +148,56 @@ func normalizeExchangeConfig(name string, c ExchangeConfig) ExchangeConfig {
 }
 
 func readEnvByName(name string) string {
+	if value := readProcessEnvByName(name); value != "" {
+		return value
+	}
+	return readDotEnvByName(name)
+}
+
+func readProcessEnvByName(name string) string {
 	if strings.TrimSpace(name) == "" {
 		return ""
 	}
 	return strings.TrimSpace(os.Getenv(name))
+}
+
+func readDotEnvByName(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	values := loadDotEnvValues()
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[strings.TrimSpace(name)])
+}
+
+func loadDotEnvValues() map[string]string {
+	dotEnvValuesOnce.Do(func() {
+		values, err := gotenv.Read(".env")
+		if err != nil {
+			dotEnvValues = map[string]string{}
+			return
+		}
+		dotEnvValues = values
+	})
+	return dotEnvValues
+}
+
+func readCredentialPair(primaryEnvName, secondaryEnvName string) (string, string) {
+	primaryProcess := readProcessEnvByName(primaryEnvName)
+	secondaryProcess := readProcessEnvByName(secondaryEnvName)
+	if primaryProcess != "" && secondaryProcess != "" {
+		return primaryProcess, secondaryProcess
+	}
+
+	primaryDotEnv := readDotEnvByName(primaryEnvName)
+	secondaryDotEnv := readDotEnvByName(secondaryEnvName)
+	if primaryDotEnv != "" && secondaryDotEnv != "" {
+		return primaryDotEnv, secondaryDotEnv
+	}
+
+	return firstNonEmpty(primaryProcess, primaryDotEnv), firstNonEmpty(secondaryProcess, secondaryDotEnv)
 }
 
 // AdapterOption 返回某个协议族私有配置项的值。

@@ -487,11 +487,76 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 		ui.panelTitle.Render("市场快照"),
 		renderMarketSummary(m.data.Market, width),
 		"",
+		ui.panelTitle.Render("收益构成"),
+		m.renderPnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width),
+		"",
 		ui.panelTitle.Render("双腿信息"),
 		m.renderLegsDetail(item, detail, hasDetail, loading, width),
 		"",
 		ui.panelTitle.Render("计划信息"),
 		m.renderPlanDetail(item, plan, hasPlan, rec, hasRec, width),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, plan entity.ExecutionPlan, hasPlan bool, width int) string {
+	carrySource := any(item)
+	if hasDetail && detail != nil {
+		carrySource = *detail
+	}
+	carryRate := fundingSpread(carrySource)
+	hourlyEdge := fundingSpreadHourly(carrySource)
+	notional := opportunityTargetNotional(carryRate, item.GrossFundingPNL, plan, hasPlan, m.data.System.Strategy)
+	strategy := m.data.System.Strategy
+
+	lines := []string{
+		clip(strings.Join([]string{
+			renderField("估算名义", renderUSDTValue(notional, 2)),
+			renderField("Funding carry", renderPctValue(carryRate, 5)),
+			renderField("时均 edge", renderPctValue(hourlyEdge, 5)),
+			renderField("事件数", toneStyle("accent").Render(fmt.Sprintf("多头 %d / 空头 %d", item.LongFundingEventCount, item.ShortFundingEventCount))),
+		}, "  "), width),
+		clip(toneStyle("subtle").Render("公式: 净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲"), width),
+		clip(strings.Join([]string{
+			toneStyle("subtle").Render("代入:"),
+			renderMoneyValue(item.NetExpectedPNL, 3),
+			toneStyle("subtle").Render("="),
+			renderMoneyValue(item.GrossFundingPNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.EntryFeePNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.ExitFeePNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.SlippagePNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.SafetyBufferPNL, 3),
+		}, " "), width),
+		clip(strings.Join([]string{
+			renderField("资金收益", renderMoneyValue(item.GrossFundingPNL, 3)),
+			renderField("计算", toneStyle("accent").Render(notionalFormulaText(notional, carryRate))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("入场手续费", renderCostSignedValue(item.EntryFeePNL, 3)),
+			renderField("模式", toneStyle("accent").Render(feeModeLabel(strategy.EntryMode))),
+			renderField("明细", toneStyle("accent").Render(feeBreakdownText(item, strategy, strategy.EntryMode))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("出场手续费", renderCostSignedValue(item.ExitFeePNL, 3)),
+			renderField("模式", toneStyle("accent").Render(feeModeLabel(strategy.ExitMode))),
+			renderField("明细", toneStyle("accent").Render(feeBreakdownText(item, strategy, strategy.ExitMode))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("滑点预估", renderCostSignedValue(item.SlippagePNL, 3)),
+			renderField("入场惩罚", renderBpsValue(-math.Abs(item.EntryPenaltyBps), 2)),
+			renderField("出场惩罚", renderBpsValue(-math.Abs(item.ExitPenaltyBps), 2)),
+			renderField("模型", toneStyle("accent").Render(orDefault(item.ExecutionPenaltyModel, "--"))),
+			renderField("桶", toneStyle("accent").Render(orDefault(item.ExecutionPenaltyBucket, "--"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("安全缓冲", renderCostSignedValue(item.SafetyBufferPNL, 3)),
+			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
+		}, "  "), width),
+		clip(toneStyle("subtle").Render("说明: 资金收益按当前最佳持有窗口估算；若会跨多轮 funding，后续事件会结合近期历史做平滑预测。"), width),
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1175,6 +1240,13 @@ func renderMoneyValue(value float64, digits int) string {
 	return toneStyle(signedNumberTone(value)).Render(fmtMoney(value, digits))
 }
 
+func renderUSDTValue(value float64, digits int) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return toneStyle("subtle").Render("--")
+	}
+	return toneStyle("accent").Render(fmt.Sprintf("%.*f USDT", digits, value))
+}
+
 func renderPctValue(value float64, digits int) string {
 	return toneStyle(signedNumberTone(value)).Render(fmtPctRatio(value, digits))
 }
@@ -1224,6 +1296,20 @@ func renderTimeValue(ms int64, tone string) string {
 	return toneStyle(tone).Render(fmtTime(ms))
 }
 
+func renderCostSignedValue(value float64, digits int) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return toneStyle("subtle").Render("--")
+	}
+	return toneStyle("bad").Render(fmtMoney(-math.Abs(value), digits))
+}
+
+func renderCostAbsValue(value float64, digits int) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return toneStyle("subtle").Render("--")
+	}
+	return toneStyle("bad").Render(fmt.Sprintf("%.*f USDT", digits, math.Abs(value)))
+}
+
 func signedNumberTone(value float64) string {
 	switch {
 	case math.IsNaN(value) || math.IsInf(value, 0):
@@ -1261,6 +1347,77 @@ func opportunityPlanTone(label string) string {
 	default:
 		return "accent"
 	}
+}
+
+func feeModeLabel(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "maker":
+		return "maker"
+	case "taker":
+		return "taker"
+	case "mid":
+		return "mid"
+	default:
+		if strings.TrimSpace(mode) == "" {
+			return "--"
+		}
+		return mode
+	}
+}
+
+func feeBreakdownText(item OpportunityListItem, strategy StrategyStatus, mode string) string {
+	parts := make([]string, 0, 2)
+	for _, exchangeName := range []string{item.LongExchange, item.ShortExchange} {
+		if bps, ok := feeRateBps(strategy, exchangeName, mode); ok {
+			parts = append(parts, fmt.Sprintf("%s %s %s", exchangeName, feeModeLabel(mode), fmt.Sprintf("%s bps", fmtNumber(bps, 2))))
+		}
+	}
+	if len(parts) == 0 {
+		return "--"
+	}
+	return strings.Join(parts, " + ")
+}
+
+func feeRateBps(strategy StrategyStatus, exchangeName string, mode string) (float64, bool) {
+	if len(strategy.FeesByExchange) == 0 {
+		return 0, false
+	}
+	fees, ok := strategy.FeesByExchange[strings.ToLower(strings.TrimSpace(exchangeName))]
+	if !ok {
+		return 0, false
+	}
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "maker":
+		return fees.MakerBps, true
+	case "taker":
+		return fees.TakerBps, true
+	case "mid":
+		return (fees.MakerBps + fees.TakerBps) / 2, true
+	default:
+		return fees.MakerBps, true
+	}
+}
+
+func opportunityTargetNotional(carryRate float64, grossFundingPNL float64, plan entity.ExecutionPlan, hasPlan bool, strategy StrategyStatus) float64 {
+	if hasPlan {
+		if value := targetNotional(plan); value > 0 {
+			return value
+		}
+	}
+	if strategy.EffectiveNotional > 0 {
+		return strategy.EffectiveNotional
+	}
+	if math.Abs(carryRate) > 0 && grossFundingPNL > 0 {
+		return grossFundingPNL / math.Abs(carryRate)
+	}
+	return 0
+}
+
+func notionalFormulaText(notional float64, carryRate float64) string {
+	if notional <= 0 || math.IsNaN(notional) || math.IsInf(notional, 0) {
+		return "--"
+	}
+	return fmt.Sprintf("%s × %s", fmt.Sprintf("%s USDT", fmtNumber(notional, 2)), fmtPctRatio(carryRate, 5))
 }
 
 func selectedMarker(active bool) string {

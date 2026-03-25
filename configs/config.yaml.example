@@ -209,6 +209,13 @@ exchanges:
       api_key_env: "BINANCE_API_KEY"
       # API Secret 的环境变量名。
       api_secret_env: "BINANCE_API_SECRET"
+      # RSA 模式使用的私钥环境变量名（推荐 PKCS#8 PEM）。
+      # private_key_env: "BINANCE_RSA_PRIVATE_KEY"
+    adapter_options:
+      # Binance 当前支持 legacy_hmac 与 rsa 两种私有鉴权方式。
+      # 若只配置了 private_key_env 且未提供 api_secret_env，程序会自动推断为 rsa。
+      # trade_auth_mode: "legacy_hmac"
+      # trade_auth_mode: "rsa"
 
   aster:
     adapter_kind: "binance_like"
@@ -228,8 +235,16 @@ exchanges:
       maker_bps: 0.5
       taker_bps: 4.0
     auth:
+      # legacy_hmac 模式使用 API key / secret。
       api_key_env: "ASTER_API_KEY"
       api_secret_env: "ASTER_API_SECRET"
+      # v3_signer 模式使用主账户地址 + API wallet 私钥。
+      # account_address_env: "ASTER_ACCOUNT_ADDRESS"
+      # private_key_env: "ASTER_SIGNER_PRIVATE_KEY"
+    adapter_options:
+      # Aster 同时支持 legacy_hmac 与 v3_signer；默认会按已配置凭证自动判断。
+      # trade_auth_mode: "legacy_hmac"
+      # trade_auth_mode: "v3_signer"
 
   # Bybit 目前作为一个独立协议族接入，而不是继续复用 binance_like。
   # 这样做的原因是：Bybit V5 的签名头、REST 路径、订单/持仓字段和 Binance Futures 明显不同。

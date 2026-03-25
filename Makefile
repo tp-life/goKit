@@ -1,9 +1,10 @@
-.PHONY: all build run build-tui run-tui test clean tidy docker-build help
+.PHONY: all build run build-tui run-tui build-tradeprobe run-tradeprobe test clean tidy docker-build help
 
 PROJECT_NAME := nexus
 APP_NAME := server
 MAIN_FILE := cmd/server/main.go
 TUI_MAIN_FILE := cmd/tui/main.go
+TRADE_PROBE_MAIN_FILE := cmd/tradeprobe/main.go
 
 # 默认目标
 all: build
@@ -25,6 +26,10 @@ run:
 run-tui:
 	go run $(TUI_MAIN_FILE)
 
+## run-tradeprobe: 运行交易探针（可额外追加 ARGS='--action inspect'）
+run-tradeprobe:
+	go run $(TRADE_PROBE_MAIN_FILE) $(ARGS)
+
 ## build: 编译二进制文件
 build:
 	@echo "Building $(APP_NAME)..."
@@ -34,6 +39,11 @@ build:
 build-tui:
 	@echo "Building tui..."
 	go build -o bin/tui $(TUI_MAIN_FILE)
+
+## build-tradeprobe: 编译交易探针二进制
+build-tradeprobe:
+	@echo "Building tradeprobe..."
+	go build -o bin/tradeprobe $(TRADE_PROBE_MAIN_FILE)
 
 ## test: 运行单元测试
 test:

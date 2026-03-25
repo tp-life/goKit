@@ -94,14 +94,15 @@ func NewBybitV5TradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger
 		c.PrivateWSBaseURL = "wss://stream.bybit.com/v5/private"
 	}
 	appCfg := loadAppConfig()
+	apiKey, apiSecret := readCredentialPair(c.Auth.APIKeyEnv, c.Auth.APISecretEnv)
 	return &BybitV5TradeClient{
 		name:         name,
 		cfg:          c,
 		logger:       logger,
 		httpClient:   newHTTPClient(c, appCfg, logger, name+"-trade"),
 		wsDialer:     newWebSocketDialer(c, appCfg, logger, name+"-trade"),
-		apiKey:       readEnvByName(c.Auth.APIKeyEnv),
-		apiSecret:    readEnvByName(c.Auth.APISecretEnv),
+		apiKey:       apiKey,
+		apiSecret:    apiSecret,
 		recvWindow:   bybitRecvWindow(c),
 		category:     bybitCategory(c),
 		accountType:  bybitAccountType(c),

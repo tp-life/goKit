@@ -2,19 +2,37 @@ package exchange
 
 import (
 	"context"
+	stdcrypto "crypto"
+	"crypto/ecdsa"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	binanceLikeTradeAuthLegacyHMAC = "legacy_hmac"
+	binanceLikeTradeAuthRSA        = "rsa"
+	asterTradeAuthV3Signer         = "v3_signer"
 )
 
 // CEXTradeClient 是保留了历史命名的实现类型。
@@ -25,16 +43,23 @@ import (
 // 这层纠偏非常重要，因为后续如果继续接入 OKX / Bybit / Bitget，
 // 我们应该先判断它们是否真的属于同一协议族，而不是被 `CEX` 这个宽泛名字误导。
 type CEXTradeClient struct {
-	name         string
-	cfg          ExchangeConfig
-	logger       *slog.Logger
-	httpClient   *http.Client
-	wsDialer     *websocket.Dialer
-	apiKey       string
-	apiSecret    string
-	orderPath    string
-	positionPath string
-	accountPath  string
+	name          string
+	cfg           ExchangeConfig
+	logger        *slog.Logger
+	httpClient    *http.Client
+	wsDialer      *websocket.Dialer
+	apiKey        string
+	apiSecret     string
+	rsaPrivateKey *rsa.PrivateKey
+	privateKey    *ecdsa.PrivateKey
+	accountAddr   string
+	signerAddr    string
+	authMode      string
+	orderPath     string
+	positionPath  string
+	accountPath   string
+	nonceMu       sync.Mutex
+	lastNonce     int64
 }
 
 func NewBinanceTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
@@ -86,28 +111,55 @@ func NewCEXTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) Tr
 	orderPath := "/fapi/v1/order"
 	positionPath := "/fapi/v2/positionRisk"
 	accountPath := "/fapi/v2/account"
-	if name == "aster" {
-		orderPath = "/fapi/v3/order"
+	authMode := tradeAuthMode(name, c)
+	if name == "binance" {
 		positionPath = "/fapi/v3/positionRisk"
 		accountPath = "/fapi/v3/account"
 	}
+	if name == "aster" && authMode == asterTradeAuthV3Signer {
+		orderPath = "/fapi/v3/order"
+		positionPath = "/fapi/v3/positionRisk"
+		accountPath = "/fapi/v3/account"
+	} else if name == "aster" {
+		accountPath = "/fapi/v4/account"
+	}
+	pk, signerAddr := loadAsterSigner(c.Auth)
+	rsaPK := loadRSASigner(c.Auth)
+	apiKey, apiSecret := readCredentialPair(c.Auth.APIKeyEnv, c.Auth.APISecretEnv)
+	accountAddr, _ := readCredentialPair(c.Auth.AccountAddressEnv, c.Auth.PrivateKeyEnv)
 	client := &CEXTradeClient{
-		name:         name,
-		cfg:          c,
-		logger:       logger,
-		httpClient:   newHTTPClient(c, appCfg, logger, name+"-trade"),
-		wsDialer:     newWebSocketDialer(c, appCfg, logger, name+"-trade"),
-		apiKey:       readEnvByName(c.Auth.APIKeyEnv),
-		apiSecret:    readEnvByName(c.Auth.APISecretEnv),
-		orderPath:    orderPath,
-		positionPath: positionPath,
-		accountPath:  accountPath,
+		name:          name,
+		cfg:           c,
+		logger:        logger,
+		httpClient:    newHTTPClient(c, appCfg, logger, name+"-trade"),
+		wsDialer:      newWebSocketDialer(c, appCfg, logger, name+"-trade"),
+		apiKey:        apiKey,
+		apiSecret:     apiSecret,
+		rsaPrivateKey: rsaPK,
+		privateKey:    pk,
+		accountAddr:   strings.TrimSpace(accountAddr),
+		signerAddr:    signerAddr,
+		authMode:      authMode,
+		orderPath:     orderPath,
+		positionPath:  positionPath,
+		accountPath:   accountPath,
 	}
 	return client
 }
 
-func (c *CEXTradeClient) Name() string  { return c.name }
-func (c *CEXTradeClient) Enabled() bool { return c.cfg.Enabled && c.apiKey != "" && c.apiSecret != "" }
+func (c *CEXTradeClient) Name() string { return c.name }
+func (c *CEXTradeClient) Enabled() bool {
+	if !c.cfg.Enabled {
+		return false
+	}
+	switch c.authMode {
+	case asterTradeAuthV3Signer:
+		return c.privateKey != nil && strings.TrimSpace(c.accountAddr) != "" && strings.TrimSpace(c.signerAddr) != ""
+	case binanceLikeTradeAuthRSA:
+		return strings.TrimSpace(c.apiKey) != "" && c.rsaPrivateKey != nil
+	}
+	return c.apiKey != "" && c.apiSecret != ""
+}
 func (c *CEXTradeClient) Capabilities() TradeCapabilities {
 	return TradeCapabilities{
 		MakerLimitTIF:            "GTX",
@@ -126,7 +178,9 @@ func (c *CEXTradeClient) PlaceOrder(ctx context.Context, req TradeOrderRequest) 
 	params.Set("side", strings.ToUpper(req.Side))
 	params.Set("quantity", formatFloat(req.Quantity, 8))
 	params.Set("newOrderRespType", "RESULT")
-	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	if c.authMode != asterTradeAuthV3Signer {
+		params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	}
 	if req.ClientOrderID != "" {
 		params.Set("newClientOrderId", req.ClientOrderID)
 	}
@@ -193,7 +247,9 @@ func (c *CEXTradeClient) GetOrderStatus(ctx context.Context, req OrderLookupRequ
 	}
 	params := url.Values{}
 	params.Set("symbol", req.VenueSymbol)
-	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	if c.authMode != asterTradeAuthV3Signer {
+		params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	}
 	if req.VenueOrderID != "" {
 		params.Set("orderId", req.VenueOrderID)
 	} else if req.ClientOrderID != "" {
@@ -225,7 +281,9 @@ func (c *CEXTradeClient) GetAccountSnapshot(ctx context.Context) (AccountSnapsho
 		return AccountSnapshot{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
 	params := url.Values{}
-	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	if c.authMode != asterTradeAuthV3Signer {
+		params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	}
 	var payload map[string]any
 	raw, err := c.signedGET(ctx, c.accountPath, params, &payload)
 	if err != nil {
@@ -245,7 +303,9 @@ func (c *CEXTradeClient) GetPosition(ctx context.Context, canonicalSymbol, venue
 		return Position{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
 	params := url.Values{}
-	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	if c.authMode != asterTradeAuthV3Signer {
+		params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	}
 	var payload []map[string]any
 	_, err := c.signedGET(ctx, c.positionPath, params, &payload)
 	if err != nil {
@@ -302,10 +362,18 @@ func (c *CEXTradeClient) signedDo(ctx context.Context, method, path string, para
 }
 
 func (c *CEXTradeClient) performSignedRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {
+	switch c.authMode {
+	case asterTradeAuthV3Signer:
+		return c.performAsterV3SignedRequest(ctx, method, path, params)
+	case binanceLikeTradeAuthRSA:
+		return c.performRSASignedRequest(ctx, method, path, params)
+	}
+	return c.performLegacyHMACSignedRequest(ctx, method, path, params)
+}
+
+func (c *CEXTradeClient) performLegacyHMACSignedRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {
 	payload := params.Encode()
-	mac := hmac.New(sha256.New, []byte(c.apiSecret))
-	_, _ = mac.Write([]byte(payload))
-	signature := hex.EncodeToString(mac.Sum(nil))
+	signature := signLegacyHMACPayload(c.apiSecret, payload)
 	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path + "?" + payload + "&signature=" + signature
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
@@ -322,6 +390,236 @@ func (c *CEXTradeClient) performSignedRequest(ctx context.Context, method, path 
 		return nil, nil, readErr
 	}
 	return resp, body, nil
+}
+
+func (c *CEXTradeClient) performRSASignedRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {
+	payload := params.Encode()
+	signature, err := signRSAPayload(c.rsaPrivateKey, payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path + "?" + payload + "&signature=" + url.QueryEscape(signature)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("X-MBX-APIKEY", c.apiKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	return resp, body, nil
+}
+
+func (c *CEXTradeClient) performAsterV3SignedRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {
+	signedParams := cloneURLValues(params)
+	signedParams.Set("user", c.accountAddr)
+	signedParams.Set("signer", c.signerAddr)
+	signedParams.Set("nonce", fmt.Sprintf("%d", c.nextNonce()))
+
+	payload := signedParams.Encode()
+	signature, err := c.signAsterV3Payload(payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	signedParams.Set("signature", signature)
+
+	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + path
+	var bodyReader io.Reader
+	if strings.EqualFold(method, http.MethodGet) {
+		endpoint += "?" + signedParams.Encode()
+	} else {
+		bodyReader = strings.NewReader(signedParams.Encode())
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if bodyReader != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	return resp, body, nil
+}
+
+func (c *CEXTradeClient) signAsterV3Payload(payload string) (string, error) {
+	if c.privateKey == nil {
+		return "", fmt.Errorf("%s aster v3 signer private key missing", c.name)
+	}
+	typedData := apitypes.TypedData{
+		Types: apitypes.Types{
+			"EIP712Domain": {
+				{Name: "name", Type: "string"},
+				{Name: "version", Type: "string"},
+				{Name: "chainId", Type: "uint256"},
+				{Name: "verifyingContract", Type: "address"},
+			},
+			"Message": {
+				{Name: "msg", Type: "string"},
+			},
+		},
+		PrimaryType: "Message",
+		Domain: apitypes.TypedDataDomain{
+			Name:              "AsterSignTransaction",
+			Version:           "1",
+			ChainId:           math.NewHexOrDecimal256(1666),
+			VerifyingContract: "0x0000000000000000000000000000000000000000",
+		},
+		Message: apitypes.TypedDataMessage{
+			"msg": payload,
+		},
+	}
+	hash, _, err := apitypes.TypedDataAndHash(typedData)
+	if err != nil {
+		return "", fmt.Errorf("%s aster v3 sign typed data failed: %w", c.name, err)
+	}
+	sig, err := crypto.Sign(hash, c.privateKey)
+	if err != nil {
+		return "", fmt.Errorf("%s aster v3 sign failed: %w", c.name, err)
+	}
+	if len(sig) != 65 {
+		return "", fmt.Errorf("%s aster v3 invalid signature length %d", c.name, len(sig))
+	}
+	sig[64] += 27
+	return hexutil.Encode(sig), nil
+}
+
+func (c *CEXTradeClient) nextNonce() int64 {
+	c.nonceMu.Lock()
+	defer c.nonceMu.Unlock()
+
+	nonce := time.Now().UnixMicro()
+	if nonce <= c.lastNonce {
+		nonce = c.lastNonce + 1
+	}
+	c.lastNonce = nonce
+	return nonce
+}
+
+func cloneURLValues(values url.Values) url.Values {
+	if values == nil {
+		return url.Values{}
+	}
+	cloned := make(url.Values, len(values))
+	for key, items := range values {
+		cloned[key] = append([]string(nil), items...)
+	}
+	return cloned
+}
+
+func tradeAuthMode(name string, cfg ExchangeConfig) string {
+	switch strings.ToLower(strings.TrimSpace(cfg.AdapterOption("trade_auth_mode"))) {
+	case asterTradeAuthV3Signer:
+		return asterTradeAuthV3Signer
+	case binanceLikeTradeAuthRSA, "rsa_pkcs8":
+		return binanceLikeTradeAuthRSA
+	case binanceLikeTradeAuthLegacyHMAC:
+		return binanceLikeTradeAuthLegacyHMAC
+	}
+	if name == "aster" && hasAsterSignerCredentials(cfg.Auth) {
+		return asterTradeAuthV3Signer
+	}
+	if name != "aster" && hasRSASignerCredentials(cfg.Auth) && !hasLegacyHMACCredentials(cfg.Auth) {
+		return binanceLikeTradeAuthRSA
+	}
+	return binanceLikeTradeAuthLegacyHMAC
+}
+
+func hasAsterSignerCredentials(auth AuthConfig) bool {
+	accountAddr, privateKey := readCredentialPair(auth.AccountAddressEnv, auth.PrivateKeyEnv)
+	return strings.TrimSpace(accountAddr) != "" && strings.TrimSpace(privateKey) != ""
+}
+
+func hasLegacyHMACCredentials(auth AuthConfig) bool {
+	apiKey, apiSecret := readCredentialPair(auth.APIKeyEnv, auth.APISecretEnv)
+	return strings.TrimSpace(apiKey) != "" && strings.TrimSpace(apiSecret) != ""
+}
+
+func hasRSASignerCredentials(auth AuthConfig) bool {
+	apiKey, privateKey := readCredentialPair(auth.APIKeyEnv, auth.PrivateKeyEnv)
+	return strings.TrimSpace(apiKey) != "" && strings.TrimSpace(privateKey) != ""
+}
+
+func loadAsterSigner(auth AuthConfig) (*ecdsa.PrivateKey, string) {
+	_, privateKey := readCredentialPair(auth.AccountAddressEnv, auth.PrivateKeyEnv)
+	pkHex := strings.TrimPrefix(privateKey, "0x")
+	if strings.TrimSpace(pkHex) == "" {
+		return nil, ""
+	}
+	pk, err := crypto.HexToECDSA(pkHex)
+	if err != nil {
+		return nil, ""
+	}
+	extra := auth.ResolveExtraEnv()
+	signerAddr := strings.TrimSpace(extra["signer"])
+	if signerAddr == "" {
+		signerAddr = crypto.PubkeyToAddress(pk.PublicKey).Hex()
+	}
+	return pk, signerAddr
+}
+
+func loadRSASigner(auth AuthConfig) *rsa.PrivateKey {
+	_, resolvedPrivateKey := readCredentialPair(auth.APIKeyEnv, auth.PrivateKeyEnv)
+	privateKey := normalizePrivateKeyPEM(resolvedPrivateKey)
+	if privateKey == "" {
+		return nil
+	}
+	block, _ := pem.Decode([]byte(privateKey))
+	if block == nil {
+		return nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err == nil {
+		if rsaKey, ok := parsed.(*rsa.PrivateKey); ok {
+			return rsaKey
+		}
+		return nil
+	}
+	rsaKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return rsaKey
+}
+
+func normalizePrivateKeyPEM(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return strings.ReplaceAll(value, `\n`, "\n")
+}
+
+func signLegacyHMACPayload(secret, payload string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func signRSAPayload(privateKey *rsa.PrivateKey, payload string) (string, error) {
+	if privateKey == nil {
+		return "", fmt.Errorf("rsa private key missing")
+	}
+	digest := sha256.Sum256([]byte(payload))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey, stdcrypto.SHA256, digest[:])
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(signature), nil
 }
 
 func asString(v any) string {
