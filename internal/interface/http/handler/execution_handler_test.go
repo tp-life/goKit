@@ -30,6 +30,40 @@ type executionHandlerTestPlanRepo struct {
 	items []entity.ExecutionPlan
 }
 
+type executionHandlerTestTradeAdapter struct {
+	name     string
+	enabled  bool
+	position exchange.Position
+}
+
+func (a *executionHandlerTestTradeAdapter) Name() string { return a.name }
+
+func (a *executionHandlerTestTradeAdapter) Enabled() bool { return a.enabled }
+
+func (*executionHandlerTestTradeAdapter) Capabilities() exchange.TradeCapabilities {
+	return exchange.TradeCapabilities{}
+}
+
+func (*executionHandlerTestTradeAdapter) PlaceOrder(context.Context, exchange.TradeOrderRequest) (exchange.TradeOrderResult, error) {
+	return exchange.TradeOrderResult{Status: "FILLED"}, nil
+}
+
+func (*executionHandlerTestTradeAdapter) ClosePosition(context.Context, exchange.TradeOrderRequest) (exchange.TradeOrderResult, error) {
+	return exchange.TradeOrderResult{Status: "FILLED"}, nil
+}
+
+func (a *executionHandlerTestTradeAdapter) GetPosition(context.Context, string, string, string) (exchange.Position, error) {
+	return a.position, nil
+}
+
+func (*executionHandlerTestTradeAdapter) GetOrderStatus(context.Context, exchange.OrderLookupRequest) (exchange.OrderStatus, error) {
+	return exchange.OrderStatus{Status: "FILLED", Terminal: true}, nil
+}
+
+func (*executionHandlerTestTradeAdapter) GetAccountSnapshot(context.Context) (exchange.AccountSnapshot, error) {
+	return exchange.AccountSnapshot{}, nil
+}
+
 func (r *executionHandlerTestOrderRepo) Create(_ context.Context, item *entity.OrderRecord) error {
 	if item != nil {
 		r.items = append(r.items, *item)
@@ -180,7 +214,7 @@ func (r *executionHandlerTestPlanRepo) FindByPlanKey(_ context.Context, planKey 
 	return nil, nil
 }
 
-func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRepo *executionHandlerTestExecRepo, planRepo *executionHandlerTestPlanRepo) *fiber.App {
+func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRepo *executionHandlerTestExecRepo, planRepo *executionHandlerTestPlanRepo, trades ...exchange.TradeAdapter) *fiber.App {
 	if planRepo == nil {
 		planRepo = &executionHandlerTestPlanRepo{}
 	}
@@ -192,12 +226,13 @@ func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRe
 		PlanRepo:  planRepo,
 		ExecRepo:  execRepo,
 		OrderRepo: orderRepo,
-		Trades:    []exchange.TradeAdapter{},
+		Trades:    trades,
 	})
 
 	app := fiber.New()
 	app.Use(middleware.ErrorHandler(logger))
 	app.Get("/api/v1/executions/auto-close-candidates", NewExecutionHandler(svc).AutoCloseCandidates)
+	app.Get("/api/v1/executions/live-positions", NewExecutionHandler(svc).LivePositions)
 	app.Post("/api/v1/executions/:planKey/open", NewExecutionHandler(svc).Open)
 	app.Post("/api/v1/executions/:planKey/close", NewExecutionHandler(svc).Close)
 	app.Post("/api/v1/executions/auto-close-sweep", NewExecutionHandler(svc).SweepAutoClose)
@@ -254,6 +289,63 @@ func TestAutoCloseCandidates_ReturnsInspection(t *testing.T) {
 	}
 	if body.Data.Total != 1 || body.Data.ShouldClose != 1 {
 		t.Fatalf("expected one retry-close candidate, got %+v", body.Data)
+	}
+}
+
+func TestLivePositions_ReturnsInspection(t *testing.T) {
+	execRepo := &executionHandlerTestExecRepo{
+		items: []entity.ExecutionRecord{{
+			PlanKey:       "plan-live-position",
+			Symbol:        "BTC",
+			Status:        "opened",
+			LiveTrading:   true,
+			AutoClose:     true,
+			LongExchange:  "longex",
+			ShortExchange: "shortex",
+		}},
+	}
+	planRepo := &executionHandlerTestPlanRepo{
+		items: []entity.ExecutionPlan{{
+			PlanKey:          "plan-live-position",
+			Symbol:           "BTC",
+			LongExchange:     "longex",
+			ShortExchange:    "shortex",
+			LongVenueSymbol:  "BTCUSDT",
+			ShortVenueSymbol: "BTCUSDT",
+			LongQty:          1,
+			ShortQty:         1,
+		}},
+	}
+	longAdapter := &executionHandlerTestTradeAdapter{name: "longex", enabled: true, position: exchange.Position{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: 1, EntryPrice: 100, MarkPrice: 101}}
+	shortAdapter := &executionHandlerTestTradeAdapter{name: "shortex", enabled: true, position: exchange.Position{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: -1, EntryPrice: 100, MarkPrice: 99}}
+	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, execRepo, planRepo, longAdapter, shortAdapter)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/executions/live-positions", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Code int                            `json:"code"`
+		Data service.LivePositionInspection `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("expected response body to be valid json: %v", err)
+	}
+	if body.Code != 0 {
+		t.Fatalf("expected business code 0, got %d", body.Code)
+	}
+	if body.Data.Total != 1 || body.Data.InSync != 1 {
+		t.Fatalf("expected one in-sync live position, got %+v", body.Data)
+	}
+	if len(body.Data.Candidates) != 1 || body.Data.Candidates[0].SyncStatus != "in_sync" {
+		t.Fatalf("expected first candidate to be in sync, got %+v", body.Data.Candidates)
 	}
 }
 

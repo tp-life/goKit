@@ -31,11 +31,11 @@ const (
 func (v mainView) String() string {
 	switch v {
 	case viewExecution:
-		return "Execution"
+		return "执行"
 	case viewSystem:
-		return "System"
+		return "系统"
 	default:
-		return "Scanner"
+		return "扫描"
 	}
 }
 
@@ -52,15 +52,15 @@ const (
 func (t scannerTab) String() string {
 	switch t {
 	case tabLegs:
-		return "Legs"
+		return "双腿"
 	case tabPlan:
-		return "Plan"
+		return "计划"
 	case tabProjection:
-		return "Projection"
+		return "预测"
 	case tabOrders:
-		return "Orders"
+		return "订单"
 	default:
-		return "Overview"
+		return "总览"
 	}
 }
 
@@ -75,11 +75,11 @@ const (
 func (s sortMode) String() string {
 	switch s {
 	case sortByScore:
-		return "score"
+		return "评分"
 	case sortByEdge:
-		return "edge"
+		return "边际"
 	default:
-		return "net"
+		return "净收益"
 	}
 }
 
@@ -103,9 +103,9 @@ const (
 
 func (m executionListMode) String() string {
 	if m == execRecords {
-		return "Executions"
+		return "执行记录"
 	}
-	return "Plans"
+	return "执行计划"
 }
 
 type actionType string
@@ -225,6 +225,7 @@ type refreshLoadedMsg struct {
 	Seq           int
 	System        SystemStatus
 	AutoClose     service.AutoCloseInspection
+	LivePositions service.LivePositionInspection
 	Opportunities []OpportunityListItem
 	Executions    []entity.ExecutionRecord
 	Stats         repository.SnapshotStats
@@ -344,6 +345,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.data.System = msg.System
 		m.data.AutoClose = msg.AutoClose
+		m.data.LivePositions = msg.LivePositions
 		m.data.Opportunities = msg.Opportunities
 		m.data.Executions = msg.Executions
 		m.data.Stats = msg.Stats
@@ -1425,6 +1427,15 @@ func (m Model) executionByPlanKey(planKey string) (entity.ExecutionRecord, bool)
 	return entity.ExecutionRecord{}, false
 }
 
+func (m Model) livePositionByPlanKey(planKey string) (service.LivePositionCandidate, bool) {
+	for _, item := range m.data.LivePositions.Candidates {
+		if item.Execution.PlanKey == planKey {
+			return item, true
+		}
+	}
+	return service.LivePositionCandidate{}, false
+}
+
 func (m Model) indexOfOpportunity(items []OpportunityListItem, key string) int {
 	for i, item := range items {
 		if opportunityKey(item) == key {
@@ -1473,6 +1484,7 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 		var (
 			system    SystemStatus
 			autoClose service.AutoCloseInspection
+			positions service.LivePositionInspection
 			opps      []OpportunityListItem
 			execs     []entity.ExecutionRecord
 			stats     repository.SnapshotStats
@@ -1494,7 +1506,7 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 			})
 		}
 
-		wg.Add(6)
+		wg.Add(7)
 		go func() {
 			defer wg.Done()
 			var err error
@@ -1505,6 +1517,12 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 			defer wg.Done()
 			var err error
 			autoClose, err = client.getAutoCloseCandidates(ctx)
+			setErr(err)
+		}()
+		go func() {
+			defer wg.Done()
+			var err error
+			positions, err = client.getLivePositions(ctx)
 			setErr(err)
 		}()
 		go func() {
@@ -1555,6 +1573,7 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 			Seq:           seq,
 			System:        system,
 			AutoClose:     autoClose,
+			LivePositions: positions,
 			Opportunities: opps,
 			Executions:    execs,
 			Stats:         stats,

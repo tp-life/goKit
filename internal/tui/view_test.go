@@ -83,10 +83,10 @@ func TestRenderHeader_IncludesHardLimits(t *testing.T) {
 
 	got := m.renderHeader(240)
 	for _, needle := range []string{
-		"min_pnl 1.500U",
-		"max_spread 12.00bps",
-		"entry_lead 45m0s",
-		"close_grace 5m0s",
+		"最小收益 1.500U",
+		"最大价差 12.00bps",
+		"提前开仓 45m0s",
+		"平仓缓冲 5m0s",
 	} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("expected header to contain %q, got %q", needle, got)

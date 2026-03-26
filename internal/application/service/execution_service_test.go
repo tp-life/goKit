@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -856,6 +857,240 @@ func TestInspectLiveAutoClose_ReportsDecisionAndRetryCloseCandidates(t *testing.
 	}
 	if pendingCandidate == nil || pendingCandidate.Decision.Eligible {
 		t.Fatalf("expected pending_close candidate to be excluded from scan, got %+v", pendingCandidate)
+	}
+}
+
+func TestInspectLivePositions_ReportsSyncAndManualCloseDrift(t *testing.T) {
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:       "plan-in-sync",
+				Symbol:        "BTC",
+				Status:        executionStateOpened,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longsync",
+				ShortExchange: "shortsync",
+			},
+			{
+				PlanKey:       "plan-manual-flat",
+				Symbol:        "ETH",
+				Status:        executionStateOpened,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longflat",
+				ShortExchange: "shortflat",
+			},
+			{
+				PlanKey:       "plan-single-leg",
+				Symbol:        "SOL",
+				Status:        executionStateOpenPartial,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longsolo",
+				ShortExchange: "shortsolo",
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-in-sync",
+				Symbol:           "BTC",
+				LongExchange:     "longsync",
+				ShortExchange:    "shortsync",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          1,
+				ShortQty:         1,
+			},
+			{
+				PlanKey:          "plan-manual-flat",
+				Symbol:           "ETH",
+				LongExchange:     "longflat",
+				ShortExchange:    "shortflat",
+				LongVenueSymbol:  "ETHUSDT",
+				ShortVenueSymbol: "ETHUSDT",
+				LongQty:          2,
+				ShortQty:         2,
+			},
+			{
+				PlanKey:          "plan-single-leg",
+				Symbol:           "SOL",
+				LongExchange:     "longsolo",
+				ShortExchange:    "shortsolo",
+				LongVenueSymbol:  "SOLUSDT",
+				ShortVenueSymbol: "SOLUSDT",
+				LongQty:          3,
+				ShortQty:         3,
+			},
+		},
+	}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"longsync":  &testTradeAdapter{name: "longsync", enabled: true, position: exchange.Position{Exchange: "longsync", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: 1, EntryPrice: 100, MarkPrice: 101}},
+		"shortsync": &testTradeAdapter{name: "shortsync", enabled: true, position: exchange.Position{Exchange: "shortsync", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: -1, EntryPrice: 100, MarkPrice: 99}},
+		"longflat":  &testTradeAdapter{name: "longflat", enabled: true, position: exchange.Position{Exchange: "longflat", Symbol: "ETH", VenueSymbol: "ETHUSDT", Quantity: 0}},
+		"shortflat": &testTradeAdapter{name: "shortflat", enabled: true, position: exchange.Position{Exchange: "shortflat", Symbol: "ETH", VenueSymbol: "ETHUSDT", Quantity: 0}},
+		"longsolo":  &testTradeAdapter{name: "longsolo", enabled: true, position: exchange.Position{Exchange: "longsolo", Symbol: "SOL", VenueSymbol: "SOLUSDT", Quantity: 3, EntryPrice: 50, MarkPrice: 51}},
+		"shortsolo": &testTradeAdapter{name: "shortsolo", enabled: true, position: exchange.Position{Exchange: "shortsolo", Symbol: "SOL", VenueSymbol: "SOLUSDT", Quantity: 0}},
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+
+	inspection, err := svc.InspectLivePositions(context.Background())
+	if err != nil {
+		t.Fatalf("expected inspect live positions to succeed, got %v", err)
+	}
+	if inspection.Total != 3 {
+		t.Fatalf("expected 3 live position candidates, got %d", inspection.Total)
+	}
+	if inspection.InSync != 1 || inspection.Flat != 1 || inspection.SingleLeg != 1 {
+		t.Fatalf("expected 1 in_sync / 1 flat / 1 single_leg, got %+v", inspection)
+	}
+
+	statusByPlan := map[string]string{}
+	for _, item := range inspection.Candidates {
+		statusByPlan[item.Execution.PlanKey] = item.SyncStatus
+	}
+	if statusByPlan["plan-in-sync"] != "in_sync" {
+		t.Fatalf("expected plan-in-sync to be in_sync, got %q", statusByPlan["plan-in-sync"])
+	}
+	if statusByPlan["plan-manual-flat"] != "flat" {
+		t.Fatalf("expected plan-manual-flat to be flat, got %q", statusByPlan["plan-manual-flat"])
+	}
+	if statusByPlan["plan-single-leg"] != "single_leg" {
+		t.Fatalf("expected plan-single-leg to be single_leg, got %q", statusByPlan["plan-single-leg"])
+	}
+}
+
+func TestReconcileLivePositions_MarksFlatLiveExecutionClosed(t *testing.T) {
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:       "plan-manual-flat",
+				Symbol:        "ETH",
+				Status:        executionStateOpened,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longflat",
+				ShortExchange: "shortflat",
+				LastError:     "old close failure",
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-manual-flat",
+				Symbol:           "ETH",
+				LongExchange:     "longflat",
+				ShortExchange:    "shortflat",
+				LongVenueSymbol:  "ETHUSDT",
+				ShortVenueSymbol: "ETHUSDT",
+				LongQty:          2,
+				ShortQty:         2,
+			},
+		},
+	}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"longflat":  &testTradeAdapter{name: "longflat", enabled: true, position: exchange.Position{Exchange: "longflat", Symbol: "ETH", VenueSymbol: "ETHUSDT", Quantity: 0}},
+		"shortflat": &testTradeAdapter{name: "shortflat", enabled: true, position: exchange.Position{Exchange: "shortflat", Symbol: "ETH", VenueSymbol: "ETHUSDT", Quantity: 0}},
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+
+	reconciled, err := svc.ReconcileLivePositions(context.Background())
+	if err != nil {
+		t.Fatalf("expected reconcile to succeed, got %v", err)
+	}
+	if reconciled != 1 {
+		t.Fatalf("expected 1 reconciled execution, got %d", reconciled)
+	}
+
+	rec, err := execRepo.FindByPlanKey(context.Background(), "plan-manual-flat")
+	if err != nil {
+		t.Fatalf("expected load reconciled record to succeed, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected reconciled record to exist")
+	}
+	if rec.Status != executionStateClosed {
+		t.Fatalf("expected reconciled record status %q, got %q", executionStateClosed, rec.Status)
+	}
+	if rec.ClosedAtMs == 0 {
+		t.Fatal("expected reconciled record to have closed_at_ms set")
+	}
+	if rec.LastTransitionEvent != "external_positions_flat" {
+		t.Fatalf("expected last transition event external_positions_flat, got %q", rec.LastTransitionEvent)
+	}
+	if !strings.Contains(rec.StatusReason, "externally closed") {
+		t.Fatalf("expected status reason to mention externally closed, got %q", rec.StatusReason)
+	}
+	if rec.LastError != "" {
+		t.Fatalf("expected last error to be cleared after reconcile, got %q", rec.LastError)
+	}
+
+	active, err := execRepo.ListActiveLive(context.Background())
+	if err != nil {
+		t.Fatalf("expected active live list to load, got %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("expected reconciled closed record to leave active live set, got %d items", len(active))
+	}
+}
+
+func TestReconcileLivePositions_DoesNotClosePendingOpenAwaitingFill(t *testing.T) {
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:       "plan-awaiting-fill",
+				Symbol:        "BTC",
+				Status:        executionStatePendingOpen,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longwait",
+				ShortExchange: "shortwait",
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-awaiting-fill",
+				Symbol:           "BTC",
+				LongExchange:     "longwait",
+				ShortExchange:    "shortwait",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          1,
+				ShortQty:         1,
+			},
+		},
+	}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"longwait":  &testTradeAdapter{name: "longwait", enabled: true, position: exchange.Position{Exchange: "longwait", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: 0}},
+		"shortwait": &testTradeAdapter{name: "shortwait", enabled: true, position: exchange.Position{Exchange: "shortwait", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: 0}},
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+
+	reconciled, err := svc.ReconcileLivePositions(context.Background())
+	if err != nil {
+		t.Fatalf("expected reconcile to succeed, got %v", err)
+	}
+	if reconciled != 0 {
+		t.Fatalf("expected no reconciled executions for pending open, got %d", reconciled)
+	}
+
+	rec, err := execRepo.FindByPlanKey(context.Background(), "plan-awaiting-fill")
+	if err != nil {
+		t.Fatalf("expected load record to succeed, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected pending open record to exist")
+	}
+	if rec.Status != executionStatePendingOpen {
+		t.Fatalf("expected pending open status to remain unchanged, got %q", rec.Status)
 	}
 }
 

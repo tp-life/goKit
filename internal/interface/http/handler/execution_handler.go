@@ -36,6 +36,14 @@ func (h *ExecutionHandler) AutoCloseCandidates(c *fiber.Ctx) error {
 	return response.Success(c, items)
 }
 
+func (h *ExecutionHandler) LivePositions(c *fiber.Ctx) error {
+	items, err := h.svc.InspectLivePositions(c.UserContext())
+	if err != nil {
+		return response.ErrInternal(err, "查询真实持仓失败")
+	}
+	return response.Success(c, items)
+}
+
 func (h *ExecutionHandler) Orders(c *fiber.Ctx) error {
 	planKey := strings.TrimSpace(c.Params("planKey"))
 	if planKey == "" {

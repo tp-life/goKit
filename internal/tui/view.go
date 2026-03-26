@@ -61,7 +61,7 @@ func renderModal(width int, height int, content string) string {
 
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
-		return "loading terminal..."
+		return "终端初始化中..."
 	}
 
 	bodyHeight := m.bodyHeight()
@@ -80,49 +80,49 @@ func (m Model) View() string {
 }
 
 func (m Model) renderHeader(width int) string {
-	title := fmt.Sprintf("Funding Arbitrage TUI  [%s]", m.view.String())
+	title := fmt.Sprintf("资金费套利 TUI  [%s]", m.view.String())
 	strategy := m.data.System.Strategy
 	exec := m.data.System.Execution
 	statusLine := strings.Join([]string{
-		m.chip("mode "+m.interactionModeLabel(), m.interactionModeTone()),
-		m.chip("refresh "+m.refreshInterval.String(), "accent"),
-		m.chip("sort "+m.sort.String(), "accent"),
-		m.chip("pair "+m.currentPairLabel(), "accent"),
-		m.chip("search "+orDefault(strings.TrimSpace(m.search.Value()), "--"), "accent"),
-		m.chip("live "+boolWord(m.data.System.Execution.LiveTradingEnabled), boolTone(m.data.System.Execution.LiveTradingEnabled, true)),
-		m.chip("auto_entry "+boolWord(m.data.System.Execution.AutoEntry), boolTone(m.data.System.Execution.AutoEntry, false)),
-		m.chip("auto_close "+boolWord(m.data.System.Execution.AutoClose), boolTone(m.data.System.Execution.AutoClose, false)),
+		m.chip("模式 "+m.interactionModeLabel(), m.interactionModeTone()),
+		m.chip("刷新 "+m.refreshInterval.String(), "accent"),
+		m.chip("排序 "+m.sort.String(), "accent"),
+		m.chip("交易对 "+m.currentPairLabel(), "accent"),
+		m.chip("搜索 "+orDefault(strings.TrimSpace(m.search.Value()), "--"), "accent"),
+		m.chip("实盘 "+boolWord(m.data.System.Execution.LiveTradingEnabled), boolTone(m.data.System.Execution.LiveTradingEnabled, true)),
+		m.chip("自动开仓 "+boolWord(m.data.System.Execution.AutoEntry), boolTone(m.data.System.Execution.AutoEntry, false)),
+		m.chip("自动平仓 "+boolWord(m.data.System.Execution.AutoClose), boolTone(m.data.System.Execution.AutoClose, false)),
 	}, "  ")
 	limitLine := strings.Join([]string{
-		m.chip("min_pnl "+compactUSDT(strategy.MinNetPNL, 3), "good"),
-		m.chip("max_spread "+compactBps(strategy.MaxSpreadBps, 2), "warn"),
-		m.chip("entry_lead "+orDefault(strategy.EntryLeadTime, "--"), "accent"),
-		m.chip("close_grace "+orDefault(exec.CloseGracePeriod, "--"), "accent"),
+		m.chip("最小收益 "+compactUSDT(strategy.MinNetPNL, 3), "good"),
+		m.chip("最大价差 "+compactBps(strategy.MaxSpreadBps, 2), "warn"),
+		m.chip("提前开仓 "+orDefault(strategy.EntryLeadTime, "--"), "accent"),
+		m.chip("平仓缓冲 "+orDefault(exec.CloseGracePeriod, "--"), "accent"),
 	}, "  ")
 
 	metrics := strings.Join([]string{
-		m.metric("opps", len(m.data.Opportunities)),
-		m.metric("ready", countEligible(m.data.Opportunities)),
-		m.metric("plans", len(m.data.AllPlans)),
-		m.metric("exec", len(m.data.Executions)),
-		m.metric("fund24h", int(m.data.Stats.FundingCount24h)),
-		m.metric("book24h", int(m.data.Stats.BookTopCount24h)),
-		m.metric("batch", m.data.CurrentBatchID),
+		m.metric("机会", len(m.data.Opportunities)),
+		m.metric("就绪", countEligible(m.data.Opportunities)),
+		m.metric("计划", len(m.data.AllPlans)),
+		m.metric("执行", len(m.data.Executions)),
+		m.metric("24h资金费", int(m.data.Stats.FundingCount24h)),
+		m.metric("24h盘口", int(m.data.Stats.BookTopCount24h)),
+		m.metric("批次", m.data.CurrentBatchID),
 	}, "   ")
 
 	stateParts := []string{
-		m.chip("source "+m.client.BaseURL(), "accent"),
-		m.chip("last "+orDefault(formatClock(m.lastRefresh), "--"), "accent"),
+		m.chip("来源 "+m.client.BaseURL(), "accent"),
+		m.chip("最近刷新 "+orDefault(formatClock(m.lastRefresh), "--"), "accent"),
 	}
 	if m.loading {
-		label := "syncing"
+		label := "同步中"
 		if summary := m.loadingSummary(); summary != "" {
-			label = "sync " + summary
+			label = "同步 " + summary
 		}
 		stateParts = append(stateParts, m.chip(label, "warn"))
 	}
 	if strings.TrimSpace(m.lastError) != "" {
-		stateParts = append(stateParts, m.chip("error "+clip(m.lastError, 48), "bad"))
+		stateParts = append(stateParts, m.chip("错误 "+clip(m.lastError, 48), "bad"))
 	} else if strings.TrimSpace(m.flash) != "" {
 		stateParts = append(stateParts, m.chip(m.flash, "good"))
 	}
@@ -191,24 +191,32 @@ func (m Model) renderSystemBody(height int) string {
 		if restHeight <= 0 {
 			return m.renderConnectorPanel(leftWidth+rightWidth, topHeight)
 		}
-		midHeight, bottomHeight := splitStackedHeights(restHeight)
+		midHeight, lowerHeight := splitStackedHeights(restHeight)
 		sections := []string{
 			m.renderConnectorPanel(leftWidth+rightWidth, topHeight),
 			m.renderConfigPanel(leftWidth+rightWidth, midHeight),
 		}
-		if bottomHeight > 0 {
-			sections = append(sections, m.renderAutoClosePanel(leftWidth+rightWidth, bottomHeight))
+		if lowerHeight > 0 {
+			autoCloseHeight, livePositionHeight := splitStackedHeights(lowerHeight)
+			sections = append(sections, m.renderAutoClosePanel(leftWidth+rightWidth, autoCloseHeight))
+			if livePositionHeight > 0 {
+				sections = append(sections, m.renderLivePositionPanel(leftWidth+rightWidth, livePositionHeight))
+			}
 		}
 		return lipgloss.JoinVertical(lipgloss.Left, sections...)
 	}
-	topHeight, bottomHeight := splitStackedHeights(height)
+	topHeight, lowerHeight := splitStackedHeights(height)
 	right := m.renderConfigPanel(rightWidth, height)
-	if bottomHeight > 0 {
-		right = lipgloss.JoinVertical(
-			lipgloss.Left,
+	if lowerHeight > 0 {
+		autoCloseHeight, livePositionHeight := splitStackedHeights(lowerHeight)
+		sections := []string{
 			m.renderConfigPanel(rightWidth, topHeight),
-			m.renderAutoClosePanel(rightWidth, bottomHeight),
-		)
+			m.renderAutoClosePanel(rightWidth, autoCloseHeight),
+		}
+		if livePositionHeight > 0 {
+			sections = append(sections, m.renderLivePositionPanel(rightWidth, livePositionHeight))
+		}
+		right = lipgloss.JoinVertical(lipgloss.Left, sections...)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
 		m.renderConnectorPanel(leftWidth, height),
@@ -305,17 +313,17 @@ func (m Model) renderScannerDetail(width int, height int) string {
 }
 
 func (m Model) renderExecutionList(width int, height int) string {
-	title := fmt.Sprintf("Execution  [%s]", m.execTab.String())
-	sub := "tab switch  p plans  x executions  o open  c close"
+	title := fmt.Sprintf("执行  [%s]", m.execTab.String())
+	sub := "切换标签  p 计划  x 执行记录  o 开仓  c 平仓"
 	lines := []string{ui.panelTitle.Render(title), ui.subtle.Render(sub), ""}
 
 	if m.execTab == execRecords {
 		if len(m.data.Executions) == 0 {
 			if m.isLoading(loadExecutions) {
-				lines = append(lines, ui.subtle.Render("Loading execution records..."))
+				lines = append(lines, ui.subtle.Render("正在加载执行记录..."))
 				return renderPanel(width, height, strings.Join(lines, "\n"))
 			}
-			lines = append(lines, ui.subtle.Render("No execution records yet."))
+			lines = append(lines, ui.subtle.Render("当前还没有执行记录。"))
 			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
 		visibleRows := maxInt(1, panelListContentHeight(height)/listRowHeight)
@@ -325,7 +333,7 @@ func (m Model) renderExecutionList(width int, height int) string {
 		}
 		start := clampOffset(m.executionOffset, len(m.data.Executions), visibleRows)
 		end := minInt(len(m.data.Executions), start+visibleRows)
-		lines = append(lines, ui.subtle.Render(fmt.Sprintf("showing %d-%d", start+1, end)), "")
+		lines = append(lines, ui.subtle.Render(fmt.Sprintf("显示 %d-%d", start+1, end)), "")
 		for i := start; i < end; i++ {
 			item := m.data.Executions[i]
 			marker := selectedMarker(i == selected)
@@ -335,8 +343,8 @@ func (m Model) renderExecutionList(width int, height int) string {
 			}
 			block := strings.Join([]string{
 				fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), statusText(item.Status)),
-				fmt.Sprintf("    plan %-28s live %-3s auto_close %-3s", clip(item.PlanKey, 28), boolWord(item.LiveTrading), boolWord(item.AutoClose)),
-				fmt.Sprintf("    alloc %-14s open %s  close %s", clip(allocatedText, 14), clip(fmtTime(item.OpenedAtMs), 19), clip(fmtTime(item.ClosedAtMs), 19)),
+				fmt.Sprintf("    计划 %-28s 实盘 %-3s 自动平仓 %-3s", clip(item.PlanKey, 28), boolWord(item.LiveTrading), boolWord(item.AutoClose)),
+				fmt.Sprintf("    占用 %-14s 开仓 %s  平仓 %s", clip(allocatedText, 14), clip(fmtTime(item.OpenedAtMs), 19), clip(fmtTime(item.ClosedAtMs), 19)),
 			}, "\n")
 			if i == selected {
 				block = ui.activeRow.Render(block)
@@ -348,10 +356,10 @@ func (m Model) renderExecutionList(width int, height int) string {
 
 	if len(m.data.AllPlans) == 0 {
 		if m.isLoading(loadAllPlans) {
-			lines = append(lines, ui.subtle.Render("Loading plans..."))
+			lines = append(lines, ui.subtle.Render("正在加载执行计划..."))
 			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
-		lines = append(lines, ui.subtle.Render("No plans available."))
+		lines = append(lines, ui.subtle.Render("当前没有执行计划。"))
 		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 	visibleRows := maxInt(1, panelListContentHeight(height)/listRowHeight)
@@ -361,15 +369,15 @@ func (m Model) renderExecutionList(width int, height int) string {
 	}
 	start := clampOffset(m.planOffset, len(m.data.AllPlans), visibleRows)
 	end := minInt(len(m.data.AllPlans), start+visibleRows)
-	lines = append(lines, ui.subtle.Render(fmt.Sprintf("showing %d-%d", start+1, end)), "")
+	lines = append(lines, ui.subtle.Render(fmt.Sprintf("显示 %d-%d", start+1, end)), "")
 	for i := start; i < end; i++ {
 		item := m.data.AllPlans[i]
 		marker := selectedMarker(i == selected)
 		pnlText := alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 10)
 		block := strings.Join([]string{
 			fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), pnlText),
-			fmt.Sprintf("    %-18s ready %-3s status %-18s", clip(opportunityPair(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 18), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
-			fmt.Sprintf("    plan %-16s notional %-12s", clip(item.PlanKey, 16), clip(fmtMoney(targetNotional(item), 2), 12)),
+			fmt.Sprintf("    %-18s 就绪 %-3s 状态 %-18s", clip(opportunityPair(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 18), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
+			fmt.Sprintf("    计划 %-16s 名义 %-12s", clip(item.PlanKey, 16), clip(fmtMoney(targetNotional(item), 2), 12)),
 		}, "\n")
 		if i == selected {
 			block = ui.activeRow.Render(block)
@@ -381,15 +389,15 @@ func (m Model) renderExecutionList(width int, height int) string {
 
 func (m Model) renderExecutionDetail(width int, height int) string {
 	lines := []string{
-		ui.panelTitle.Render("Execution Detail"),
-		ui.subtle.Render("Shows plan state, execution record, and order history for the selected item."),
+		ui.panelTitle.Render("执行详情"),
+		ui.subtle.Render("展示当前选中项的计划状态、执行记录与订单历史。"),
 		"",
 	}
 	var detail string
 	if m.execTab == execRecords {
 		rec, ok := m.selectedExecution()
 		if !ok {
-			detail = ui.subtle.Render("Select an execution record first.")
+			detail = ui.subtle.Render("请先选择一条执行记录。")
 		} else {
 			plan, hasPlan := m.planByKey(rec.PlanKey)
 			detail = m.renderExecutionRecordDetail(rec, plan, hasPlan, width-4)
@@ -397,7 +405,7 @@ func (m Model) renderExecutionDetail(width int, height int) string {
 	} else {
 		plan, ok := m.selectedPlan()
 		if !ok {
-			detail = ui.subtle.Render("Select a plan first.")
+			detail = ui.subtle.Render("请先选择一条执行计划。")
 		} else {
 			rec, hasRec := m.executionByPlanKey(plan.PlanKey)
 			detail = m.renderPlanExecutionDetail(plan, rec, hasRec, width-4)
@@ -409,16 +417,16 @@ func (m Model) renderExecutionDetail(width int, height int) string {
 
 func (m Model) renderConnectorPanel(width int, height int) string {
 	lines := []string{
-		ui.panelTitle.Render(fmt.Sprintf("Connectors  %d", len(m.data.System.Connectors))),
-		ui.subtle.Render("Healthy connectors should have recent market/book activity and no sticky error."),
+		ui.panelTitle.Render(fmt.Sprintf("连接器状态  %d", len(m.data.System.Connectors))),
+		ui.subtle.Render("健康连接器应当持续收到最新行情和盘口事件，并且没有持续错误。"),
 		"",
 	}
 	if len(m.data.System.Connectors) == 0 {
 		if m.isLoading(loadSystem) {
-			lines = append(lines, ui.subtle.Render("Loading system status..."))
+			lines = append(lines, ui.subtle.Render("正在加载系统状态..."))
 			return renderPanel(width, height, strings.Join(lines, "\n"))
 		}
-		lines = append(lines, ui.subtle.Render("No connector status has been reported yet."))
+		lines = append(lines, ui.subtle.Render("当前还没有连接器状态上报。"))
 		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 	for _, item := range m.data.System.Connectors {
@@ -429,7 +437,7 @@ func (m Model) renderConnectorPanel(width int, height int) string {
 			tone = "warn"
 		}
 		lines = append(lines,
-			toneStyle(tone).Render(fmt.Sprintf("%-12s market=%-3s book=%-3s  market_at=%-19s  book_at=%-19s",
+			toneStyle(tone).Render(fmt.Sprintf("%-12s 行情=%-3s 盘口=%-3s  行情时间=%-19s  盘口时间=%-19s",
 				item.Exchange,
 				boolWord(item.MarkPriceConnected),
 				boolWord(item.BookTickerConnected),
@@ -438,7 +446,7 @@ func (m Model) renderConnectorPanel(width int, height int) string {
 			)),
 		)
 		if strings.TrimSpace(item.LastError) != "" {
-			lines = append(lines, ui.bad.Render("  err: "+clip(item.LastError, width-8)))
+			lines = append(lines, ui.bad.Render("  错误: "+clip(item.LastError, width-8)))
 		}
 	}
 	return renderPanel(width, height, strings.Join(lines, "\n"))
@@ -448,23 +456,23 @@ func (m Model) renderConfigPanel(width int, height int) string {
 	strategy := m.data.System.Strategy
 	exec := m.data.System.Execution
 	lines := []string{
-		ui.panelTitle.Render("Strategy / Execution"),
-		ui.subtle.Render("Static config and current watchlists, useful for verifying whether the engine is in monitor or live mode."),
+		ui.panelTitle.Render("策略与执行配置"),
+		ui.subtle.Render("展示当前生效的策略参数和监控名单，用来确认系统处于观察模式还是实盘模式。"),
 		"",
-		fmt.Sprintf("Strategy: enabled=%s  hold=%sh  leverage=%sx  min_net=%s  effective_notional=%s",
+		fmt.Sprintf("策略: 启用=%s  持有=%sh  杠杆=%sx  最小净收益=%s  有效名义=%s",
 			boolWord(strategy.Enabled),
 			fmtNumber(strategy.HoldHours, 1),
 			fmtNumber(strategy.Leverage, 2),
 			fmtMoney(strategy.MinNetPNL, 3),
 			fmtMoney(strategy.EffectiveNotional, 2),
 		),
-		fmt.Sprintf("Entry/Exit: %s / %s  spread_limit=%s  data_age=%s",
+		fmt.Sprintf("开平仓: %s / %s  价差限制=%s  数据时效=%s",
 			orDefault(strategy.EntryMode, "--"),
 			orDefault(strategy.ExitMode, "--"),
 			fmtSignedBps(strategy.MaxSpreadBps, 2),
 			orDefault(strategy.MaxDataAge, "--"),
 		),
-		fmt.Sprintf("Execution: live=%s  auto_entry=%s  auto_close=%s  loop=%s  close_grace=%s  max_latest_plans=%d",
+		fmt.Sprintf("执行: 实盘=%s  自动开仓=%s  自动平仓=%s  轮询=%s  平仓缓冲=%s  最近计划上限=%d",
 			boolWord(exec.LiveTradingEnabled),
 			boolWord(exec.AutoEntry),
 			boolWord(exec.AutoClose),
@@ -472,7 +480,7 @@ func (m Model) renderConfigPanel(width int, height int) string {
 			orDefault(exec.CloseGracePeriod, "--"),
 			exec.MaxLatestPlans,
 		),
-		fmt.Sprintf("Auto budget: allocate=%s  used=%s  remain=%s  live_plans=%d%s  per_loop=%s",
+		fmt.Sprintf("自动预算: 分配=%s  已用=%s  剩余=%s  持仓计划=%d%s  每轮开仓=%s",
 			boolWord(exec.AutoAllocateCapital),
 			fmtMoney(exec.ActiveAllocatedNotionalUSDT, 2),
 			fmtMoney(exec.RemainingAutoBudgetUSDT, 2),
@@ -481,11 +489,11 @@ func (m Model) renderConfigPanel(width int, height int) string {
 			renderLoopLimit(exec.MaxAutoOpenPerLoop),
 		),
 		"",
-		"Watchlist: " + clip(strings.Join(m.data.System.Watchlist, ", "), width-8),
-		"DeepScan: " + clip(strings.Join(m.data.System.DeepScanWatchlist, ", "), width-8),
+		"监控名单: " + clip(strings.Join(m.data.System.Watchlist, ", "), width-10),
+		"深扫名单: " + clip(strings.Join(m.data.System.DeepScanWatchlist, ", "), width-10),
 	}
 	if m.isLoading(loadSystem) && len(m.data.System.Watchlist) == 0 && len(m.data.System.DeepScanWatchlist) == 0 {
-		lines = append(lines, "", ui.subtle.Render("Loading strategy and execution config..."))
+		lines = append(lines, "", ui.subtle.Render("正在加载策略和执行配置..."))
 	}
 	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
@@ -493,10 +501,10 @@ func (m Model) renderConfigPanel(width int, height int) string {
 func (m Model) renderAutoClosePanel(width int, height int) string {
 	items := m.data.AutoClose.Candidates
 	lines := []string{
-		ui.panelTitle.Render(fmt.Sprintf("Auto Close Live  %d", len(items))),
-		ui.subtle.Render("Shows live executions, the current close decision, and what a manual sweep would act on."),
+		ui.panelTitle.Render(fmt.Sprintf("自动平仓候选  %d", len(items))),
+		ui.subtle.Render("展示当前 live execution 的平仓判断，以及手动 sweep 会实际处理哪些仓位。"),
 		"",
-		fmt.Sprintf("evaluated=%s  eligible=%d  should_close=%d  errors=%d",
+		fmt.Sprintf("评估时间=%s  可评估=%d  应平仓=%d  错误=%d",
 			fmtTime(m.data.AutoClose.EvaluatedAtMs),
 			m.data.AutoClose.Eligible,
 			m.data.AutoClose.ShouldClose,
@@ -505,7 +513,7 @@ func (m Model) renderAutoClosePanel(width int, height int) string {
 		"",
 	}
 	if len(items) == 0 {
-		lines = append(lines, ui.subtle.Render("No live execution is currently tracked for auto-close."))
+		lines = append(lines, ui.subtle.Render("当前没有需要纳入自动平仓扫描的 live execution。"))
 		return renderPanel(width, height, strings.Join(lines, "\n"))
 	}
 
@@ -521,23 +529,23 @@ func (m Model) renderAutoClosePanel(width int, height int) string {
 			hasPlan = true
 		}
 
-		actionLabel := "holding"
+		actionLabel := "继续持有"
 		actionTone := "accent"
 		switch {
 		case decision.Error != "":
-			actionLabel = "decision_error"
+			actionLabel = "判断失败"
 			actionTone = "bad"
 		case decision.ShouldClose:
-			actionLabel = decision.Trigger
+			actionLabel = autoCloseActionText(decision.Trigger)
 			if strings.TrimSpace(actionLabel) == "" {
-				actionLabel = "close_now"
+				actionLabel = "立即平仓"
 			}
 			actionTone = "warn"
 		case !decision.Eligible:
-			actionLabel = "skipped"
+			actionLabel = "已跳过"
 			actionTone = "bad"
 		case !decision.AutoCloseEnabled:
-			actionLabel = "auto_close_off"
+			actionLabel = "自动平仓关闭"
 			actionTone = "bad"
 		}
 
@@ -547,18 +555,70 @@ func (m Model) renderAutoClosePanel(width int, height int) string {
 		}
 		if strings.TrimSpace(reason) == "" {
 			reason = "--"
+		} else {
+			reason = autoCloseReasonText(reason)
 		}
 
 		allocated := executionAllocatedNotional(rec, plan, hasPlan)
 		block := strings.Join([]string{
 			fmt.Sprintf("%-7s %-24s %s", clip(rec.Symbol, 7), clip(rec.PlanKey, 24), statusText(rec.Status)),
-			fmt.Sprintf("    due %-19s alloc %-12s auto_close %-3s %s",
+			fmt.Sprintf("    到期 %-19s 占用 %-12s 自动平仓 %-3s %s",
 				clip(fmtTime(rec.TargetCloseTimeMs), 19),
 				clip(renderAllocatedNotionalValue(allocated), 12),
 				boolWord(rec.AutoClose),
 				toneStyle(actionTone).Render(actionLabel),
 			),
 			fmt.Sprintf("    %s", clip(reason, maxInt(10, width-8))),
+		}, "\n")
+		lines = append(lines, block)
+	}
+	return renderPanel(width, height, strings.Join(lines, "\n"))
+}
+
+func (m Model) renderLivePositionPanel(width int, height int) string {
+	items := m.data.LivePositions.Candidates
+	lines := []string{
+		ui.panelTitle.Render(fmt.Sprintf("交易所真实持仓  %d", len(items))),
+		ui.subtle.Render("展示每条 live execution 在交易所上的真实双腿持仓，手动平仓或单腿漂移会立即暴露出来。"),
+		"",
+		fmt.Sprintf("评估时间=%s  同步=%d  待成交=%d  单腿=%d  空仓=%d  方向异常=%d  错误=%d",
+			fmtTime(m.data.LivePositions.EvaluatedAtMs),
+			m.data.LivePositions.InSync,
+			m.data.LivePositions.AwaitingFill,
+			m.data.LivePositions.SingleLeg,
+			m.data.LivePositions.Flat,
+			m.data.LivePositions.SideMismatch,
+			m.data.LivePositions.Errors,
+		),
+		"",
+	}
+	if len(items) == 0 {
+		lines = append(lines, ui.subtle.Render("当前没有需要检查交易所真实持仓的 live execution。"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
+	}
+
+	const rowHeight = 4
+	visibleRows := maxInt(1, panelListContentHeight(height)/rowHeight)
+	_, end := visibleWindow(0, len(items), visibleRows)
+	for _, item := range items[:end] {
+		statusTone := livePositionStatusTone(item.SyncStatus)
+		block := strings.Join([]string{
+			fmt.Sprintf("%-7s %-24s %s",
+				clip(item.Execution.Symbol, 7),
+				clip(item.Execution.PlanKey, 24),
+				toneStyle(statusTone).Render(livePositionStatusLabel(item.SyncStatus)),
+			),
+			fmt.Sprintf("    多 %-8s %-12s %s",
+				clip(item.LongLeg.Exchange, 8),
+				clip(item.LongLeg.VenueSymbol, 12),
+				clip(renderLivePositionLegSummary(item.LongLeg), maxInt(10, width-30)),
+			),
+			fmt.Sprintf("    空 %-8s %-12s %s",
+				clip(item.ShortLeg.Exchange, 8),
+				clip(item.ShortLeg.VenueSymbol, 12),
+				clip(renderLivePositionLegSummary(item.ShortLeg), maxInt(10, width-30)),
+			),
+			fmt.Sprintf("    %s", clip(livePositionSummaryText(item.Summary), maxInt(10, width-8))),
 		}, "\n")
 		lines = append(lines, block)
 	}
@@ -817,14 +877,14 @@ func (m Model) renderOrdersDetail(planKey string, width int) string {
 	if !ok || len(items) == 0 {
 		return ui.subtle.Render("当前计划暂无订单记录。")
 	}
-	lines := []string{ui.accent.Render("阶段    腿       交易所       方向   状态               请求数量         成交数量         均价")}
+	lines := []string{ui.accent.Render("阶段    腿角色    交易所       方向   状态               请求数量         成交数量         均价")}
 	for _, order := range items {
 		line := fmt.Sprintf("%-7s %-8s %-12s %-6s %-18s %-15s %-15s %-10s",
-			clip(order.Phase, 7),
-			clip(order.LegRole, 8),
+			clip(orderPhaseText(order.Phase), 7),
+			clip(orderLegRoleText(order.LegRole), 8),
 			clip(order.Exchange, 12),
-			clip(order.Side, 6),
-			clip(order.Status, 18),
+			clip(orderSideText(order.Side), 6),
+			clip(statusText(order.Status), 18),
 			fmtNumber(order.RequestedQty, 6),
 			fmtNumber(order.ExecutedQty, 6),
 			priceText(order.AvgPrice),
@@ -841,52 +901,55 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(plan.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: plan.LongExchange, ShortExchange: plan.ShortExchange}))),
 		strings.Join([]string{
-			renderField("plan", toneStyle("accent").Render(plan.PlanKey)),
-			renderField("ready", renderBoolValue(plan.ReadyNow, false)),
-			renderField("status", renderStatusValue(plan.Status)),
-			renderField("pnl", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("计划", toneStyle("accent").Render(plan.PlanKey)),
+			renderField("就绪", renderBoolValue(plan.ReadyNow, false)),
+			renderField("状态", renderStatusValue(plan.Status)),
+			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
 		}, "  "),
 		strings.Join([]string{
-			renderField("notional", renderMoneyValue(targetNotional(plan), 2)),
-			renderField("leverage", toneStyle("accent").Render(fmt.Sprintf("%sx", fmtNumber(plan.TargetLeverage, 2)))),
-			renderField("basis", renderBpsValue(plan.CrossVenueBasisBps, 2)),
-			renderField("target_close", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+			renderField("名义", renderMoneyValue(targetNotional(plan), 2)),
+			renderField("杠杆", toneStyle("accent").Render(fmt.Sprintf("%sx", fmtNumber(plan.TargetLeverage, 2)))),
+			renderField("基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
+			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 		}, "  "),
 		strings.Join([]string{
-			renderField("long", toneStyle("accent").Render(plan.LongVenueSymbol)),
-			renderField("qty", toneStyle("accent").Render(fmtNumber(plan.LongQty, 6))),
-			renderField("@", toneStyle("accent").Render(priceText(plan.LongEntryPrice))),
+			renderField("多头", toneStyle("accent").Render(plan.LongVenueSymbol)),
+			renderField("数量", toneStyle("accent").Render(fmtNumber(plan.LongQty, 6))),
+			renderField("价格", toneStyle("accent").Render(priceText(plan.LongEntryPrice))),
 		}, "  "),
 		strings.Join([]string{
-			renderField("short", toneStyle("accent").Render(plan.ShortVenueSymbol)),
-			renderField("qty", toneStyle("accent").Render(fmtNumber(plan.ShortQty, 6))),
-			renderField("@", toneStyle("accent").Render(priceText(plan.ShortEntryPrice))),
+			renderField("空头", toneStyle("accent").Render(plan.ShortVenueSymbol)),
+			renderField("数量", toneStyle("accent").Render(fmtNumber(plan.ShortQty, 6))),
+			renderField("价格", toneStyle("accent").Render(priceText(plan.ShortEntryPrice))),
 		}, "  "),
 	}
 	if opp, ok := m.matchingOpportunityForPlan(plan); ok {
 		lines = append(lines, strings.Join([]string{
-			renderField("matched_opp", toneStyle("accent").Render(opportunityKey(opp))),
-			renderField("opp_status", renderStatusValue(opp.Status)),
-			renderField("hold", toneStyle("accent").Render(holdingDurationText(opp))),
+			renderField("关联机会", toneStyle("accent").Render(opportunityKey(opp))),
+			renderField("机会状态", renderStatusValue(opp.Status)),
+			renderField("建议持有", toneStyle("accent").Render(holdingDurationText(opp))),
 		}, "  "))
 	}
 	if hasRec {
 		lines = append(lines, strings.Join([]string{
-			renderField("record", renderStatusValue(rec.Status)),
-			renderField("live", renderBoolValue(rec.LiveTrading, true)),
-			renderField("auto_close", renderBoolValue(rec.AutoClose, false)),
-			renderField("alloc", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
-			renderField("opened", renderTimeValue(rec.OpenedAtMs, "accent")),
-			renderField("closed", renderTimeValue(rec.ClosedAtMs, "accent")),
+			renderField("执行记录", renderStatusValue(rec.Status)),
+			renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+			renderField("自动平仓", renderBoolValue(rec.AutoClose, false)),
+			renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
+			renderField("开仓时间", renderTimeValue(rec.OpenedAtMs, "accent")),
+			renderField("平仓时间", renderTimeValue(rec.ClosedAtMs, "accent")),
 		}, "  "))
 		if strings.TrimSpace(rec.StatusReason) != "" {
-			lines = append(lines, renderField("reason", toneStyle("warn").Render(clip(rec.StatusReason, width))))
+			lines = append(lines, renderField("原因", toneStyle("warn").Render(clip(rec.StatusReason, width))))
 		}
 		if strings.TrimSpace(rec.LastError) != "" {
-			lines = append(lines, renderField("last_error", toneStyle("bad").Render(clip(rec.LastError, width))))
+			lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
+		}
+		if positionItem, ok := m.livePositionByPlanKey(plan.PlanKey); ok {
+			lines = append(lines, "", ui.panelTitle.Render("交易所持仓"), m.renderLivePositionDetail(positionItem, width))
 		}
 	}
-	lines = append(lines, "", ui.panelTitle.Render("Orders"), m.renderOrdersDetail(plan.PlanKey, width))
+	lines = append(lines, "", ui.panelTitle.Render("订单记录"), m.renderOrdersDetail(plan.PlanKey, width))
 	return strings.Join(lines, "\n")
 }
 
@@ -894,37 +957,40 @@ func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan enti
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(rec.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: rec.LongExchange, ShortExchange: rec.ShortExchange}))),
 		strings.Join([]string{
-			renderField("plan", toneStyle("accent").Render(rec.PlanKey)),
-			renderField("status", renderStatusValue(rec.Status)),
-			renderField("live", renderBoolValue(rec.LiveTrading, true)),
-			renderField("auto_close", renderBoolValue(rec.AutoClose, false)),
+			renderField("计划", toneStyle("accent").Render(rec.PlanKey)),
+			renderField("状态", renderStatusValue(rec.Status)),
+			renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+			renderField("自动平仓", renderBoolValue(rec.AutoClose, false)),
 		}, "  "),
 		strings.Join([]string{
-			renderField("alloc", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, hasPlan))),
-			renderField("opened", renderTimeValue(rec.OpenedAtMs, "accent")),
-			renderField("closed", renderTimeValue(rec.ClosedAtMs, "accent")),
-			renderField("transition", renderTimeValue(rec.LastTransitionAtMs, "accent")),
-			renderField("event", toneStyle("accent").Render(orDefault(rec.LastTransitionEvent, "--"))),
+			renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, hasPlan))),
+			renderField("开仓时间", renderTimeValue(rec.OpenedAtMs, "accent")),
+			renderField("平仓时间", renderTimeValue(rec.ClosedAtMs, "accent")),
+			renderField("最近迁移", renderTimeValue(rec.LastTransitionAtMs, "accent")),
+			renderField("事件", toneStyle("accent").Render(orDefault(rec.LastTransitionEvent, "--"))),
 		}, "  "),
 		strings.Join([]string{
-			renderField("open_orders", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
-			renderField("close_orders", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
+			renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
+			renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
 		}, "  "),
 	}
 	if strings.TrimSpace(rec.StatusReason) != "" {
-		lines = append(lines, renderField("reason", toneStyle("warn").Render(clip(rec.StatusReason, width))))
+		lines = append(lines, renderField("原因", toneStyle("warn").Render(clip(rec.StatusReason, width))))
 	}
 	if strings.TrimSpace(rec.LastError) != "" {
-		lines = append(lines, renderField("last_error", toneStyle("bad").Render(clip(rec.LastError, width))))
+		lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
 	}
 	if hasPlan {
 		lines = append(lines, strings.Join([]string{
-			renderField("plan_status", renderStatusValue(plan.Status)),
-			renderField("expected_pnl", renderMoneyValue(plan.NetExpectedPNL, 3)),
-			renderField("target_close", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+			renderField("计划状态", renderStatusValue(plan.Status)),
+			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 		}, "  "))
 	}
-	lines = append(lines, "", ui.panelTitle.Render("Orders"), m.renderOrdersDetail(rec.PlanKey, width))
+	if positionItem, ok := m.livePositionByPlanKey(rec.PlanKey); ok {
+		lines = append(lines, "", ui.panelTitle.Render("交易所持仓"), m.renderLivePositionDetail(positionItem, width))
+	}
+	lines = append(lines, "", ui.panelTitle.Render("订单记录"), m.renderOrdersDetail(rec.PlanKey, width))
 	return strings.Join(lines, "\n")
 }
 
@@ -940,10 +1006,10 @@ func (m Model) renderHelp(height int) string {
 		"  j/k or arrows move   g/home first   G/end last   tab switch detail/list mode",
 		"Scanner",
 		"  o open selected linked plan   c close selected linked plan",
-		"Execution",
-		"  p show plans   x show execution records   o/c operate on current selection",
+		"执行页",
+		"  p 显示计划   x 显示执行记录   o/c 对当前选中项执行开平仓",
 		"Safety",
-		"  open/close actions require typing OPEN or CLOSE before the request is sent",
+		"  开平仓操作发出前，仍需输入 OPEN 或 CLOSE 进行确认",
 		"",
 		ui.subtle.Render("Press ? or esc to return."),
 	}
@@ -953,42 +1019,42 @@ func (m Model) renderHelp(height int) string {
 func (m Model) renderConfirm(height int) string {
 	target := m.confirm.Target
 	word := string(m.confirm.Action)
-	liveText := "dry-run request"
+	liveText := "模拟请求"
 	if target.LiveTrading || m.data.System.Execution.LiveTradingEnabled {
-		liveText = "live request"
+		liveText = "实盘请求"
 	}
 	lines := []string{
-		ui.panelTitle.Render(fmt.Sprintf("%s Confirmation", word)),
+		ui.panelTitle.Render(fmt.Sprintf("%s 确认", word)),
 		"",
-		fmt.Sprintf("source=%s  mode=%s", target.Source, liveText),
-		fmt.Sprintf("plan=%s", target.PlanKey),
-		fmt.Sprintf("symbol=%s  direction=%s long / %s short", target.Symbol, target.LongExchange, target.ShortExchange),
-		fmt.Sprintf("status=%s  expected_pnl=%s", statusText(target.Status), fmtMoney(target.NetExpectedPNL, 3)),
+		fmt.Sprintf("来源=%s  模式=%s", target.Source, liveText),
+		fmt.Sprintf("计划=%s", target.PlanKey),
+		fmt.Sprintf("标的=%s  方向=%s 做多 / %s 做空", target.Symbol, target.LongExchange, target.ShortExchange),
+		fmt.Sprintf("状态=%s  预期收益=%s", statusText(target.Status), fmtMoney(target.NetExpectedPNL, 3)),
 		"",
-		fmt.Sprintf("Type %s to confirm:", ui.code.Render(word)),
+		fmt.Sprintf("输入 %s 进行确认：", ui.code.Render(word)),
 		m.confirm.Input.View(),
 	}
 	if strings.TrimSpace(m.confirm.ErrorText) != "" {
 		lines = append(lines, "", ui.bad.Render(m.confirm.ErrorText))
 	}
 	if m.confirm.Submitting {
-		lines = append(lines, "", ui.warn.Render("Submitting request..."))
+		lines = append(lines, "", ui.warn.Render("正在提交请求..."))
 	}
-	lines = append(lines, "", ui.subtle.Render("esc cancels"))
+	lines = append(lines, "", ui.subtle.Render("按 esc 取消"))
 	return renderModal(minInt(m.width-4, 88), minInt(height, 14), strings.Join(lines, "\n"))
 }
 
 func (m Model) renderFooter(width int) string {
 	if m.confirm != nil {
-		return ui.footer.Width(width).Render(fmt.Sprintf("Mode: %s   type %s to confirm, esc to cancel", m.interactionModeLabel(), m.confirm.Action))
+		return ui.footer.Width(width).Render(fmt.Sprintf("模式: %s   输入 %s 确认，按 esc 取消", m.interactionModeLabel(), m.confirm.Action))
 	}
 	if m.showHelp {
-		return ui.footer.Width(width).Render("Mode: HELP   esc or ? to return")
+		return ui.footer.Width(width).Render("模式: 帮助   按 esc 或 ? 返回")
 	}
 	if m.searchMode {
-		return ui.footer.Width(width).Render("Mode: SEARCH   " + m.search.View() + "   enter/esc to apply and close")
+		return ui.footer.Width(width).Render("模式: 搜索   " + m.search.View() + "   enter/esc 应用并关闭")
 	}
-	return ui.footer.Width(width).Render("Mode: NORMAL   j/k move  tab switch  / search  f pair  s sort  r refresh  o open  c close  1/2/3 views  ? help  q quit")
+	return ui.footer.Width(width).Render("模式: 普通   j/k 移动  tab 切换  / 搜索  f 交易对  s 排序  r 刷新  o 开仓  c 平仓  1/2/3 视图  ? 帮助  q 退出")
 }
 
 func (m Model) renderTab(label string, active bool) string {
@@ -1000,7 +1066,7 @@ func (m Model) renderTab(label string, active bool) string {
 
 func (m Model) currentPairLabel() string {
 	if strings.TrimSpace(m.pairFilter) == "" {
-		return "all"
+		return "全部"
 	}
 	return m.pairFilter
 }
@@ -1025,13 +1091,13 @@ func (m Model) chip(label string, tone string) string {
 func (m Model) interactionModeLabel() string {
 	switch {
 	case m.confirm != nil:
-		return "CONFIRM"
+		return "确认"
 	case m.searchMode:
-		return "SEARCH"
+		return "搜索"
 	case m.showHelp:
-		return "HELP"
+		return "帮助"
 	default:
-		return "NORMAL"
+		return "普通"
 	}
 }
 
@@ -1276,9 +1342,9 @@ func formatClock(t time.Time) string {
 
 func boolWord(v bool) string {
 	if v {
-		return "yes"
+		return "是"
 	}
-	return "no"
+	return "否"
 }
 
 func boolTone(v bool, warnWhenTrue bool) string {
@@ -1337,6 +1403,32 @@ func statusText(status string) string {
 		return "模拟已开仓"
 	case "dry_run_closed":
 		return "模拟已平仓"
+	case "pending":
+		return "处理中"
+	case "submitted":
+		return "已提交"
+	case "new":
+		return "新建"
+	case "partially_filled":
+		return "部分成交"
+	case "partially_filled_canceled":
+		return "部分成交后撤单"
+	case "filled":
+		return "全部成交"
+	case "canceled", "cancelled":
+		return "已撤单"
+	case "rejected":
+		return "已拒绝"
+	case "expired", "expired_in_match":
+		return "已过期"
+	case "deactivated":
+		return "已停用"
+	case "error":
+		return "错误"
+	case "timeout":
+		return "超时"
+	case "no_position":
+		return "无持仓"
 	default:
 		if strings.TrimSpace(status) == "" {
 			return "--"
@@ -1398,6 +1490,17 @@ func renderAllocatedNotionalValue(value float64) string {
 	return toneStyle("accent").Render(fmtMoney(value, 2))
 }
 
+func renderPositionQtyValue(value float64) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) || math.Abs(value) <= 1e-9 {
+		return toneStyle("subtle").Render("0")
+	}
+	prefix := ""
+	if value > 0 {
+		prefix = "+"
+	}
+	return toneStyle(signedNumberTone(value)).Render(prefix + fmtNumber(value, 6))
+}
+
 func renderPctValue(value float64, digits int) string {
 	return toneStyle(signedNumberTone(value)).Render(fmtPctRatio(value, digits))
 }
@@ -1443,6 +1546,108 @@ func renderDurationValue(d time.Duration) string {
 	return toneStyle(tone).Render(fmtDuration(d))
 }
 
+func livePositionStatusLabel(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "in_sync":
+		return "双腿同步"
+	case "awaiting_fill":
+		return "等待成交"
+	case "single_leg":
+		return "单腿暴露"
+	case "flat":
+		return "已空仓"
+	case "side_mismatch":
+		return "方向异常"
+	case "error":
+		return "检查错误"
+	default:
+		if strings.TrimSpace(status) == "" {
+			return "未知"
+		}
+		return status
+	}
+}
+
+func livePositionStatusTone(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "in_sync":
+		return "good"
+	case "awaiting_fill":
+		return "accent"
+	case "flat":
+		return "warn"
+	case "single_leg", "side_mismatch", "error":
+		return "bad"
+	default:
+		return "subtle"
+	}
+}
+
+func renderLivePositionLegSummary(leg service.LivePositionLegInspection) string {
+	if strings.TrimSpace(leg.Error) != "" {
+		return "错误 " + leg.Error
+	}
+	if !leg.HasPosition {
+		return fmt.Sprintf("空仓 预期=%s 数量=%s", positionSideText(leg.ExpectedSide), fmtNumber(leg.ExpectedQty, 6))
+	}
+	return fmt.Sprintf("数量 %s 开仓价 %s 标记价 %s 浮盈亏 %s",
+		renderPositionQtyValue(leg.Position.Quantity),
+		priceText(leg.Position.EntryPrice),
+		priceText(leg.Position.MarkPrice),
+		renderMoneyValue(leg.Position.UnrealizedPnL, 3),
+	)
+}
+
+func livePositionSummaryText(summary string) string {
+	switch strings.TrimSpace(summary) {
+	case "":
+		return "--"
+	case "execution is still pending open; no venue position is visible yet":
+		return "执行仍在等待开仓成交，交易所暂未看到持仓"
+	case "execution is marked live, but both venue legs are flat on exchange":
+		return "执行记录仍标记为 live，但交易所两条腿都已经空仓"
+	case "only one venue leg currently has live exposure":
+		return "当前只有一条腿在交易所上仍有真实持仓"
+	case "both venue legs have exposure matching the expected direction":
+		return "两条腿的真实持仓方向都与预期一致"
+	case "venue exposure exists, but at least one leg direction differs from the expected side":
+		return "交易所上仍有持仓，但至少一条腿的方向和预期不一致"
+	default:
+		return summary
+	}
+}
+
+func (m Model) renderLivePositionDetail(item service.LivePositionCandidate, width int) string {
+	lines := []string{
+		strings.Join([]string{
+			renderField("同步", toneStyle(livePositionStatusTone(item.SyncStatus)).Render(livePositionStatusLabel(item.SyncStatus))),
+			renderField("摘要", toneStyle(livePositionStatusTone(item.SyncStatus)).Render(clip(livePositionSummaryText(item.Summary), maxInt(10, width-18)))),
+		}, "  "),
+	}
+	lines = append(lines, m.renderLivePositionLegDetail("多头腿", item.LongLeg))
+	lines = append(lines, m.renderLivePositionLegDetail("空头腿", item.ShortLeg))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderLivePositionLegDetail(label string, leg service.LivePositionLegInspection) string {
+	if strings.TrimSpace(leg.Error) != "" {
+		return strings.Join([]string{
+			renderField(label, toneStyle("bad").Render(strings.ToUpper(leg.Exchange+" "+orDefault(leg.VenueSymbol, "--")))),
+			renderField("错误", toneStyle("bad").Render(leg.Error)),
+		}, "  ")
+	}
+	return strings.Join([]string{
+		renderField(label, toneStyle("accent").Render(strings.ToUpper(leg.Exchange+" "+orDefault(leg.VenueSymbol, "--")))),
+		renderField("预期", toneStyle("accent").Render(fmt.Sprintf("%s %s", positionSideText(leg.ExpectedSide), fmtNumber(leg.ExpectedQty, 6)))),
+		renderField("数量", renderPositionQtyValue(leg.Position.Quantity)),
+		renderField("开仓价", toneStyle("accent").Render(priceText(leg.Position.EntryPrice))),
+		renderField("标记价", toneStyle("accent").Render(priceText(leg.Position.MarkPrice))),
+		renderField("浮盈亏", renderMoneyValue(leg.Position.UnrealizedPnL, 3)),
+		renderField("可见", renderBoolValue(leg.HasPosition, false)),
+		renderField("方向正确", renderBoolValue(leg.DirectionOK, false)),
+	}, "  ")
+}
+
 func renderTimeValue(ms int64, tone string) string {
 	return toneStyle(tone).Render(fmtTime(ms))
 }
@@ -1478,12 +1683,153 @@ func statusTone(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "", "--":
 		return "subtle"
-	case "eligible", "ready", "opened", "closed", "dry_run_opened", "dry_run_closed":
+	case "eligible", "ready", "opened", "closed", "dry_run_opened", "dry_run_closed", "filled", "no_position":
 		return "good"
-	case "watching", "pending_open", "pending_close", "open_partial_failed", "close_partial_failed", "open_hedging", "close_hedging", "outside_entry_window":
+	case "watching", "pending_open", "pending_close", "open_partial_failed", "close_partial_failed", "open_hedging", "close_hedging", "outside_entry_window", "pending", "submitted", "new", "partially_filled", "partially_filled_canceled":
 		return "warn"
 	default:
 		return "bad"
+	}
+}
+
+func autoCloseActionText(trigger string) string {
+	switch strings.ToLower(strings.TrimSpace(trigger)) {
+	case "auto_recovery":
+		return "自动恢复平仓"
+	case "auto_retry_close":
+		return "自动重试平仓"
+	case "auto_schedule":
+		return "按计划平仓"
+	case "auto_drawdown_guard":
+		return "浮亏护栏平仓"
+	case "auto_basis_guard":
+		return "基差护栏平仓"
+	case "auto_balance_guard":
+		return "余额护栏平仓"
+	default:
+		if strings.TrimSpace(trigger) == "" {
+			return ""
+		}
+		return trigger
+	}
+}
+
+func autoCloseReasonText(reason string) string {
+	out := strings.TrimSpace(reason)
+	if out == "" {
+		return "--"
+	}
+
+	replacements := map[string]string{
+		"execution record has auto_close disabled":            "该执行记录已关闭自动平仓",
+		"target close time reached":                           "已到目标平仓时间",
+		"no auto-close trigger is active":                     "当前未触发自动平仓条件",
+		"load execution plan failed:":                         "加载执行计划失败:",
+		"close guard mtm: missing latest book snapshot for":   "浮亏护栏: 缺少最新盘口快照 ",
+		"close guard mtm: stale book snapshot for":            "浮亏护栏: 盘口快照已过期 ",
+		"close guard basis: missing latest book snapshot for": "基差护栏: 缺少最新盘口快照 ",
+		"close guard basis: stale book snapshot for":          "基差护栏: 盘口快照已过期 ",
+	}
+	for from, to := range replacements {
+		out = strings.ReplaceAll(out, from, to)
+	}
+
+	if strings.HasPrefix(out, "execution status ") && strings.HasSuffix(out, " requires recovery close") {
+		status := strings.TrimSuffix(strings.TrimPrefix(out, "execution status "), " requires recovery close")
+		return fmt.Sprintf("执行状态 %s，需要恢复性平仓", statusText(status))
+	}
+	if strings.HasPrefix(out, "execution status ") && strings.HasSuffix(out, " requires close retry") {
+		status := strings.TrimSuffix(strings.TrimPrefix(out, "execution status "), " requires close retry")
+		return fmt.Sprintf("执行状态 %s，需要重试平仓", statusText(status))
+	}
+	if strings.HasPrefix(out, "execution status ") && strings.Contains(out, " is outside the auto-close scan set") {
+		status := strings.TrimSuffix(strings.TrimPrefix(out, "execution status "), " is outside the auto-close scan set")
+		return fmt.Sprintf("执行状态 %s 不在自动平仓扫描范围内", statusText(status))
+	}
+	if strings.HasPrefix(out, "execution plan ") && strings.HasSuffix(out, " not found") {
+		planKey := strings.TrimSuffix(strings.TrimPrefix(out, "execution plan "), " not found")
+		return fmt.Sprintf("未找到执行计划 %s", planKey)
+	}
+	if strings.HasPrefix(out, "waiting until target close time ") && strings.HasSuffix(out, "; safety guards are not triggered") {
+		target := strings.TrimSuffix(strings.TrimPrefix(out, "waiting until target close time "), "; safety guards are not triggered")
+		return fmt.Sprintf("等待到目标平仓时间 %s；当前未触发安全护栏", target)
+	}
+	if strings.HasPrefix(out, "mark-to-market pnl ") && strings.Contains(out, " <= -") {
+		return strings.ReplaceAll(out, "mark-to-market pnl", "盯市盈亏")
+	}
+	if strings.HasPrefix(out, "close-side basis ") && strings.Contains(out, " bps > max ") {
+		out = strings.ReplaceAll(out, "close-side basis", "平仓基差")
+		return strings.ReplaceAll(out, " bps > max ", " bps > 阈值 ")
+	}
+	if strings.Contains(out, " available ratio ") && strings.Contains(out, " < emergency minimum ") {
+		out = strings.ReplaceAll(out, " available ratio ", " 可用余额比例 ")
+		return strings.ReplaceAll(out, " < emergency minimum ", " < 紧急下限 ")
+	}
+	return out
+}
+
+func orderPhaseText(phase string) string {
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "open":
+		return "开仓"
+	case "close":
+		return "平仓"
+	case "hedge_close":
+		return "对冲平仓"
+	default:
+		if strings.TrimSpace(phase) == "" {
+			return "--"
+		}
+		return phase
+	}
+}
+
+func orderLegRoleText(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "long_leg":
+		return "多头腿"
+	case "short_leg":
+		return "空头腿"
+	default:
+		if strings.Contains(strings.ToLower(strings.TrimSpace(role)), "hedge") {
+			return "对冲腿"
+		}
+		if strings.TrimSpace(role) == "" {
+			return "--"
+		}
+		return role
+	}
+}
+
+func orderSideText(side string) string {
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "BUY":
+		return "买入"
+	case "SELL":
+		return "卖出"
+	default:
+		if strings.TrimSpace(side) == "" {
+			return "--"
+		}
+		return side
+	}
+}
+
+func positionSideText(side string) string {
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "LONG":
+		return "做多"
+	case "SHORT":
+		return "做空"
+	case "BUY":
+		return "买入"
+	case "SELL":
+		return "卖出"
+	default:
+		if strings.TrimSpace(side) == "" {
+			return "--"
+		}
+		return side
 	}
 }
 
@@ -1610,14 +1956,14 @@ func executionAllocatedNotional(rec entity.ExecutionRecord, plan entity.Executio
 
 func renderLimitSuffix(limit int) string {
 	if limit <= 0 {
-		return "/unlimited"
+		return "/不限"
 	}
 	return fmt.Sprintf("/%d", limit)
 }
 
 func renderLoopLimit(limit int) string {
 	if limit <= 0 {
-		return "unlimited"
+		return "不限"
 	}
 	return fmt.Sprintf("%d", limit)
 }

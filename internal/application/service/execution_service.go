@@ -107,6 +107,9 @@ func (s *ExecutionService) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if _, err := s.ReconcileLivePositions(ctx); err != nil {
+				s.logger.Error("execution_live_position_reconcile_loop_failed", slog.Any("err", err))
+			}
 			if s.cfg.Execution.AutoEntry {
 				s.runAutoOpen(ctx)
 			}

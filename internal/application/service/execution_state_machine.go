@@ -131,6 +131,16 @@ var (
 		transitionRule(closeExecutionPolicy.failedStatus, closeExecutionPolicy.successStatus, closeExecutionPolicy.partialStatus, closeExecutionPolicy.failedStatus, closeExecutionPolicy.hedgingStatus),
 		transitionRule(closeExecutionPolicy.hedgingStatus, closeExecutionPolicy.hedgingStatus, closeExecutionPolicy.failedStatus),
 	)
+	externalFlatCloseTransitions = newExecutionTransitionGraph(
+		"external_close_reconcile",
+		transitionRule(executionStateOpened, closeExecutionPolicy.successStatus),
+		transitionRule(executionStateOpenPartial, closeExecutionPolicy.successStatus),
+		transitionRule(executionStateOpenHedging, closeExecutionPolicy.successStatus),
+		transitionRule(executionStatePendingClose, closeExecutionPolicy.successStatus),
+		transitionRule(closeExecutionPolicy.partialStatus, closeExecutionPolicy.successStatus),
+		transitionRule(closeExecutionPolicy.failedStatus, closeExecutionPolicy.successStatus),
+		transitionRule(closeExecutionPolicy.hedgingStatus, closeExecutionPolicy.successStatus),
+	)
 )
 
 // statusSet 只是一个小工具，用来让 policy 初始化更易读。
