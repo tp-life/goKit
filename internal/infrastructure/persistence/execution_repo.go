@@ -26,7 +26,7 @@ func (r *ExecutionRepo) Upsert(ctx context.Context, item *entity.ExecutionRecord
 		Columns: []clause.Column{{Name: "plan_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"batch_id", "opportunity_batch_id", "symbol", "long_exchange", "short_exchange",
-			"status", "live_trading", "auto_close", "target_close_time_ms", "opened_at_ms",
+			"status", "live_trading", "auto_close", "allocated_notional_usdt", "target_close_time_ms", "opened_at_ms",
 			"closed_at_ms", "last_transition_at_ms", "last_transition_event", "status_reason",
 			"last_error", "open_order_count", "close_order_count", "updated_at",
 		}),
@@ -132,25 +132,45 @@ func (r *ExecutionRepo) ListLatest(ctx context.Context, limit int) ([]entity.Exe
 	return out, err
 }
 
+func (r *ExecutionRepo) ListActiveLive(ctx context.Context) ([]entity.ExecutionRecord, error) {
+	var out []entity.ExecutionRecord
+	err := r.client.GetDB(ctx).
+		Where("live_trading = ?", true).
+		Where("status IN ?", []string{
+			"pending_open",
+			"opened",
+			"open_partial_failed",
+			"open_hedging",
+			"pending_close",
+			"close_partial_failed",
+			"close_failed",
+			"close_hedging",
+		}).
+		Order("updated_at desc").
+		Find(&out).Error
+	return out, err
+}
+
 func executionRecordAssignments(item *entity.ExecutionRecord) map[string]any {
 	return map[string]any{
-		"batch_id":              item.BatchID,
-		"opportunity_batch_id":  item.OpportunityBatchID,
-		"symbol":                item.Symbol,
-		"long_exchange":         item.LongExchange,
-		"short_exchange":        item.ShortExchange,
-		"status":                item.Status,
-		"live_trading":          item.LiveTrading,
-		"auto_close":            item.AutoClose,
-		"target_close_time_ms":  item.TargetCloseTimeMs,
-		"opened_at_ms":          item.OpenedAtMs,
-		"closed_at_ms":          item.ClosedAtMs,
-		"last_transition_at_ms": item.LastTransitionAtMs,
-		"last_transition_event": item.LastTransitionEvent,
-		"status_reason":         item.StatusReason,
-		"last_error":            item.LastError,
-		"open_order_count":      item.OpenOrderCount,
-		"close_order_count":     item.CloseOrderCount,
+		"batch_id":                item.BatchID,
+		"opportunity_batch_id":    item.OpportunityBatchID,
+		"symbol":                  item.Symbol,
+		"long_exchange":           item.LongExchange,
+		"short_exchange":          item.ShortExchange,
+		"status":                  item.Status,
+		"live_trading":            item.LiveTrading,
+		"auto_close":              item.AutoClose,
+		"allocated_notional_usdt": item.AllocatedNotionalUSDT,
+		"target_close_time_ms":    item.TargetCloseTimeMs,
+		"opened_at_ms":            item.OpenedAtMs,
+		"closed_at_ms":            item.ClosedAtMs,
+		"last_transition_at_ms":   item.LastTransitionAtMs,
+		"last_transition_event":   item.LastTransitionEvent,
+		"status_reason":           item.StatusReason,
+		"last_error":              item.LastError,
+		"open_order_count":        item.OpenOrderCount,
+		"close_order_count":       item.CloseOrderCount,
 	}
 }
 

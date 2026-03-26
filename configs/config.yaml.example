@@ -148,7 +148,17 @@ strategy:
     # 执行引擎轮询周期。
     loop_interval: 3s
     # 每轮最多读取多少条最新执行计划/记录。
+    # 这只是“候选读取上限”，不是“最多实际开几单”。
     max_latest_plans: 50
+    # 自动开仓时，是否把“剩余可用 notional”按本轮可开 plan 数动态平分。
+    # false = 保持旧行为，每条 plan 都按完整目标仓位尝试开仓。
+    auto_allocate_capital: false
+    # 同时最多允许多少条 live execution 存在。
+    # =0 表示不限制；opened / pending / recovery close 都计入。
+    max_live_plans: 0
+    # 每轮自动开仓循环最多尝试推进多少条新 plan。
+    # =0 表示不限制，仍受 max_latest_plans 与 max_live_plans 共同约束。
+    max_auto_open_per_loop: 0
     # 持仓期间允许承受的最大“按当前可成交方向估算”的浮亏（USDT）。
     # =0 表示关闭这条提前平仓护栏。
     max_unrealized_loss_usdt: 0

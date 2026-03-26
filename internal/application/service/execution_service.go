@@ -50,15 +50,15 @@ type ExecutionServiceParams struct {
 }
 
 type ExecutionService struct {
-	cfg          Config
-	logger       *slog.Logger
-	store        *MarketStore
-	planRepo     repository.ExecutionPlanRepository
-	execRepo     repository.ExecutionRepository
-	orderRepo    repository.OrderRepository
-	trades       map[string]exchange.TradeAdapter
-	orderEventCh chan exchange.OrderEvent
-	mu           sync.Mutex
+	cfg             Config
+	logger          *slog.Logger
+	store           *MarketStore
+	planRepo        repository.ExecutionPlanRepository
+	execRepo        repository.ExecutionRepository
+	orderRepo       repository.OrderRepository
+	trades          map[string]exchange.TradeAdapter
+	orderEventCh    chan exchange.OrderEvent
+	mu              sync.Mutex
 	exchangeFailure map[string]exchangeFailureState
 }
 
@@ -123,6 +123,13 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 		s.logger.Error("execution_auto_open_list_plans_failed", slog.Any("err", err))
 		return
 	}
+	activeRecords, err := s.execRepo.ListActiveLive(ctx)
+	if err != nil {
+		s.logger.Error("execution_auto_open_list_active_records_failed", slog.Any("err", err))
+		return
+	}
+
+	candidates := make([]entity.ExecutionPlan, 0, len(plans))
 	for _, plan := range plans {
 		if !plan.ReadyNow || strings.ToLower(plan.Status) != "ready" {
 			continue
@@ -135,8 +142,65 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 		if rec != nil {
 			continue
 		}
-		if _, err := s.openPlan(ctx, &plan, "auto", s.cfg.Execution.Enabled); err != nil {
-			s.logger.Error("execution_auto_open_failed", slog.String("plan_key", plan.PlanKey), slog.Any("err", err))
+		candidates = append(candidates, plan)
+	}
+
+	activeLiveCount := len(activeRecords)
+	activeAllocatedNotional := s.sumAllocatedNotional(ctx, activeRecords)
+	openAttempts := 0
+
+	for idx, candidate := range candidates {
+		if s.cfg.Execution.MaxAutoOpenPerLoop > 0 && openAttempts >= s.cfg.Execution.MaxAutoOpenPerLoop {
+			break
+		}
+		if s.cfg.Execution.MaxLivePlans > 0 && activeLiveCount >= s.cfg.Execution.MaxLivePlans {
+			break
+		}
+
+		planToOpen := candidate
+		if s.cfg.Execution.AutoAllocateCapital {
+			remainingBudget := s.cfg.EffectiveNotional() - activeAllocatedNotional
+			if remainingBudget <= 0 {
+				s.logger.Info(
+					"execution_auto_open_budget_exhausted",
+					slog.Float64("effective_notional", s.cfg.EffectiveNotional()),
+					slog.Float64("active_allocated_notional", activeAllocatedNotional),
+				)
+				break
+			}
+
+			remainingTargets := len(candidates) - idx
+			if s.cfg.Execution.MaxAutoOpenPerLoop > 0 {
+				remainingTargets = minInt(remainingTargets, s.cfg.Execution.MaxAutoOpenPerLoop-openAttempts)
+			}
+			if s.cfg.Execution.MaxLivePlans > 0 {
+				remainingTargets = minInt(remainingTargets, s.cfg.Execution.MaxLivePlans-activeLiveCount)
+			}
+			if remainingTargets <= 0 {
+				break
+			}
+
+			scaledPlan, scaleErr := s.scalePlanForAutoBudget(candidate, remainingBudget/float64(remainingTargets))
+			if scaleErr != nil {
+				s.logger.Warn(
+					"execution_auto_open_plan_skipped_after_budget_scale",
+					slog.String("plan_key", candidate.PlanKey),
+					slog.String("symbol", candidate.Symbol),
+					slog.Any("err", scaleErr),
+				)
+				continue
+			}
+			planToOpen = scaledPlan
+		}
+
+		rec, openErr := s.openPlan(ctx, &planToOpen, "auto", s.cfg.Execution.Enabled)
+		openAttempts++
+		if rec != nil && countsTowardLivePlanLimit(*rec) {
+			activeLiveCount++
+			activeAllocatedNotional += s.allocatedNotionalForRecord(ctx, *rec, &planToOpen)
+		}
+		if openErr != nil {
+			s.logger.Error("execution_auto_open_failed", slog.String("plan_key", planToOpen.PlanKey), slog.Any("err", openErr))
 		}
 	}
 }
@@ -491,15 +555,16 @@ func summarizeExecutionOutcomeReason(phase, status string, resultCount int, errM
 
 func (s *ExecutionService) newExecutionRecord(plan *entity.ExecutionPlan, live bool) *entity.ExecutionRecord {
 	return &entity.ExecutionRecord{
-		PlanKey:            plan.PlanKey,
-		BatchID:            plan.BatchID,
-		OpportunityBatchID: plan.OpportunityBatchID,
-		Symbol:             plan.Symbol,
-		LongExchange:       plan.LongExchange,
-		ShortExchange:      plan.ShortExchange,
-		LiveTrading:        live,
-		AutoClose:          s.cfg.Execution.AutoClose,
-		TargetCloseTimeMs:  plan.TargetCloseTimeMs,
+		PlanKey:               plan.PlanKey,
+		BatchID:               plan.BatchID,
+		OpportunityBatchID:    plan.OpportunityBatchID,
+		Symbol:                plan.Symbol,
+		LongExchange:          plan.LongExchange,
+		ShortExchange:         plan.ShortExchange,
+		LiveTrading:           live,
+		AutoClose:             s.cfg.Execution.AutoClose,
+		AllocatedNotionalUSDT: firstPositiveFloat(plan.RoundedNotionalUSDT, plan.TargetNotionalUSDT),
+		TargetCloseTimeMs:     plan.TargetCloseTimeMs,
 	}
 }
 
@@ -1151,6 +1216,112 @@ func firstPositiveFloat(values ...float64) float64 {
 		}
 	}
 	return 0
+}
+
+func countsTowardLivePlanLimit(rec entity.ExecutionRecord) bool {
+	if !rec.LiveTrading {
+		return false
+	}
+	switch normalizeExecutionStatus(rec.Status) {
+	case executionStatePendingOpen, executionStateOpened, executionStateOpenPartial, executionStateOpenHedging, executionStatePendingClose, executionStateClosePartial, executionStateCloseFailed, executionStateCloseHedging:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *ExecutionService) sumAllocatedNotional(ctx context.Context, records []entity.ExecutionRecord) float64 {
+	var total float64
+	for _, rec := range records {
+		total += s.allocatedNotionalForRecord(ctx, rec, nil)
+	}
+	return total
+}
+
+func (s *ExecutionService) allocatedNotionalForRecord(ctx context.Context, rec entity.ExecutionRecord, fallbackPlan *entity.ExecutionPlan) float64 {
+	if rec.AllocatedNotionalUSDT > 0 {
+		return rec.AllocatedNotionalUSDT
+	}
+	if fallbackPlan != nil && fallbackPlan.PlanKey == rec.PlanKey {
+		return firstPositiveFloat(fallbackPlan.RoundedNotionalUSDT, fallbackPlan.TargetNotionalUSDT)
+	}
+	plan, err := s.planRepo.FindByPlanKey(ctx, rec.PlanKey)
+	if err == nil && plan != nil {
+		return firstPositiveFloat(plan.RoundedNotionalUSDT, plan.TargetNotionalUSDT)
+	}
+	return 0
+}
+
+func (s *ExecutionService) scalePlanForAutoBudget(plan entity.ExecutionPlan, targetNotional float64) (entity.ExecutionPlan, error) {
+	if targetNotional <= 0 {
+		return entity.ExecutionPlan{}, fmt.Errorf("target notional must be positive")
+	}
+	longMeta, okLong := s.store.Symbol(plan.LongExchange, plan.Symbol)
+	shortMeta, okShort := s.store.Symbol(plan.ShortExchange, plan.Symbol)
+	if !okLong || !okShort {
+		return entity.ExecutionPlan{}, fmt.Errorf("missing symbol metadata for auto allocation %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
+	}
+	if plan.LongEntryPrice <= 0 || plan.ShortEntryPrice <= 0 {
+		return entity.ExecutionPlan{}, fmt.Errorf("missing entry prices for auto allocation %s", plan.Symbol)
+	}
+
+	longQty, shortQty, longNotional, shortNotional, ok := computeCommonLegQuantities(
+		targetNotional,
+		plan.LongEntryPrice,
+		plan.ShortEntryPrice,
+		longMeta.StepSize,
+		shortMeta.StepSize,
+	)
+	if !ok {
+		return entity.ExecutionPlan{}, fmt.Errorf("auto allocation %s cannot compute common quantities for target notional %.2f", plan.Symbol, targetNotional)
+	}
+
+	scaled := plan
+	scaled.TargetNotionalUSDT = round2(targetNotional)
+	scaled.LongQty = round8(longQty)
+	scaled.ShortQty = round8(shortQty)
+	scaled.RoundedNotionalUSDT = round2(math.Min(longNotional, shortNotional))
+
+	if scaled.LongQty < scaled.LongMinQty || scaled.ShortQty < scaled.ShortMinQty {
+		return entity.ExecutionPlan{}, fmt.Errorf(
+			"auto allocation %s target notional %.2f drops below min qty long=%.6f/%.6f short=%.6f/%.6f",
+			plan.Symbol,
+			targetNotional,
+			scaled.LongQty,
+			scaled.LongMinQty,
+			scaled.ShortQty,
+			scaled.ShortMinQty,
+		)
+	}
+	if longNotional < scaled.LongMinNotionalUSDT || shortNotional < scaled.ShortMinNotionalUSDT {
+		return entity.ExecutionPlan{}, fmt.Errorf(
+			"auto allocation %s target notional %.2f drops below min notional long=%.2f/%.2f short=%.2f/%.2f",
+			plan.Symbol,
+			targetNotional,
+			longNotional,
+			scaled.LongMinNotionalUSDT,
+			shortNotional,
+			scaled.ShortMinNotionalUSDT,
+		)
+	}
+
+	baseNotional := firstPositiveFloat(plan.RoundedNotionalUSDT, plan.TargetNotionalUSDT)
+	actualNotional := scaled.RoundedNotionalUSDT
+	if baseNotional > 0 && actualNotional > 0 {
+		scale := actualNotional / baseNotional
+		scaled.FundingCarryPNL = round2(plan.FundingCarryPNL * scale)
+		scaled.EntryFeePNL = round2(plan.EntryFeePNL * scale)
+		scaled.ExitFeePNL = round2(plan.ExitFeePNL * scale)
+		scaled.SlippagePNL = round2(actualNotional * (plan.EntryPenaltyBps + plan.ExitPenaltyBps) / 10000)
+		scaled.SafetyBufferPNL = round2(s.cfg.SafetyBufferUSDT + actualNotional*plan.HedgePenaltyBps/10000)
+		scaled.NetExpectedPNL = round2(scaled.FundingCarryPNL - scaled.EntryFeePNL - scaled.ExitFeePNL - scaled.SlippagePNL - scaled.SafetyBufferPNL)
+		if actualNotional > 0 {
+			scaled.NetExpectedPNLBps = round4(scaled.NetExpectedPNL / actualNotional * 10000)
+		} else {
+			scaled.NetExpectedPNLBps = 0
+		}
+	}
+	return scaled, nil
 }
 
 func executionClaimableStatuses(policy executionPhasePolicy) []string {

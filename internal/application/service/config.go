@@ -12,6 +12,9 @@ type ExecutionConfig struct {
 	CloseGracePeriod                  time.Duration `mapstructure:"close_grace_period"`
 	LoopInterval                      time.Duration `mapstructure:"loop_interval"`
 	MaxLatestPlans                    int           `mapstructure:"max_latest_plans"`
+	AutoAllocateCapital               bool          `mapstructure:"auto_allocate_capital"`
+	MaxLivePlans                      int           `mapstructure:"max_live_plans"`
+	MaxAutoOpenPerLoop                int           `mapstructure:"max_auto_open_per_loop"`
 	MaxSingleSymbolExposureUSDT       float64       `mapstructure:"max_single_symbol_exposure_usdt"`
 	MaxSingleExchangeExposureUSDT     float64       `mapstructure:"max_single_exchange_exposure_usdt"`
 	MinAccountEquityUSDT              float64       `mapstructure:"min_account_equity_usdt"`
@@ -194,6 +197,12 @@ func (c Config) normalize() Config {
 	}
 	if c.Execution.MaxLatestPlans <= 0 {
 		c.Execution.MaxLatestPlans = 50
+	}
+	if c.Execution.MaxLivePlans < 0 {
+		c.Execution.MaxLivePlans = 0
+	}
+	if c.Execution.MaxAutoOpenPerLoop < 0 {
+		c.Execution.MaxAutoOpenPerLoop = 0
 	}
 	if c.Execution.MinAvailableBalanceRatio <= 0 || c.Execution.MinAvailableBalanceRatio > 1 {
 		c.Execution.MinAvailableBalanceRatio = 0.1

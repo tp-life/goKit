@@ -56,12 +56,19 @@ type StrategyStatus struct {
 }
 
 type ExecutionStatus struct {
-	LiveTradingEnabled bool   `json:"live_trading_enabled"`
-	AutoEntry          bool   `json:"auto_entry"`
-	AutoClose          bool   `json:"auto_close"`
-	CloseGracePeriod   string `json:"close_grace_period"`
-	LoopInterval       string `json:"loop_interval"`
-	MaxLatestPlans     int    `json:"max_latest_plans"`
+	LiveTradingEnabled          bool    `json:"live_trading_enabled"`
+	AutoEntry                   bool    `json:"auto_entry"`
+	AutoClose                   bool    `json:"auto_close"`
+	CloseGracePeriod            string  `json:"close_grace_period"`
+	LoopInterval                string  `json:"loop_interval"`
+	MaxLatestPlans              int     `json:"max_latest_plans"`
+	AutoAllocateCapital         bool    `json:"auto_allocate_capital"`
+	MaxLivePlans                int     `json:"max_live_plans"`
+	MaxAutoOpenPerLoop          int     `json:"max_auto_open_per_loop"`
+	ActiveLivePlans             int     `json:"active_live_plans"`
+	ActiveAllocatedNotionalUSDT float64 `json:"active_allocated_notional_usdt"`
+	RemainingAutoBudgetUSDT     float64 `json:"remaining_auto_budget_usdt"`
+	RemainingLiveSlots          int     `json:"remaining_live_slots"`
 }
 
 type SystemStatus struct {

@@ -108,6 +108,18 @@ func (r *testExecRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionR
 	return append([]entity.ExecutionRecord(nil), r.items...), nil
 }
 
+func (r *testExecRepo) ListActiveLive(_ context.Context) ([]entity.ExecutionRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]entity.ExecutionRecord, 0, len(r.items))
+	for _, item := range r.items {
+		if countsTowardLivePlanLimit(item) {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
 type testPlanRepo struct {
 	items []entity.ExecutionPlan
 }
@@ -288,6 +300,58 @@ func newTestExecutionService(orderRepo *testOrderRepo, trades map[string]exchang
 		trades:          trades,
 		orderEventCh:    make(chan exchange.OrderEvent, 32),
 		exchangeFailure: map[string]exchangeFailureState{},
+	}
+}
+
+func seedAutoOpenMarket(store *MarketStore, now time.Time, symbol, longExchange, shortExchange string, price float64) {
+	venueSymbol := symbol + "USDT"
+	store.UpsertSymbol(entity.Symbol{Exchange: longExchange, Symbol: symbol, VenueSymbol: venueSymbol, StepSize: "0.001", MinNotional: "10", FundingIntervalHours: 8})
+	store.UpsertSymbol(entity.Symbol{Exchange: shortExchange, Symbol: symbol, VenueSymbol: venueSymbol, StepSize: "0.001", MinNotional: "10", FundingIntervalHours: 8})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: longExchange, Symbol: symbol, VenueSymbol: venueSymbol, BidPrice: price, AskPrice: price, EventTimeMs: now.UnixMilli()})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: shortExchange, Symbol: symbol, VenueSymbol: venueSymbol, BidPrice: price, AskPrice: price, EventTimeMs: now.UnixMilli()})
+	store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             longExchange,
+		Symbol:               symbol,
+		VenueSymbol:          venueSymbol,
+		FundingRate:          -0.0020,
+		FundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+	store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             shortExchange,
+		Symbol:               symbol,
+		VenueSymbol:          venueSymbol,
+		FundingRate:          0.0020,
+		FundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+}
+
+func readyPlan(planKey, symbol, longExchange, shortExchange string, price, qty, notional float64) entity.ExecutionPlan {
+	venueSymbol := symbol + "USDT"
+	return entity.ExecutionPlan{
+		PlanKey:              planKey,
+		Symbol:               symbol,
+		Status:               "ready",
+		ReadyNow:             true,
+		LongExchange:         longExchange,
+		ShortExchange:        shortExchange,
+		LongVenueSymbol:      venueSymbol,
+		ShortVenueSymbol:     venueSymbol,
+		LongEntryPrice:       price,
+		ShortEntryPrice:      price,
+		LongQty:              qty,
+		ShortQty:             qty,
+		LongMinQty:           0.001,
+		ShortMinQty:          0.001,
+		LongMinNotionalUSDT:  10,
+		ShortMinNotionalUSDT: 10,
+		TargetNotionalUSDT:   notional,
+		RoundedNotionalUSDT:  notional,
+		EntryMode:            "taker",
+		ExitMode:             "taker",
 	}
 }
 
@@ -1328,6 +1392,148 @@ func TestOpenPlan_RevalidatesCurrentOpportunityBeforeLiveOpen(t *testing.T) {
 	}
 	if len(longAdapter.placed) != 0 || len(shortAdapter.placed) != 0 {
 		t.Fatalf("expected revalidation failure to block all live orders, got long=%d short=%d", len(longAdapter.placed), len(shortAdapter.placed))
+	}
+}
+
+func TestRunAutoOpen_RespectsMaxAutoOpenPerLoop(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			readyPlan("plan-auto-1", "BTC", "longex", "shortex", 100, 16, 1600),
+			readyPlan("plan-auto-2", "ETH", "longex", "shortex", 100, 16, 1600),
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.Execution.MaxAutoOpenPerLoop = 1
+	svc.cfg.MinNetPNL = 0.1
+	seedAutoOpenMarket(svc.store, now, "BTC", "longex", "shortex", 100)
+	seedAutoOpenMarket(svc.store, now, "ETH", "longex", "shortex", 100)
+
+	svc.runAutoOpen(context.Background())
+
+	if len(orderRepo.items) != 2 {
+		t.Fatalf("expected exactly one plan to place two primary-leg orders, got %d order records", len(orderRepo.items))
+	}
+	if len(execRepo.items) != 1 {
+		t.Fatalf("expected exactly one execution record, got %d", len(execRepo.items))
+	}
+	if execRepo.items[0].PlanKey != "plan-auto-1" {
+		t.Fatalf("expected first ready plan to open first, got %s", execRepo.items[0].PlanKey)
+	}
+}
+
+func TestRunAutoOpen_AutoAllocatesRemainingBudgetAcrossCandidates(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:               "plan-existing",
+				Status:                executionStateOpened,
+				LiveTrading:           true,
+				AllocatedNotionalUSDT: 800,
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			readyPlan("plan-auto-btc", "BTC", "longex", "shortex", 100, 16, 1600),
+			readyPlan("plan-auto-eth", "ETH", "longex", "shortex", 100, 16, 1600),
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.Execution.AutoAllocateCapital = true
+	svc.cfg.Execution.MaxAutoOpenPerLoop = 2
+	svc.cfg.Execution.MaxLivePlans = 3
+	svc.cfg.MinNetPNL = 0.1
+	seedAutoOpenMarket(svc.store, now, "BTC", "longex", "shortex", 100)
+	seedAutoOpenMarket(svc.store, now, "ETH", "longex", "shortex", 100)
+
+	svc.runAutoOpen(context.Background())
+
+	if len(execRepo.items) != 3 {
+		t.Fatalf("expected existing record plus two new live executions, got %d", len(execRepo.items))
+	}
+	for _, planKey := range []string{"plan-auto-btc", "plan-auto-eth"} {
+		rec, err := execRepo.FindByPlanKey(context.Background(), planKey)
+		if err != nil {
+			t.Fatalf("expected execution lookup to succeed for %s, got %v", planKey, err)
+		}
+		if rec == nil {
+			t.Fatalf("expected execution record for %s", planKey)
+		}
+		if rec.AllocatedNotionalUSDT != 400 {
+			t.Fatalf("expected %s allocated notional 400, got %.2f", planKey, rec.AllocatedNotionalUSDT)
+		}
+	}
+	if len(longAdapter.placed) != 2 || len(shortAdapter.placed) != 2 {
+		t.Fatalf("expected two live open requests per side, got long=%d short=%d", len(longAdapter.placed), len(shortAdapter.placed))
+	}
+	for _, req := range append(append([]exchange.TradeOrderRequest(nil), longAdapter.placed...), shortAdapter.placed...) {
+		if req.Quantity != 4 {
+			t.Fatalf("expected auto-allocated quantity 4, got %.6f", req.Quantity)
+		}
+	}
+}
+
+func TestRunAutoOpen_RespectsMaxLivePlans(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:               "plan-live-existing",
+				Status:                executionStateOpened,
+				LiveTrading:           true,
+				AllocatedNotionalUSDT: 800,
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			readyPlan("plan-live-1", "BTC", "longex", "shortex", 100, 16, 1600),
+			readyPlan("plan-live-2", "ETH", "longex", "shortex", 100, 16, 1600),
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.Execution.MaxLivePlans = 2
+	svc.cfg.MinNetPNL = 0.1
+	seedAutoOpenMarket(svc.store, now, "BTC", "longex", "shortex", 100)
+	seedAutoOpenMarket(svc.store, now, "ETH", "longex", "shortex", 100)
+
+	svc.runAutoOpen(context.Background())
+
+	if len(orderRepo.items) != 2 {
+		t.Fatalf("expected only one additional plan to open under max_live_plans, got %d order records", len(orderRepo.items))
+	}
+	rec, err := execRepo.FindByPlanKey(context.Background(), "plan-live-1")
+	if err != nil {
+		t.Fatalf("expected execution lookup to succeed, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected first candidate to open within remaining live slot")
+	}
+	if rec, err = execRepo.FindByPlanKey(context.Background(), "plan-live-2"); err != nil {
+		t.Fatalf("expected second execution lookup to succeed, got %v", err)
+	} else if rec != nil {
+		t.Fatalf("expected second candidate to remain unopened after reaching max_live_plans, got %#v", rec)
 	}
 }
 

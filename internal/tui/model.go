@@ -273,6 +273,8 @@ type Model struct {
 	lastError   string
 	flash       string
 
+	marketLastRefresh time.Time
+
 	searchMode bool
 	search     textinput.Model
 
@@ -438,6 +440,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if strings.EqualFold(strings.TrimSpace(msg.Symbol), m.currentSymbol()) || strings.TrimSpace(m.data.Market.Symbol) == "" {
 			m.data.Market = msg.Snapshot
+			m.marketLastRefresh = time.Now()
 		}
 		return m, nil
 	case marketErrMsg:
@@ -1055,10 +1058,21 @@ func (m *Model) ensureMarketCmd() tea.Cmd {
 	if strings.TrimSpace(symbol) == "" {
 		return nil
 	}
-	if strings.EqualFold(strings.TrimSpace(m.data.Market.Symbol), symbol) && !m.isLoading(loadMarket) {
+	if strings.EqualFold(strings.TrimSpace(m.data.Market.Symbol), symbol) && !m.isLoading(loadMarket) && !m.marketRefreshDue() {
 		return nil
 	}
 	return m.startMarketRefreshCmd(symbol)
+}
+
+func (m Model) marketRefreshDue() bool {
+	if m.marketLastRefresh.IsZero() {
+		return true
+	}
+	interval := m.refreshInterval
+	if interval <= 0 {
+		interval = 8 * time.Second
+	}
+	return time.Since(m.marketLastRefresh) >= interval
 }
 
 func (m *Model) ensureOrdersCmd() tea.Cmd {

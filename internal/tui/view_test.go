@@ -93,3 +93,55 @@ func TestRenderHeader_IncludesHardLimits(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderOverviewDetail_ShowsLegsBeforePnLBreakdown(t *testing.T) {
+	m := NewModel(nil, 0)
+	item := OpportunityListItem{
+		Symbol:                 "BTC",
+		LongExchange:           "binance",
+		ShortExchange:          "aster",
+		LongVenueSymbol:        "BTCUSDT",
+		ShortVenueSymbol:       "BTCUSDT",
+		NetExpectedPNL:         6.6,
+		NetExpectedBps:         12,
+		LongFundingTimeMs:      time.Now().Add(time.Hour).UnixMilli(),
+		ShortFundingTimeMs:     time.Now().Add(2 * time.Hour).UnixMilli(),
+		ProjectedFundingTimeMs: time.Now().Add(2 * time.Hour).UnixMilli(),
+		FundingWindowHours:     2,
+		FundingComputationMode: "event_window",
+	}
+
+	got := m.renderOverviewDetail(item, nil, false, false, entity.ExecutionPlan{}, false, entity.ExecutionRecord{}, false, 180)
+	legsIdx := strings.Index(got, "双腿信息")
+	pnlIdx := strings.Index(got, "收益构成")
+	if legsIdx < 0 || pnlIdx < 0 {
+		t.Fatalf("expected overview to contain both sections, got %q", got)
+	}
+	if legsIdx > pnlIdx {
+		t.Fatalf("expected legs section before pnl breakdown, got %q", got)
+	}
+}
+
+func TestRenderLegsDetail_RendersComparisonTable(t *testing.T) {
+	item := OpportunityListItem{
+		LongExchange:           "binance",
+		ShortExchange:          "aster",
+		LongVenueSymbol:        "BTCUSDT",
+		ShortVenueSymbol:       "BTCUSDT",
+		LongFundingRate:        0.0012,
+		ShortFundingRate:       0.0023,
+		LongFutureFundingRate:  0.0011,
+		ShortFutureFundingRate: 0.0021,
+		LongFundingHourly:      0.0003,
+		ShortFundingHourly:     0.0005,
+		LongFundingTimeMs:      time.Now().Add(time.Hour).UnixMilli(),
+		ShortFundingTimeMs:     time.Now().Add(2 * time.Hour).UnixMilli(),
+	}
+
+	got := NewModel(nil, 0).renderLegsDetail(item, nil, false, false, 180)
+	for _, needle := range []string{"指标", "做多腿", "做空腿", "交易所", "当前费率", "标记价"} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("expected legs detail table to contain %q, got %q", needle, got)
+		}
+	}
+}

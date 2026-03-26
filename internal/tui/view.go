@@ -315,10 +315,14 @@ func (m Model) renderExecutionList(width int, height int) string {
 		for i := start; i < end; i++ {
 			item := m.data.Executions[i]
 			marker := selectedMarker(i == selected)
+			allocatedText := "--"
+			if value := executionAllocatedNotional(item, entity.ExecutionPlan{}, false); value > 0 {
+				allocatedText = fmtMoney(value, 2)
+			}
 			block := strings.Join([]string{
 				fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), statusText(item.Status)),
 				fmt.Sprintf("    plan %-28s live %-3s auto_close %-3s", clip(item.PlanKey, 28), boolWord(item.LiveTrading), boolWord(item.AutoClose)),
-				fmt.Sprintf("    open %s  close %s", clip(fmtTime(item.OpenedAtMs), 19), clip(fmtTime(item.ClosedAtMs), 19)),
+				fmt.Sprintf("    alloc %-14s open %s  close %s", clip(allocatedText, 14), clip(fmtTime(item.OpenedAtMs), 19), clip(fmtTime(item.ClosedAtMs), 19)),
 			}, "\n")
 			if i == selected {
 				block = ui.activeRow.Render(block)
@@ -351,7 +355,7 @@ func (m Model) renderExecutionList(width int, height int) string {
 		block := strings.Join([]string{
 			fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), pnlText),
 			fmt.Sprintf("    %-18s ready %-3s status %-18s", clip(opportunityPair(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 18), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
-			fmt.Sprintf("    plan %-36s", clip(item.PlanKey, 36)),
+			fmt.Sprintf("    plan %-16s notional %-12s", clip(item.PlanKey, 16), clip(fmtMoney(targetNotional(item), 2), 12)),
 		}, "\n")
 		if i == selected {
 			block = ui.activeRow.Render(block)
@@ -454,6 +458,14 @@ func (m Model) renderConfigPanel(width int, height int) string {
 			orDefault(exec.CloseGracePeriod, "--"),
 			exec.MaxLatestPlans,
 		),
+		fmt.Sprintf("Auto budget: allocate=%s  used=%s  remain=%s  live_plans=%d%s  per_loop=%s",
+			boolWord(exec.AutoAllocateCapital),
+			fmtMoney(exec.ActiveAllocatedNotionalUSDT, 2),
+			fmtMoney(exec.RemainingAutoBudgetUSDT, 2),
+			exec.ActiveLivePlans,
+			renderLimitSuffix(exec.MaxLivePlans),
+			renderLoopLimit(exec.MaxAutoOpenPerLoop),
+		),
 		"",
 		"Watchlist: " + clip(strings.Join(m.data.System.Watchlist, ", "), width-8),
 		"DeepScan: " + clip(strings.Join(m.data.System.DeepScanWatchlist, ", "), width-8),
@@ -496,11 +508,11 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 		ui.panelTitle.Render("市场快照"),
 		renderMarketSummary(m.data.Market, width),
 		"",
-		ui.panelTitle.Render("收益构成"),
-		m.renderPnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width),
-		"",
 		ui.panelTitle.Render("双腿信息"),
 		m.renderLegsDetail(item, detail, hasDetail, loading, width),
+		"",
+		ui.panelTitle.Render("收益构成"),
+		m.renderPnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width),
 		"",
 		ui.panelTitle.Render("计划信息"),
 		m.renderPlanDetail(item, plan, hasPlan, rec, hasRec, width),
@@ -571,38 +583,7 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 }
 
 func (m Model) renderLegsDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, width int) string {
-	lines := []string{
-		fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s",
-			ui.good.Render("多头"),
-			renderField("合约", toneStyle("accent").Render(orDefault(item.LongVenueSymbol, "--"))),
-			renderField("当前费率", renderPctValue(item.LongFundingRate, 5)),
-			renderField("预测费率", renderPctValue(item.LongFutureFundingRate, 5)),
-			renderField("小时化", renderPctValue(item.LongFundingHourly, 5)),
-			renderField("下次结算", renderTimeValue(item.LongFundingTimeMs, "accent")),
-			renderField("结算间隔", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(float64(item.LongFundingIntervalHours), 0)))),
-		),
-		fmt.Sprintf("  %s  %s  %s",
-			renderField("买一", toneStyle("accent").Render(priceText(item.LongBidPrice))),
-			renderField("卖一", toneStyle("accent").Render(priceText(item.LongAskPrice))),
-			renderField("标记价", toneStyle("accent").Render(priceText(item.LongMarkPrice))),
-		),
-		"",
-		fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s",
-			ui.warn.Render("空头"),
-			renderField("合约", toneStyle("accent").Render(orDefault(item.ShortVenueSymbol, "--"))),
-			renderField("当前费率", renderPctValue(item.ShortFundingRate, 5)),
-			renderField("预测费率", renderPctValue(item.ShortFutureFundingRate, 5)),
-			renderField("小时化", renderPctValue(item.ShortFundingHourly, 5)),
-			renderField("下次结算", renderTimeValue(item.ShortFundingTimeMs, "accent")),
-			renderField("结算间隔", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(float64(item.ShortFundingIntervalHours), 0)))),
-		),
-		fmt.Sprintf("  %s  %s  %s",
-			renderField("买一", toneStyle("accent").Render(priceText(item.ShortBidPrice))),
-			renderField("卖一", toneStyle("accent").Render(priceText(item.ShortAskPrice))),
-			renderField("标记价", toneStyle("accent").Render(priceText(item.ShortMarkPrice))),
-		),
-		"",
-	}
+	lines := []string{renderLegsCompareTable(item, width), ""}
 	switch {
 	case hasDetail:
 		lines = append(lines,
@@ -613,6 +594,42 @@ func (m Model) renderLegsDetail(item OpportunityListItem, detail *entity.Opportu
 		lines = append(lines, ui.subtle.Render("正在加载资金费规则详情..."))
 	default:
 		lines = append(lines, ui.subtle.Render("资金费规则详情暂不可用。"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderLegsCompareTable(item OpportunityListItem, width int) string {
+	tableWidth := maxInt(48, width)
+	metricWidth := 10
+	available := tableWidth - metricWidth - 6
+	if available < 24 {
+		available = 24
+	}
+	longWidth := available / 2
+	shortWidth := available - longWidth
+
+	lines := []string{
+		fmt.Sprintf("%s | %s | %s",
+			ui.subtle.Render(padTablePlain("指标", metricWidth, lipgloss.Left)),
+			ui.good.Render(padTablePlain("做多腿", longWidth, lipgloss.Left)),
+			ui.warn.Render(padTablePlain("做空腿", shortWidth, lipgloss.Left)),
+		),
+		fmt.Sprintf("%s-+-%s-+-%s",
+			strings.Repeat("-", metricWidth),
+			strings.Repeat("-", longWidth),
+			strings.Repeat("-", shortWidth),
+		),
+		renderLegRow("交易所", item.LongExchange, item.ShortExchange, metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("合约", orDefault(item.LongVenueSymbol, "--"), orDefault(item.ShortVenueSymbol, "--"), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("当前费率", fmtPctRatio(item.LongFundingRate, 5), fmtPctRatio(item.ShortFundingRate, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFundingRate), signedNumberTone(item.ShortFundingRate)),
+		renderLegRow("预测费率", fmtPctRatio(item.LongFutureFundingRate, 5), fmtPctRatio(item.ShortFutureFundingRate, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFutureFundingRate), signedNumberTone(item.ShortFutureFundingRate)),
+		renderLegRow("小时化", fmtPctRatio(item.LongFundingHourly, 5), fmtPctRatio(item.ShortFundingHourly, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFundingHourly), signedNumberTone(item.ShortFundingHourly)),
+		renderLegRow("买一", priceText(item.LongBidPrice), priceText(item.ShortBidPrice), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("卖一", priceText(item.LongAskPrice), priceText(item.ShortAskPrice), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("标记价", priceText(item.LongMarkPrice), priceText(item.ShortMarkPrice), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("下次结算", fmtTime(item.LongFundingTimeMs), fmtTime(item.ShortFundingTimeMs), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("结算间隔", fmt.Sprintf("%sh", fmtNumber(float64(item.LongFundingIntervalHours), 0)), fmt.Sprintf("%sh", fmtNumber(float64(item.ShortFundingIntervalHours), 0)), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("事件数", fmt.Sprintf("%d 次", item.LongFundingEventCount), fmt.Sprintf("%d 次", item.ShortFundingEventCount), metricWidth, longWidth, shortWidth, "accent", "accent"),
 	}
 	return strings.Join(lines, "\n")
 }
@@ -661,6 +678,7 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 			strings.Join([]string{
 				renderField("执行记录", renderStatusValue(rec.Status)),
 				renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+				renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
 				renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
 				renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
 			}, "  "),
@@ -768,6 +786,7 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 			renderField("record", renderStatusValue(rec.Status)),
 			renderField("live", renderBoolValue(rec.LiveTrading, true)),
 			renderField("auto_close", renderBoolValue(rec.AutoClose, false)),
+			renderField("alloc", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
 			renderField("opened", renderTimeValue(rec.OpenedAtMs, "accent")),
 			renderField("closed", renderTimeValue(rec.ClosedAtMs, "accent")),
 		}, "  "))
@@ -792,6 +811,7 @@ func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan enti
 			renderField("auto_close", renderBoolValue(rec.AutoClose, false)),
 		}, "  "),
 		strings.Join([]string{
+			renderField("alloc", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, hasPlan))),
 			renderField("opened", renderTimeValue(rec.OpenedAtMs, "accent")),
 			renderField("closed", renderTimeValue(rec.ClosedAtMs, "accent")),
 			renderField("transition", renderTimeValue(rec.LastTransitionAtMs, "accent")),
@@ -1259,6 +1279,18 @@ func alignRightValue(text string, width int) string {
 	return lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(text)
 }
 
+func padTablePlain(text string, width int, align lipgloss.Position) string {
+	return lipgloss.NewStyle().Width(width).Align(align).Render(clip(text, width))
+}
+
+func renderLegRow(label string, longValue string, shortValue string, metricWidth int, longWidth int, shortWidth int, longTone string, shortTone string) string {
+	return fmt.Sprintf("%s | %s | %s",
+		ui.subtle.Render(padTablePlain(label, metricWidth, lipgloss.Left)),
+		toneStyle(longTone).Render(padTablePlain(longValue, longWidth, lipgloss.Left)),
+		toneStyle(shortTone).Render(padTablePlain(shortValue, shortWidth, lipgloss.Left)),
+	)
+}
+
 func renderMoneyValue(value float64, digits int) string {
 	return toneStyle(signedNumberTone(value)).Render(fmtMoney(value, digits))
 }
@@ -1268,6 +1300,13 @@ func renderUSDTValue(value float64, digits int) string {
 		return toneStyle("subtle").Render("--")
 	}
 	return toneStyle("accent").Render(fmt.Sprintf("%.*f USDT", digits, value))
+}
+
+func renderAllocatedNotionalValue(value float64) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return toneStyle("subtle").Render("--")
+	}
+	return toneStyle("accent").Render(fmtMoney(value, 2))
 }
 
 func renderPctValue(value float64, digits int) string {
@@ -1465,6 +1504,33 @@ func orDefault(value string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func executionAllocatedNotional(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool) float64 {
+	if rec.AllocatedNotionalUSDT > 0 {
+		return rec.AllocatedNotionalUSDT
+	}
+	if hasPlan {
+		if value := plan.RoundedNotionalUSDT; value > 0 {
+			return value
+		}
+		return targetNotional(plan)
+	}
+	return 0
+}
+
+func renderLimitSuffix(limit int) string {
+	if limit <= 0 {
+		return "/unlimited"
+	}
+	return fmt.Sprintf("/%d", limit)
+}
+
+func renderLoopLimit(limit int) string {
+	if limit <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d", limit)
 }
 
 func minInt(a, b int) int {

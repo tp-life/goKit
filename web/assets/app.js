@@ -660,9 +660,31 @@ function renderOverview() {
     ),
     infoCell("自动开仓", boolText(execution.auto_entry)),
     infoCell("自动平仓", boolText(execution.auto_close)),
+    infoCell("自动分配资金", boolText(execution.auto_allocate_capital)),
     infoCell("轮询间隔", execution.loop_interval || "--"),
     infoCell("平仓保护期", execution.close_grace_period || "--"),
     infoCell("最新计划窗口", String(execution.max_latest_plans || 0)),
+    infoCell(
+      "每轮开仓上限",
+      execution.max_auto_open_per_loop > 0
+        ? String(execution.max_auto_open_per_loop)
+        : "不限",
+    ),
+    infoCell(
+      "当前 Live 计划",
+      execution.max_live_plans > 0
+        ? `${Number(execution.active_live_plans || 0)}/${Number(execution.max_live_plans || 0)}`
+        : `${Number(execution.active_live_plans || 0)}/不限`,
+    ),
+    infoCell(
+      "已占用名义",
+      `${fmtNumber(execution.active_allocated_notional_usdt || 0, 2)} USDT`,
+    ),
+    infoCell(
+      "剩余预算",
+      `${fmtNumber(execution.remaining_auto_budget_usdt || 0, 2)} USDT`,
+      Number(execution.remaining_auto_budget_usdt || 0) > 0 ? "good" : "warn",
+    ),
   ].join("");
 }
 
@@ -861,6 +883,22 @@ function executionExpectedPnl(item) {
   return Number.isFinite(pnl) ? pnl : null;
 }
 
+function executionAllocatedNotional(item) {
+  const direct = Number(item?.allocated_notional_usdt ?? 0);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const plan = findPlanByKey(item?.plan_key);
+  if (!plan) return null;
+
+  const rounded = Number(plan?.rounded_notional_usdt ?? 0);
+  if (Number.isFinite(rounded) && rounded > 0) return rounded;
+
+  const target = Number(plan?.target_notional_usdt ?? 0);
+  if (Number.isFinite(target) && target > 0) return target;
+
+  return null;
+}
+
 function planExpectedHoldText(item) {
   const targetCloseMs = Number(item?.target_close_time_ms ?? 0);
   const entryOpenMs = Number(item?.entry_window_open_ms ?? 0);
@@ -1054,6 +1092,18 @@ function planCompactMeta(item, linkedOpp) {
     ),
     compactStat("投入", fmtMoney(planCapitalAllocated(item), 2)),
     compactStat(
+      "目标名义",
+      Number(item.target_notional_usdt || 0) > 0
+        ? fmtMoney(item.target_notional_usdt, 2)
+        : "--",
+    ),
+    compactStat(
+      "取整名义",
+      Number(item.rounded_notional_usdt || 0) > 0
+        ? fmtMoney(item.rounded_notional_usdt, 2)
+        : "--",
+    ),
+    compactStat(
       "杠杆",
       `${fmtNumber(planLongLeverage(item), 2)}x / ${fmtNumber(planShortLeverage(item), 2)}x`,
     ),
@@ -1108,6 +1158,7 @@ function renderCompactExecutionCard(item) {
   const openCount = item.open_order_count || 0;
   const closeCount = item.close_order_count || 0;
   const expectedPnl = executionExpectedPnl(item);
+  const allocatedNotional = executionAllocatedNotional(item);
   return `
     <div class="plan-card plan-card-compact">
       <div class="plan-head plan-head-compact">
@@ -1123,6 +1174,10 @@ function renderCompactExecutionCard(item) {
       <div class="compact-stat-grid">
         ${compactStat("开仓时间", fmtTime(item.opened_at_ms))}
         ${compactStat("平仓时间", fmtTime(item.closed_at_ms))}
+        ${compactStat(
+          "占用名义",
+          allocatedNotional == null ? "--" : fmtMoney(allocatedNotional, 2),
+        )}
         ${compactStat("计划持仓", executionPlannedHoldText(item))}
         ${compactStat("最晚平仓", fmtTime(item.target_close_time_ms))}
         ${compactStat("开仓单", String(openCount))}

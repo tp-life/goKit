@@ -148,6 +148,16 @@ func (r *executionHandlerTestExecRepo) ListLatest(_ context.Context, _ int) ([]e
 	return append([]entity.ExecutionRecord(nil), r.items...), nil
 }
 
+func (r *executionHandlerTestExecRepo) ListActiveLive(_ context.Context) ([]entity.ExecutionRecord, error) {
+	out := make([]entity.ExecutionRecord, 0, len(r.items))
+	for _, item := range r.items {
+		if item.LiveTrading {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
 func (*executionHandlerTestPlanRepo) SaveBatch(context.Context, string, string, []entity.ExecutionPlan) error {
 	return nil
 }

@@ -11,4 +11,5 @@ type ExecutionRepository interface {
 	TryClaimAction(ctx context.Context, item *entity.ExecutionRecord, allowedCurrentStatuses []string) (*entity.ExecutionRecord, bool, error)
 	FindByPlanKey(ctx context.Context, planKey string) (*entity.ExecutionRecord, error)
 	ListLatest(ctx context.Context, limit int) ([]entity.ExecutionRecord, error)
+	ListActiveLive(ctx context.Context) ([]entity.ExecutionRecord, error)
 }

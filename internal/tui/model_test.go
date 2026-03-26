@@ -2,6 +2,7 @@ package tui
 
 import (
 	"testing"
+	"time"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
@@ -163,5 +164,45 @@ func TestRefreshLoadedMsg_IgnoresStaleSeq(t *testing.T) {
 	}
 	if len(got.data.Opportunities) != 1 || got.data.Opportunities[0].Symbol != "OLD" {
 		t.Fatalf("expected stale opportunities to be ignored, got %#v", got.data.Opportunities)
+	}
+}
+
+func TestEnsureMarketCmd_RefreshesCurrentSymbolWhenSnapshotIsStale(t *testing.T) {
+	m := NewModel(nil, 8*time.Second)
+	m.selectedOpportunityKey = opportunityKey(OpportunityListItem{
+		Symbol:           "BTC",
+		LongExchange:     "binance",
+		ShortExchange:    "aster",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+	})
+	m.data.Opportunities = []OpportunityListItem{
+		{Symbol: "BTC", LongExchange: "binance", ShortExchange: "aster", LongVenueSymbol: "BTCUSDT", ShortVenueSymbol: "BTCUSDT"},
+	}
+	m.data.Market.Symbol = "BTC"
+	m.marketLastRefresh = time.Now().Add(-9 * time.Second)
+
+	if cmd := m.ensureMarketCmd(); cmd == nil {
+		t.Fatal("expected stale market snapshot to trigger refresh")
+	}
+}
+
+func TestEnsureMarketCmd_SkipsCurrentSymbolWhenSnapshotIsFresh(t *testing.T) {
+	m := NewModel(nil, 8*time.Second)
+	m.selectedOpportunityKey = opportunityKey(OpportunityListItem{
+		Symbol:           "BTC",
+		LongExchange:     "binance",
+		ShortExchange:    "aster",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+	})
+	m.data.Opportunities = []OpportunityListItem{
+		{Symbol: "BTC", LongExchange: "binance", ShortExchange: "aster", LongVenueSymbol: "BTCUSDT", ShortVenueSymbol: "BTCUSDT"},
+	}
+	m.data.Market.Symbol = "BTC"
+	m.marketLastRefresh = time.Now().Add(-2 * time.Second)
+
+	if cmd := m.ensureMarketCmd(); cmd != nil {
+		t.Fatal("expected fresh market snapshot to skip refresh")
 	}
 }
