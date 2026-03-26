@@ -197,10 +197,102 @@ func newExecutionHandlerTestApp(orderRepo *executionHandlerTestOrderRepo, execRe
 
 	app := fiber.New()
 	app.Use(middleware.ErrorHandler(logger))
+	app.Get("/api/v1/executions/auto-close-candidates", NewExecutionHandler(svc).AutoCloseCandidates)
 	app.Post("/api/v1/executions/:planKey/open", NewExecutionHandler(svc).Open)
 	app.Post("/api/v1/executions/:planKey/close", NewExecutionHandler(svc).Close)
+	app.Post("/api/v1/executions/auto-close-sweep", NewExecutionHandler(svc).SweepAutoClose)
 	app.Post("/api/v1/executions/events/order", NewExecutionHandler(svc).InjectOrderEvent)
 	return app
+}
+
+func TestAutoCloseCandidates_ReturnsInspection(t *testing.T) {
+	execRepo := &executionHandlerTestExecRepo{
+		items: []entity.ExecutionRecord{{
+			PlanKey:     "plan-retry-close",
+			Symbol:      "BTC",
+			Status:      "close_failed",
+			LiveTrading: true,
+			AutoClose:   true,
+		}},
+	}
+	planRepo := &executionHandlerTestPlanRepo{
+		items: []entity.ExecutionPlan{{
+			PlanKey:          "plan-retry-close",
+			Symbol:           "BTC",
+			LongExchange:     "binance",
+			ShortExchange:    "aster",
+			LongVenueSymbol:  "BTCUSDT",
+			ShortVenueSymbol: "BTCUSDT",
+			LongQty:          1,
+			ShortQty:         1,
+			LongEntryPrice:   100,
+			ShortEntryPrice:  100,
+		}},
+	}
+	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, execRepo, planRepo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/executions/auto-close-candidates", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Code int                         `json:"code"`
+		Data service.AutoCloseInspection `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("expected response body to be valid json: %v", err)
+	}
+	if body.Code != 0 {
+		t.Fatalf("expected business code 0, got %d", body.Code)
+	}
+	if body.Data.Total != 1 || body.Data.ShouldClose != 1 {
+		t.Fatalf("expected one retry-close candidate, got %+v", body.Data)
+	}
+}
+
+func TestSweepAutoClose_ReturnsReport(t *testing.T) {
+	execRepo := &executionHandlerTestExecRepo{
+		items: []entity.ExecutionRecord{{
+			PlanKey:     "plan-opened-no-auto-close",
+			Symbol:      "BTC",
+			Status:      "opened",
+			LiveTrading: true,
+			AutoClose:   false,
+		}},
+	}
+	app := newExecutionHandlerTestApp(&executionHandlerTestOrderRepo{}, execRepo, &executionHandlerTestPlanRepo{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/executions/auto-close-sweep", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("expected request to complete, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Code int                          `json:"code"`
+		Data service.AutoCloseSweepReport `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("expected response body to be valid json: %v", err)
+	}
+	if body.Code != 0 {
+		t.Fatalf("expected business code 0, got %d", body.Code)
+	}
+	if body.Data.Total != 1 || body.Data.Attempted != 0 || body.Data.Skipped != 1 {
+		t.Fatalf("expected no-op sweep report, got %+v", body.Data)
+	}
 }
 
 func TestInjectOrderEvent_AcceptsSnakeCaseJSON(t *testing.T) {

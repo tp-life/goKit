@@ -151,6 +151,15 @@ type TradeAdapter interface {
 	GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error)
 }
 
+// TradeOrderCanceler 是一个可选能力接口。
+//
+// 它主要用于“下单后发现本轮执行已经不该继续挂着”这类场景，
+// 例如 maker 开仓腿在 entry deadline 后仍未成交，就应该尽快撤单，
+// 避免订单在 funding 之后被动成交。
+type TradeOrderCanceler interface {
+	CancelOrder(ctx context.Context, req OrderLookupRequest) error
+}
+
 // TradeOrderEventStreamer 是一个可选能力接口。
 //
 // 并不是所有交易所适配器在当前阶段都必须实现它：

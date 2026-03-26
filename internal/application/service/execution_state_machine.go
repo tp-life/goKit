@@ -385,6 +385,24 @@ func requiresRecoveryClose(status string) bool {
 	}
 }
 
+// requiresRetryClose 用来标识“close 已经尝试过，但仍然残留 live 风险”的状态。
+//
+// 这类状态和 open 阶段的 recovery close 风险不同，但本质上也不该静置：
+// - `close_failed`
+// - `close_partial_failed`
+// - `close_hedging`
+//
+// 它们说明系统已经判断“应该退出”，只是上一轮 close 没有完全成功。
+// 对这类 live record，后续自动平仓扫描应允许继续重试 close。
+func requiresRetryClose(status string) bool {
+	switch normalizeExecutionStatus(status) {
+	case executionStateCloseFailed, executionStateClosePartial, executionStateCloseHedging:
+		return true
+	default:
+		return false
+	}
+}
+
 // shouldRecordOpenedAt / shouldRecordClosedAt 用来约束 record 上时间戳的写法。
 //
 // 这两个 helper 的作用是把“某个 phase 完成后应该记录哪个时间”写清楚，

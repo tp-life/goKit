@@ -187,8 +187,8 @@ func (c Config) normalize() Config {
 	if c.EntryCutoffTime <= 0 {
 		c.EntryCutoffTime = 45 * time.Second
 	}
-	c.EntryMode = normalizeMode(c.EntryMode, "maker")
-	c.ExitMode = normalizeMode(c.ExitMode, "mixed")
+	c.EntryMode = normalizeMode(c.EntryMode, "taker")
+	c.ExitMode = normalizeMode(c.ExitMode, "taker")
 	if c.Execution.CloseGracePeriod <= 0 {
 		c.Execution.CloseGracePeriod = 2 * time.Minute
 	}

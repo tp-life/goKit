@@ -206,75 +206,82 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 }
 
 func (s *ExecutionService) runAutoClose(ctx context.Context) {
-	records, err := s.execRepo.ListLatest(ctx, s.cfg.Execution.MaxLatestPlans)
+	records, err := s.listAutoCloseCandidates(ctx)
 	if err != nil {
 		s.logger.Error("execution_auto_close_list_records_failed", slog.Any("err", err))
 		return
 	}
 	now := time.Now().UTC()
 	for _, rec := range records {
-		if !shouldAutoCloseRecord(rec) {
-			continue
-		}
-		if !rec.AutoClose {
-			continue
-		}
-		plan, err := s.planRepo.FindByPlanKey(ctx, rec.PlanKey)
-		if err != nil {
-			s.logger.Error("execution_auto_close_load_plan_failed", slog.String("plan_key", rec.PlanKey), slog.Any("err", err))
-			continue
-		}
-		if plan == nil {
-			s.logger.Warn("execution_auto_close_plan_missing", slog.String("plan_key", rec.PlanKey))
-			continue
-		}
-		// 自动平仓现在不再只看“目标时间是否到了”。
-		// 它会统一走 evaluateCloseDecision，把：
-		// 1. schedule close（到时间）
-		// 2. safety close（浮亏 / basis / 保证金缓冲恶化）
-		// 放到同一个入口判定。
-		decision, err := s.evaluateCloseDecision(ctx, now, rec, plan)
-		if err != nil {
+		candidate := s.evaluateAutoCloseCandidate(ctx, now, rec)
+		if candidate.Decision.Error != "" {
 			s.logger.Error(
 				"execution_auto_close_decision_failed",
 				slog.String("plan_key", rec.PlanKey),
-				slog.Any("err", err),
+				slog.String("err", candidate.Decision.Error),
 			)
 			continue
 		}
-		if !decision.shouldClose {
+		if !candidate.Decision.ShouldClose || candidate.Plan == nil {
 			continue
 		}
 		// 这里使用 record 自身的 LiveTrading，而不是当前全局 execution.enabled。
 		// 原因是：如果一条仓位已经真实打开，即便后面把“允许新开仓”关掉，
 		// 自动平仓也仍然必须对这条 live 仓位执行真实 close，不能退化成 dry-run。
-		if _, err := s.closePlan(ctx, plan, decision.trigger, rec.LiveTrading); err != nil {
+		if _, err := s.closePlan(ctx, candidate.Plan, candidate.Decision.Trigger, rec.LiveTrading); err != nil {
 			s.logger.Error("execution_auto_close_failed", slog.String("plan_key", rec.PlanKey), slog.Any("err", err))
 			continue
 		}
 		s.logger.Info(
 			"execution_auto_close_triggered",
 			slog.String("plan_key", rec.PlanKey),
-			slog.String("trigger", decision.trigger),
-			slog.String("reason", decision.reason),
+			slog.String("trigger", candidate.Decision.Trigger),
+			slog.String("reason", candidate.Decision.Reason),
 		)
 	}
 }
 
+func (s *ExecutionService) listAutoCloseCandidates(ctx context.Context) ([]entity.ExecutionRecord, error) {
+	latest, err := s.execRepo.ListLatest(ctx, s.cfg.Execution.MaxLatestPlans)
+	if err != nil {
+		return nil, err
+	}
+	activeLive, err := s.execRepo.ListActiveLive(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	merged := make([]entity.ExecutionRecord, 0, len(latest)+len(activeLive))
+	seen := make(map[string]struct{}, len(latest)+len(activeLive))
+	for _, item := range latest {
+		merged = append(merged, item)
+		seen[item.PlanKey] = struct{}{}
+	}
+	for _, item := range activeLive {
+		if _, ok := seen[item.PlanKey]; ok {
+			continue
+		}
+		merged = append(merged, item)
+		seen[item.PlanKey] = struct{}{}
+	}
+	return merged, nil
+}
+
 // shouldAutoCloseRecord 明确约束“哪些 execution record 可以进入自动平仓扫描”。
 //
-// 当前允许两类记录进入 auto-close：
+// 当前允许三类记录进入 auto-close：
 // 1. 正常已打开完成的 `opened` / `dry_run_opened`；
 // 2. open 阶段的异常尾部 `open_partial_failed` / `open_hedging`。
+// 3. close 阶段仍然带 live 风险的 `close_failed` / `close_partial_failed` / `close_hedging`。
 //
-// 第 2 类不再像之前那样一律跳过，而是交给 evaluateCloseDecision()
-// 作为“需要尽快执行 recovery close”的候选。
+// 第 2 类会交给 evaluateCloseDecision() 作为 recovery close；
+// 第 3 类会交给 evaluateCloseDecision() 作为 retry close。
 //
 // 这么做的前提，是 trade adapter 的 ClosePosition 已改成“最多按 req.Quantity reduce-only 平仓”，
 // 不再粗暴整仓 flatten。这样异常恢复可以更保守地推进，而不是无限期躺在数据库里。
 func shouldAutoCloseRecord(rec entity.ExecutionRecord) bool {
 	switch strings.ToLower(strings.TrimSpace(rec.Status)) {
-	case executionStateOpened, "dry_run_opened", executionStateOpenPartial, executionStateOpenHedging:
+	case executionStateOpened, "dry_run_opened", executionStateOpenPartial, executionStateOpenHedging, executionStateClosePartial, executionStateCloseFailed, executionStateCloseHedging:
 		return true
 	default:
 		return false
@@ -714,6 +721,9 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 					orderRecord.Status = "TIMEOUT"
 					orderRecord.ErrorMessage = err.Error()
 					orderRecord = s.reconcileTimedOutPrimaryLeg(ctx, adapter, orderRecord, req)
+					if phase == "open" && !isOrderFullySatisfied(orderRecord) {
+						orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, req)
+					}
 					if isOrderFullySatisfied(orderRecord) {
 						s.registerAPISuccess(leg.exchange)
 						var exposure *exposedLeg
@@ -750,6 +760,9 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 			orderRecord.AvgPrice = resp.AveragePrice
 			orderRecord.RawResponse = resp.RawResponse
 			orderRecord = s.reconcileOrder(ctx, adapter, orderRecord, req)
+			if phase == "open" && !isOrderFullySatisfied(orderRecord) {
+				orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, req)
+			}
 
 			var exposure *exposedLeg
 			if phase == "open" && orderHasOpenExposure(orderRecord) {
@@ -808,13 +821,23 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 		)
 		for _, okLeg := range exposures {
 			adapter := s.trades[strings.ToLower(okLeg.exchange)]
-			hedgeReq := okLeg.req
-			hedgeReq.ClientOrderID = buildClientOrderID(plan, "hedge", okLeg.role)
-			hedgeReq.Reason = "open_leg_failed_hedge"
-			hedgeReq.Side = reverseSide(hedgeReq.Side)
-			hedgeReq.OrderType = "MARKET"
-			hedgeReq.ReduceOnly = true
-			hedgeReq.TimeInForce = "IOC"
+			meta, _ := s.store.Symbol(okLeg.exchange, plan.Symbol)
+			if strings.TrimSpace(meta.Exchange) == "" {
+				meta.Exchange = okLeg.exchange
+			}
+			if strings.TrimSpace(meta.VenueSymbol) == "" {
+				meta.VenueSymbol = pickNonEmpty(okLeg.req.VenueSymbol, venueSymbolForLeg(plan, okLeg.role))
+			}
+			book, _ := s.store.LatestBookTop(okLeg.exchange, plan.Symbol)
+			hedgeReq := s.buildRecoveryCloseRequest(
+				plan,
+				okLeg.role,
+				reverseSide(okLeg.req.Side),
+				meta,
+				book,
+				okLeg.req.Quantity,
+				firstPositiveFloat(okLeg.req.Price, referencePriceForLeg(plan, okLeg.role)),
+			)
 			hedgeResp := exchange.TradeOrderResult{}
 			hedgeErr := error(nil)
 			rec := entity.OrderRecord{
@@ -917,6 +940,46 @@ func (s *ExecutionService) reconcileOrder(ctx context.Context, adapter exchange.
 		rec.Status = "PARTIALLY_FILLED"
 	}
 	return rec
+}
+
+func (s *ExecutionService) bestEffortCancelOpenOrder(ctx context.Context, adapter exchange.TradeAdapter, rec entity.OrderRecord, req exchange.TradeOrderRequest) entity.OrderRecord {
+	if req.ReduceOnly || isOrderFullySatisfied(rec) || isFailedOrderStatus(rec.Status) {
+		return rec
+	}
+	canceler, ok := adapter.(exchange.TradeOrderCanceler)
+	if !ok || canceler == nil {
+		return rec
+	}
+	lookup := exchange.OrderLookupRequest{
+		CanonicalSymbol: req.CanonicalSymbol,
+		VenueSymbol:     req.VenueSymbol,
+		AssetID:         req.AssetID,
+		ClientOrderID:   rec.ClientOrderID,
+		VenueOrderID:    rec.VenueOrderID,
+	}
+	if strings.TrimSpace(lookup.ClientOrderID) == "" && strings.TrimSpace(lookup.VenueOrderID) == "" {
+		return rec
+	}
+	if err := canceler.CancelOrder(ctx, lookup); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("execution_open_order_cancel_failed",
+				slog.String("exchange", rec.Exchange),
+				slog.String("client_order_id", rec.ClientOrderID),
+				slog.String("venue_order_id", rec.VenueOrderID),
+				slog.Any("err", err),
+			)
+		}
+		return rec
+	}
+	if s.logger != nil {
+		s.logger.Info("execution_open_order_cancel_requested",
+			slog.String("exchange", rec.Exchange),
+			slog.String("client_order_id", rec.ClientOrderID),
+			slog.String("venue_order_id", rec.VenueOrderID),
+			slog.String("status_before_cancel", rec.Status),
+		)
+	}
+	return s.reconcileOrder(ctx, adapter, rec, req)
 }
 
 func (s *ExecutionService) primaryLegContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -1104,6 +1167,9 @@ func (s *ExecutionService) buildTradeRequest(plan *entity.ExecutionPlan, phase, 
 	}
 
 	qty = roundDownStep(qty, meta.StepSize)
+	if orderType == "LIMIT" {
+		price = roundPriceToTick(price, meta.TickSize, side)
+	}
 	return exchange.TradeOrderRequest{
 		CanonicalSymbol: plan.Symbol,
 		VenueSymbol:     meta.VenueSymbol,
@@ -1116,6 +1182,30 @@ func (s *ExecutionService) buildTradeRequest(plan *entity.ExecutionPlan, phase, 
 		ReduceOnly:      phase == "close",
 		ClientOrderID:   buildClientOrderID(plan, phase, legRole),
 		Reason:          phase,
+	}
+}
+
+func (s *ExecutionService) buildRecoveryCloseRequest(plan *entity.ExecutionPlan, legRole, side string, meta entity.Symbol, book entity.BookTopSnapshot, qty, refPrice float64) exchange.TradeOrderRequest {
+	if strings.TrimSpace(meta.Exchange) == "" {
+		meta.Exchange = exchangeForLeg(plan, legRole)
+	}
+	if strings.TrimSpace(meta.VenueSymbol) == "" {
+		meta.VenueSymbol = venueSymbolForLeg(plan, legRole)
+	}
+	qty = roundDownStep(qty, meta.StepSize)
+	price := roundPriceToTick(aggressivePrice(side, book, refPrice), meta.TickSize, side)
+	return exchange.TradeOrderRequest{
+		CanonicalSymbol: plan.Symbol,
+		VenueSymbol:     meta.VenueSymbol,
+		AssetID:         meta.VenueAssetID,
+		Side:            side,
+		OrderType:       "LIMIT",
+		TimeInForce:     "IOC",
+		Quantity:        round8(qty),
+		Price:           round8(price),
+		ReduceOnly:      true,
+		ClientOrderID:   buildClientOrderID(plan, "hedge", legRole),
+		Reason:          "open_leg_failed_hedge",
 	}
 }
 
@@ -1150,6 +1240,27 @@ func aggressivePrice(side string, book entity.BookTopSnapshot, fallback float64)
 		ref = 1
 	}
 	return ref * 0.998
+}
+
+func exchangeForLeg(plan *entity.ExecutionPlan, legRole string) string {
+	if strings.EqualFold(legRole, "short_leg") {
+		return plan.ShortExchange
+	}
+	return plan.LongExchange
+}
+
+func venueSymbolForLeg(plan *entity.ExecutionPlan, legRole string) string {
+	if strings.EqualFold(legRole, "short_leg") {
+		return plan.ShortVenueSymbol
+	}
+	return plan.LongVenueSymbol
+}
+
+func referencePriceForLeg(plan *entity.ExecutionPlan, legRole string) float64 {
+	if strings.EqualFold(legRole, "short_leg") {
+		return plan.ShortEntryPrice
+	}
+	return plan.LongEntryPrice
 }
 
 func buildClientOrderID(plan *entity.ExecutionPlan, phase, legRole string) string {

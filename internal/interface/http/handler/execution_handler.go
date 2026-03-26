@@ -28,6 +28,14 @@ func (h *ExecutionHandler) List(c *fiber.Ctx) error {
 	return response.Success(c, items)
 }
 
+func (h *ExecutionHandler) AutoCloseCandidates(c *fiber.Ctx) error {
+	items, err := h.svc.InspectLiveAutoClose(c.UserContext())
+	if err != nil {
+		return response.ErrInternal(err, "查询自动平仓候选失败")
+	}
+	return response.Success(c, items)
+}
+
 func (h *ExecutionHandler) Orders(c *fiber.Ctx) error {
 	planKey := strings.TrimSpace(c.Params("planKey"))
 	if planKey == "" {
@@ -99,4 +107,12 @@ func (h *ExecutionHandler) InjectOrderEvent(c *fiber.Ctx) error {
 		return response.ErrInternal(err, "注入订单事件失败")
 	}
 	return response.Success(c, item)
+}
+
+func (h *ExecutionHandler) SweepAutoClose(c *fiber.Ctx) error {
+	report, err := h.svc.SweepLiveAutoClose(c.UserContext())
+	if err != nil {
+		return response.ErrInternal(err, "执行自动平仓 sweep 失败")
+	}
+	return response.Success(c, report)
 }

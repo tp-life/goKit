@@ -102,10 +102,14 @@ func (r *testExecRepo) FindByPlanKey(_ context.Context, planKey string) (*entity
 	return nil, nil
 }
 
-func (r *testExecRepo) ListLatest(_ context.Context, _ int) ([]entity.ExecutionRecord, error) {
+func (r *testExecRepo) ListLatest(_ context.Context, limit int) ([]entity.ExecutionRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]entity.ExecutionRecord(nil), r.items...), nil
+	out := append([]entity.ExecutionRecord(nil), r.items...)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (r *testExecRepo) ListActiveLive(_ context.Context) ([]entity.ExecutionRecord, error) {
@@ -206,12 +210,15 @@ type testTradeAdapter struct {
 	enabled      bool
 	caps         exchange.TradeCapabilities
 	placeErr     error
+	cancelErr    error
 	accountErr   error
 	positionErr  error
 	placed       []exchange.TradeOrderRequest
 	closed       []exchange.TradeOrderRequest
+	canceled     []exchange.OrderLookupRequest
 	closeResp    exchange.TradeOrderResult
 	orderStatus  exchange.OrderStatus
+	cancelStatus exchange.OrderStatus
 	account      exchange.AccountSnapshot
 	position     exchange.Position
 	streamEvents []exchange.OrderEvent
@@ -283,6 +290,27 @@ func (a *testTradeAdapter) GetOrderStatus(_ context.Context, _ exchange.OrderLoo
 		a.orderStatus.Terminal = true
 	}
 	return a.orderStatus, nil
+}
+func (a *testTradeAdapter) CancelOrder(_ context.Context, req exchange.OrderLookupRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.canceled = append(a.canceled, req)
+	if a.cancelErr != nil {
+		return a.cancelErr
+	}
+	if a.cancelStatus.Status != "" {
+		a.orderStatus = a.cancelStatus
+	} else {
+		a.orderStatus = exchange.OrderStatus{
+			Exchange:      a.name,
+			Status:        "CANCELED",
+			VenueOrderID:  req.VenueOrderID,
+			ClientOrderID: req.ClientOrderID,
+			Terminal:      true,
+			Canceled:      true,
+		}
+	}
+	return nil
 }
 func (a *testTradeAdapter) GetAccountSnapshot(_ context.Context) (exchange.AccountSnapshot, error) {
 	if a.accountErr != nil {
@@ -369,8 +397,8 @@ func (a *testTradeAdapter) StartOrderEventStream(ctx context.Context, sink excha
 
 func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	store := NewMarketStore()
-	store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
-	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
+	store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001"})
+	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001"})
 	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
 	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
 
@@ -402,8 +430,14 @@ func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	if !hedgeReq.ReduceOnly {
 		t.Fatalf("expected hedge request reduce-only")
 	}
-	if hedgeReq.OrderType != "MARKET" {
-		t.Fatalf("expected hedge order type MARKET, got %s", hedgeReq.OrderType)
+	if hedgeReq.OrderType != "LIMIT" {
+		t.Fatalf("expected hedge order type LIMIT, got %s", hedgeReq.OrderType)
+	}
+	if hedgeReq.TimeInForce != "IOC" {
+		t.Fatalf("expected hedge tif IOC, got %s", hedgeReq.TimeInForce)
+	}
+	if hedgeReq.Price <= 0 {
+		t.Fatalf("expected hedge limit price to be populated, got %f", hedgeReq.Price)
 	}
 	if hedgeReq.ClientOrderID == longAdapter.placed[0].ClientOrderID {
 		t.Fatalf("expected hedge client order id to differ from open order id")
@@ -608,6 +642,54 @@ func TestPlacePlanOrders_PartialFillTriggersHedgeForAllExposedLegs(t *testing.T)
 	}
 }
 
+func TestPlacePlanOrders_UnfilledOpenLegIsCanceled(t *testing.T) {
+	store := NewMarketStore()
+	store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001"})
+	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001"})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
+
+	longAdapter := &testTradeAdapter{
+		name:        "longex",
+		enabled:     true,
+		account:     exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus: exchange.OrderStatus{Status: "NEW", ExecutedQty: 0, Terminal: false},
+	}
+	shortAdapter := &testTradeAdapter{
+		name:        "shortex",
+		enabled:     true,
+		account:     exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus: exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, Terminal: true},
+	}
+
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.store = store
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-unfilled-open-cancel",
+		Symbol:           "BTCUSDT",
+		LongExchange:     "longex",
+		ShortExchange:    "shortex",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          1,
+		ShortQty:         1,
+		LongEntryPrice:   101,
+		ShortEntryPrice:  102,
+		EntryMode:        "maker",
+	}
+
+	results, errMsg := svc.placePlanOrders(context.Background(), plan, "open", "manual")
+	if errMsg == "" {
+		t.Fatal("expected unresolved open leg to surface as aggregated error")
+	}
+	if len(longAdapter.canceled) != 1 {
+		t.Fatalf("expected unresolved long leg to be canceled, got %d cancels", len(longAdapter.canceled))
+	}
+	if got := results[0].Status; got != "CANCELED" {
+		t.Fatalf("expected unresolved long leg to reconcile as CANCELED after cancel, got %s", got)
+	}
+}
+
 func TestEnforceRiskControls_BlocksLowBalance(t *testing.T) {
 	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 10}}
 	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 10}}
@@ -655,7 +737,7 @@ func TestReverseSide(t *testing.T) {
 	}
 }
 
-func TestShouldAutoCloseRecord_AllowsOpenedAndRecoveryStates(t *testing.T) {
+func TestShouldAutoCloseRecord_AllowsOpenedRecoveryAndRetryCloseStates(t *testing.T) {
 	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpened}) {
 		t.Fatal("expected opened record to be auto-close eligible")
 	}
@@ -667,6 +749,170 @@ func TestShouldAutoCloseRecord_AllowsOpenedAndRecoveryStates(t *testing.T) {
 	}
 	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateOpenHedging}) {
 		t.Fatal("expected open_hedging to be routed into recovery auto-close")
+	}
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateClosePartial}) {
+		t.Fatal("expected close_partial_failed to be routed into retry auto-close")
+	}
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateCloseFailed}) {
+		t.Fatal("expected close_failed to be routed into retry auto-close")
+	}
+	if !shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStateCloseHedging}) {
+		t.Fatal("expected close_hedging to be routed into retry auto-close")
+	}
+	if shouldAutoCloseRecord(entity.ExecutionRecord{Status: executionStatePendingClose}) {
+		t.Fatal("expected pending_close to stay out of duplicate auto-close scans")
+	}
+}
+
+func TestInspectLiveAutoClose_ReportsDecisionAndRetryCloseCandidates(t *testing.T) {
+	now := time.Now().UTC()
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:           "plan-retry-close",
+				Symbol:            "BTC",
+				Status:            executionStateCloseFailed,
+				LiveTrading:       true,
+				AutoClose:         true,
+				TargetCloseTimeMs: now.Add(2 * time.Minute).UnixMilli(),
+			},
+			{
+				PlanKey:           "plan-disabled-auto-close",
+				Symbol:            "ETH",
+				Status:            executionStateOpened,
+				LiveTrading:       true,
+				AutoClose:         false,
+				TargetCloseTimeMs: now.Add(3 * time.Minute).UnixMilli(),
+			},
+			{
+				PlanKey:           "plan-pending-close",
+				Symbol:            "SOL",
+				Status:            executionStatePendingClose,
+				LiveTrading:       true,
+				AutoClose:         true,
+				TargetCloseTimeMs: now.Add(4 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-retry-close",
+				Symbol:           "BTC",
+				LongExchange:     "longex",
+				ShortExchange:    "shortex",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          1,
+				ShortQty:         1,
+				LongEntryPrice:   100,
+				ShortEntryPrice:  100,
+			},
+		},
+	}
+	svc := newTestExecutionService(&testOrderRepo{}, nil)
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+
+	inspection, err := svc.InspectLiveAutoClose(context.Background())
+	if err != nil {
+		t.Fatalf("expected inspect to succeed, got %v", err)
+	}
+	if inspection.Total != 3 {
+		t.Fatalf("expected 3 live auto-close candidates, got %d", inspection.Total)
+	}
+	if inspection.Eligible != 2 {
+		t.Fatalf("expected 2 eligible candidates, got %d", inspection.Eligible)
+	}
+	if inspection.ShouldClose != 1 {
+		t.Fatalf("expected 1 candidate to require close now, got %d", inspection.ShouldClose)
+	}
+	if inspection.AutoCloseDisabled != 1 {
+		t.Fatalf("expected 1 auto-close-disabled candidate, got %d", inspection.AutoCloseDisabled)
+	}
+
+	var retryCandidate *AutoCloseCandidate
+	var disabledCandidate *AutoCloseCandidate
+	var pendingCandidate *AutoCloseCandidate
+	for i := range inspection.Candidates {
+		item := inspection.Candidates[i]
+		switch item.Execution.PlanKey {
+		case "plan-retry-close":
+			retryCandidate = &item
+		case "plan-disabled-auto-close":
+			disabledCandidate = &item
+		case "plan-pending-close":
+			pendingCandidate = &item
+		}
+	}
+	if retryCandidate == nil {
+		t.Fatal("expected retry-close candidate to be present")
+	}
+	if !retryCandidate.Decision.ShouldClose || retryCandidate.Decision.Trigger != "auto_retry_close" {
+		t.Fatalf("expected retry-close candidate to trigger auto_retry_close, got %+v", retryCandidate.Decision)
+	}
+	if disabledCandidate == nil || disabledCandidate.Decision.AutoCloseEnabled {
+		t.Fatalf("expected disabled candidate to report auto_close=false, got %+v", disabledCandidate)
+	}
+	if pendingCandidate == nil || pendingCandidate.Decision.Eligible {
+		t.Fatalf("expected pending_close candidate to be excluded from scan, got %+v", pendingCandidate)
+	}
+}
+
+func TestSweepLiveAutoClose_ClosesRetryCloseCandidates(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:           "plan-retry-close",
+				Symbol:            "BTC",
+				Status:            executionStateCloseFailed,
+				LiveTrading:       true,
+				AutoClose:         true,
+				TargetCloseTimeMs: now.Add(2 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-retry-close",
+				Symbol:           "BTC",
+				LongExchange:     "longex",
+				ShortExchange:    "shortex",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          1,
+				ShortQty:         1,
+				LongEntryPrice:   100,
+				ShortEntryPrice:  100,
+				ExitMode:         "taker",
+			},
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100, AskPrice: 100.1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.2, AskPrice: 100.3, EventTimeMs: now.UnixMilli()})
+
+	report, err := svc.SweepLiveAutoClose(context.Background())
+	if err != nil {
+		t.Fatalf("expected auto-close sweep to succeed, got %v", err)
+	}
+	if report.Attempted != 1 || report.Closed != 1 || report.Failed != 0 {
+		t.Fatalf("expected one successful close attempt, got attempted=%d closed=%d failed=%d", report.Attempted, report.Closed, report.Failed)
+	}
+	if len(longAdapter.closed) != 1 || len(shortAdapter.closed) != 1 {
+		t.Fatalf("expected retry-close sweep to close both legs, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+	if longAdapter.closed[0].Reason != "auto_retry_close" || shortAdapter.closed[0].Reason != "auto_retry_close" {
+		t.Fatalf("expected auto_retry_close reason to propagate, got long=%s short=%s", longAdapter.closed[0].Reason, shortAdapter.closed[0].Reason)
 	}
 }
 
@@ -772,6 +1018,69 @@ func TestRunAutoClose_RecoversOpenPartialFailedRecords(t *testing.T) {
 	}
 }
 
+func TestRunAutoClose_IncludesActiveLiveRecordsOutsideLatestWindow(t *testing.T) {
+	now := time.Now().UTC()
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:           "plan-live-old",
+				Symbol:            "BTC",
+				LongExchange:      "longex",
+				ShortExchange:     "shortex",
+				LongVenueSymbol:   "BTCUSDT",
+				ShortVenueSymbol:  "BTCUSDT",
+				LongQty:           1,
+				ShortQty:          1,
+				LongEntryPrice:    100,
+				ShortEntryPrice:   100,
+				ExitMode:          "taker",
+				TargetCloseTimeMs: now.Add(-time.Minute).UnixMilli(),
+			},
+		},
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:     "plan-newer-blocked",
+				Status:      executionStateRiskBlocked,
+				LiveTrading: false,
+				AutoClose:   true,
+			},
+			{
+				PlanKey:           "plan-live-old",
+				Status:            executionStateOpened,
+				LiveTrading:       true,
+				AutoClose:         true,
+				TargetCloseTimeMs: now.Add(-time.Minute).UnixMilli(),
+			},
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.planRepo = planRepo
+	svc.execRepo = execRepo
+	svc.cfg.Execution.MaxLatestPlans = 1
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10"})
+
+	svc.runAutoClose(context.Background())
+
+	if len(longAdapter.closed) != 1 || len(shortAdapter.closed) != 1 {
+		t.Fatalf("expected older live record outside latest window to still auto-close, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+	if longAdapter.closed[0].Reason != "auto_schedule" || shortAdapter.closed[0].Reason != "auto_schedule" {
+		t.Fatalf("expected schedule-triggered close reason, got long=%s short=%s", longAdapter.closed[0].Reason, shortAdapter.closed[0].Reason)
+	}
+	rec, err := svc.execRepo.FindByPlanKey(context.Background(), "plan-live-old")
+	if err != nil {
+		t.Fatalf("expected execution record lookup to succeed, got %v", err)
+	}
+	if rec == nil || rec.Status != executionStateClosed {
+		t.Fatalf("expected older live record to transition to closed, got %+v", rec)
+	}
+}
+
 func TestBuildTradeRequest_UsesAdapterCapabilities(t *testing.T) {
 	adapter := &testTradeAdapter{
 		name:    "hyperlike",
@@ -787,15 +1096,29 @@ func TestBuildTradeRequest_UsesAdapterCapabilities(t *testing.T) {
 	book := entity.BookTopSnapshot{Exchange: "hyperlike", Symbol: "BTC", BidPrice: 100, AskPrice: 101}
 	plan := &entity.ExecutionPlan{PlanKey: "plan", Symbol: "BTC", EntryMode: "taker"}
 
-	req := svc.buildTradeRequest(plan, "open", "long_leg", "BUY", entity.Symbol{Exchange: "hyperlike", VenueSymbol: "BTC", StepSize: "0.001"}, book, 1, 100)
+	req := svc.buildTradeRequest(plan, "open", "long_leg", "BUY", entity.Symbol{Exchange: "hyperlike", VenueSymbol: "BTC", TickSize: "0.01", StepSize: "0.001"}, book, 1, 100)
 	if req.OrderType != "LIMIT" {
 		t.Fatalf("expected taker order type LIMIT, got %s", req.OrderType)
 	}
 	if req.TimeInForce != "IOC" {
 		t.Fatalf("expected taker tif IOC, got %s", req.TimeInForce)
 	}
-	if req.Price <= 101 {
-		t.Fatalf("expected aggressive IOC price above ask, got %f", req.Price)
+	if req.Price != 101.21 {
+		t.Fatalf("expected aggressive IOC price rounded up to tick, got %f", req.Price)
+	}
+}
+
+func TestBuildTradeRequest_RoundsSellLimitPriceDownToTick(t *testing.T) {
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
+	book := entity.BookTopSnapshot{Exchange: "venue", Symbol: "BTC", BidPrice: 100.03, AskPrice: 100.07}
+	plan := &entity.ExecutionPlan{PlanKey: "plan", Symbol: "BTC", ExitMode: "mixed"}
+
+	req := svc.buildTradeRequest(plan, "close", "long_leg", "SELL", entity.Symbol{Exchange: "venue", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001"}, book, 1, 100)
+	if req.OrderType != "LIMIT" || req.TimeInForce != "IOC" {
+		t.Fatalf("expected mixed close to use LIMIT IOC, got type=%s tif=%s", req.OrderType, req.TimeInForce)
+	}
+	if req.Price != 99.82 {
+		t.Fatalf("expected sell price rounded down to tick, got %f", req.Price)
 	}
 }
 

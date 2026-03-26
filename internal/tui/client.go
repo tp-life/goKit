@@ -81,6 +81,7 @@ type SystemStatus struct {
 
 type DashboardData struct {
 	System            SystemStatus
+	AutoClose         service.AutoCloseInspection
 	Opportunities     []repository.OpportunitySummary
 	BatchPlans        []entity.ExecutionPlan
 	AllPlans          []entity.ExecutionPlan
@@ -174,6 +175,10 @@ func (c *Client) getOpportunitySummaries(ctx context.Context, limit int) ([]repo
 func (c *Client) getExecutions(ctx context.Context, limit int) ([]entity.ExecutionRecord, error) {
 	path := fmt.Sprintf("/api/v1/executions?limit=%d", limit)
 	return doJSON[[]entity.ExecutionRecord](ctx, c.httpClient, c.baseURL, c.token, http.MethodGet, path, nil)
+}
+
+func (c *Client) getAutoCloseCandidates(ctx context.Context) (service.AutoCloseInspection, error) {
+	return doJSON[service.AutoCloseInspection](ctx, c.httpClient, c.baseURL, c.token, http.MethodGet, "/api/v1/executions/auto-close-candidates", nil)
 }
 
 func (c *Client) getSnapshotStats(ctx context.Context) (repository.SnapshotStats, error) {

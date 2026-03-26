@@ -47,6 +47,7 @@ func (r *Router) Register(app *fiber.App) {
 	v1.Get("/opportunities", r.params.OpportunityHandler.List)
 	v1.Get("/plans", r.params.ExecutionPlanHandler.List)
 	v1.Get("/executions", r.params.ExecutionHandler.List)
+	v1.Get("/executions/auto-close-candidates", r.params.ExecutionHandler.AutoCloseCandidates)
 	v1.Get("/executions/:planKey/orders", r.params.ExecutionHandler.Orders)
 	v1.Get("/market/:symbol", r.params.MarketHandler.Snapshot)
 	v1.Get("/system/status", r.params.SystemHandler.Status)
@@ -55,5 +56,6 @@ func (r *Router) Register(app *fiber.App) {
 	protected := v1.Group("", middleware.RequireExecutionAuth(r.params.WebConfig))
 	protected.Post("/executions/:planKey/open", r.params.ExecutionHandler.Open)
 	protected.Post("/executions/:planKey/close", r.params.ExecutionHandler.Close)
+	protected.Post("/executions/auto-close-sweep", r.params.ExecutionHandler.SweepAutoClose)
 	protected.Post("/executions/events/order", r.params.ExecutionHandler.InjectOrderEvent)
 }

@@ -216,6 +216,27 @@ func roundDownStep(value float64, stepRaw string) float64 {
 	return math.Floor(value/step) * step
 }
 
+// roundPriceToTick 按 tick size 对限价做方向敏感的取整。
+//
+// 这里不能简单用 round/floor：
+// - BUY 单如果向下取整，可能把本来“足够激进”的价格压低，导致 IOC/LIMIT 不成交；
+// - SELL 单如果向上取整，也会把价格抬高，降低成交概率。
+//
+// 因此这里使用：
+// - BUY -> 向上取整到最近 tick；
+// - SELL -> 向下取整到最近 tick。
+func roundPriceToTick(value float64, tickRaw, side string) float64 {
+	tick := parseFloat(tickRaw)
+	if value <= 0 || tick <= 0 {
+		return value
+	}
+	scaled := value / tick
+	if strings.EqualFold(side, "BUY") {
+		return math.Ceil(scaled-1e-12) * tick
+	}
+	return math.Floor(scaled+1e-12) * tick
+}
+
 func buildPlanKey(plan entity.ExecutionPlan) string {
 	raw := strings.Join([]string{
 		strings.ToUpper(plan.Symbol),

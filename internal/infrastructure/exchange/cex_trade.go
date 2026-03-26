@@ -332,8 +332,32 @@ func (c *CEXTradeClient) signedGET(ctx context.Context, path string, params url.
 	return c.signedDo(ctx, http.MethodGet, path, params, out)
 }
 
+func (c *CEXTradeClient) signedDELETE(ctx context.Context, path string, params url.Values, out any) (string, error) {
+	return c.signedDo(ctx, http.MethodDelete, path, params, out)
+}
+
 func (c *CEXTradeClient) signedPOST(ctx context.Context, path string, params url.Values, out any) (string, error) {
 	return c.signedDo(ctx, http.MethodPost, path, params, out)
+}
+
+func (c *CEXTradeClient) CancelOrder(ctx context.Context, req OrderLookupRequest) error {
+	if !c.Enabled() {
+		return fmt.Errorf("%s trade client disabled or missing credentials", c.name)
+	}
+	params := url.Values{}
+	params.Set("symbol", req.VenueSymbol)
+	if c.authMode != asterTradeAuthV3Signer {
+		params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	}
+	if strings.TrimSpace(req.VenueOrderID) != "" {
+		params.Set("orderId", req.VenueOrderID)
+	} else if strings.TrimSpace(req.ClientOrderID) != "" {
+		params.Set("origClientOrderId", req.ClientOrderID)
+	} else {
+		return fmt.Errorf("missing order cancel id")
+	}
+	_, err := c.signedDELETE(ctx, c.orderPath, params, nil)
+	return err
 }
 
 func (c *CEXTradeClient) signedDo(ctx context.Context, method, path string, params url.Values, out any) (string, error) {

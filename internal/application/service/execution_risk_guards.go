@@ -106,6 +106,13 @@ func (s *ExecutionService) evaluateCloseDecision(ctx context.Context, now time.T
 			reason:      fmt.Sprintf("execution status %s requires recovery close", normalizeExecutionStatus(rec.Status)),
 		}, nil
 	}
+	if rec.LiveTrading && requiresRetryClose(rec.Status) {
+		return executionCloseDecision{
+			shouldClose: true,
+			trigger:     "auto_retry_close",
+			reason:      fmt.Sprintf("execution status %s requires close retry", normalizeExecutionStatus(rec.Status)),
+		}, nil
+	}
 	if rec.TargetCloseTimeMs > 0 && now.UnixMilli() >= rec.TargetCloseTimeMs {
 		return executionCloseDecision{
 			shouldClose: true,

@@ -10,6 +10,7 @@ const state = {
   batchPlans: [],
   allPlans: [],
   executions: [],
+  autoClose: null,
   system: null,
   stats: null,
   refreshMs: 8000,
@@ -53,6 +54,10 @@ const els = {
   planViewMode: document.getElementById("plan-view-mode"),
   executionsList: document.getElementById("executions-list"),
   executionsEmpty: document.getElementById("executions-empty"),
+  autoCloseSummary: document.getElementById("auto-close-summary"),
+  autoCloseList: document.getElementById("auto-close-list"),
+  autoCloseEmpty: document.getElementById("auto-close-empty"),
+  autoCloseSweepBtn: document.getElementById("auto-close-sweep-btn"),
   manualRefreshBtn: document.getElementById("manual-refresh-btn"),
 };
 
@@ -1244,6 +1249,96 @@ function renderExecutions() {
     .join("");
 }
 
+function autoCloseDecisionText(item) {
+  const decision = item?.decision || {};
+  if (decision.error) return "判断失败";
+  if (decision.should_close) return decision.trigger || "应平仓";
+  if (!decision.eligible) return "不在扫描范围";
+  if (!decision.auto_close_enabled) return "已禁用自动平仓";
+  return "继续持有";
+}
+
+function autoCloseDecisionClass(item) {
+  const decision = item?.decision || {};
+  if (decision.error) return "negative";
+  if (decision.should_close) return "positive";
+  if (!decision.eligible || !decision.auto_close_enabled) return "negative";
+  return "muted-text";
+}
+
+function autoCloseReasonText(item) {
+  const decision = item?.decision || {};
+  return decision.error || decision.reason || "--";
+}
+
+function renderAutoCloseSummary() {
+  if (!els.autoCloseSummary) return;
+  const info = state.autoClose || {};
+  els.autoCloseSummary.innerHTML = `
+    <div class="compact-stat-grid execution-board-summary-grid">
+      ${compactStat("Live 候选", String(info.total || 0))}
+      ${compactStat("可扫描", String(info.eligible || 0))}
+      ${compactStat("现在应平仓", String(info.should_close || 0), Number(info.should_close || 0) > 0 ? "positive" : "muted-text")}
+      ${compactStat("判断错误", String(info.decision_errors || 0), Number(info.decision_errors || 0) > 0 ? "negative" : "muted-text")}
+      ${compactStat("已禁用 Auto-Close", String(info.auto_close_disabled || 0), Number(info.auto_close_disabled || 0) > 0 ? "warn" : "muted-text")}
+      ${compactStat("最近评估", fmtTime(info.evaluated_at_ms))}
+    </div>
+    <div class="status-desc execution-board-summary-note">
+      候选列表只展示当前仍然带 <code>live_trading=true</code> 的 execution record。卡片上的“继续持有 / 应平仓 / 判断失败”直接对应服务端本轮 auto-close 决策。
+    </div>
+  `;
+}
+
+function renderAutoCloseCandidateCard(item) {
+  const execution = item?.execution || {};
+  const plan = item?.plan || null;
+  const allocatedNotional = executionAllocatedNotional(execution);
+  const reasonText = autoCloseReasonText(item);
+  return `
+    <div class="plan-card plan-card-compact">
+      <div class="plan-head plan-head-compact">
+        <div>
+          <div class="plan-title">${execution.symbol || "--"} · ${execution.long_exchange || "--"} / ${execution.short_exchange || "--"}</div>
+          <div class="plan-sub">${execution.plan_key || "--"}${plan?.plan_key ? ` · plan=${plan.plan_key}` : ""}</div>
+        </div>
+        <div class="plan-head-right">
+          <span class="pill ${autoCloseDecisionClass(item) === "positive" ? "good" : autoCloseDecisionClass(item) === "negative" ? "bad" : "warn"}">${autoCloseDecisionText(item)}</span>
+          <div class="plan-pnl">${execution.live_trading ? "LIVE" : "DRY"}</div>
+        </div>
+      </div>
+      <div class="compact-stat-grid">
+        ${compactStat("状态", explainStatus(execution.status))}
+        ${compactStat("自动平仓", execution.auto_close ? "YES" : "NO")}
+        ${compactStat("占用名义", allocatedNotional == null ? "--" : fmtMoney(allocatedNotional, 2))}
+        ${compactStat("目标平仓", fmtTime(execution.target_close_time_ms))}
+        ${compactStat("开仓时间", fmtTime(execution.opened_at_ms))}
+        ${compactStat("决策", autoCloseDecisionText(item), autoCloseDecisionClass(item))}
+        ${compactStat("触发器", item?.decision?.trigger || "--", item?.decision?.should_close ? "positive" : "muted-text")}
+        ${compactStat("最后状态迁移", fmtTime(execution.last_transition_at_ms))}
+      </div>
+      <div class="status-desc compact-status-desc">${reasonText}</div>
+      ${execution.last_error ? `<div class="status-desc compact-status-desc negative">${execution.last_error}</div>` : ""}
+      ${renderExecutionControls(execution.plan_key, execution.status)}
+    </div>
+  `;
+}
+
+function renderAutoCloseCandidates() {
+  renderAutoCloseSummary();
+  const items = Array.isArray(state.autoClose?.candidates)
+    ? state.autoClose.candidates
+    : [];
+  if (!items.length) {
+    els.autoCloseEmpty.style.display = "block";
+    els.autoCloseList.innerHTML = "";
+    return;
+  }
+  els.autoCloseEmpty.style.display = "none";
+  els.autoCloseList.innerHTML = items
+    .map((item) => renderAutoCloseCandidateCard(item))
+    .join("");
+}
+
 // ------------------------------------------------------------
 // 套利机会：筛选、摘要、列表、详情。
 // ------------------------------------------------------------
@@ -1710,10 +1805,11 @@ async function refreshAll() {
   // - 机会列表是新一批；
   // - 执行计划却还是旧一批；
   // 前端看起来就会互相矛盾。
-  const [system, opportunities, executions, stats] = await Promise.all([
+  const [system, opportunities, executions, autoClose, stats] = await Promise.all([
     apiGet("/api/v1/system/status", {}),
     apiGet(`/api/v1/opportunities?limit=${OPPORTUNITY_FETCH_LIMIT}`, []),
     apiGet("/api/v1/executions?limit=50", []),
+    apiGet("/api/v1/executions/auto-close-candidates", {}),
     apiGet("/api/v1/snapshot-stats", {}),
   ]);
 
@@ -1742,6 +1838,7 @@ async function refreshAll() {
   state.allPlans = Array.isArray(allPlans) ? allPlans : [];
   state.plans = state.allPlans;
   state.executions = Array.isArray(executions) ? executions : [];
+  state.autoClose = autoClose || {};
   state.stats = stats || {};
 
   syncSelectors();
@@ -1756,6 +1853,7 @@ async function refreshAll() {
   renderMarket(market || {});
   renderPlans();
   renderExecutions();
+  renderAutoCloseCandidates();
   renderOpportunities();
   els.lastRefreshLabel.textContent = new Date().toLocaleString("zh-CN", {
     hour12: false,
@@ -1810,6 +1908,20 @@ async function handleActionClick(event) {
 
 function bindEvents() {
   els.manualRefreshBtn.addEventListener("click", refreshAll);
+  els.autoCloseSweepBtn?.addEventListener("click", async () => {
+    els.autoCloseSweepBtn.disabled = true;
+    try {
+      const report = await apiPost("/api/v1/executions/auto-close-sweep");
+      await refreshAll();
+      alert(
+        `auto-close sweep 完成: attempted=${report?.attempted || 0}, closed=${report?.closed || 0}, failed=${report?.failed || 0}, skipped=${report?.skipped || 0}`,
+      );
+    } catch (err) {
+      alert(err.message || String(err));
+    } finally {
+      els.autoCloseSweepBtn.disabled = false;
+    }
+  });
 
   els.marketSelect.addEventListener("change", async (event) => {
     state.activeSymbol = event.target.value;

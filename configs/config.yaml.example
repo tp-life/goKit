@@ -81,9 +81,9 @@ strategy:
   safety_buffer_usdt: 0.2
 
   # 入场下单模式（maker/taker/mixed）。
-  entry_mode: "maker"
+  entry_mode: "taker"
   # 出场下单模式（maker/taker/mixed）。
-  exit_mode: "mixed"
+  exit_mode: "taker"
 
   # 行情最大允许延迟（超过则判为 stale）。
   max_data_age: 15s

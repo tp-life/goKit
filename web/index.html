@@ -165,9 +165,21 @@
               <div id="executions-empty" class="empty-state compact-empty">当前没有执行记录。</div>
             </section>
           </div>
+          <section class="auto-close-board">
+            <div class="execution-subhead execution-subhead-row">
+              <div>
+                <div class="section-title section-title-sm">待自动平仓 Live Execution</div>
+                <div class="section-desc">这里单独列出当前所有 live execution，并显示系统此刻的平仓判断；若已经达到条件，可以直接执行一次 auto-close sweep。</div>
+              </div>
+              <button id="auto-close-sweep-btn" class="btn btn-secondary">执行 Auto-Close Sweep</button>
+            </div>
+            <div id="auto-close-summary" class="execution-board-summary"></div>
+            <div id="auto-close-list" class="plan-list plan-list-compact"></div>
+            <div id="auto-close-empty" class="empty-state compact-empty">当前没有待自动平仓的 live execution。</div>
+          </section>
         </section>
       </main>
     </div>
-    <script src="/assets/app.js?v=20260324-opportunity-cycle-1"></script>
+    <script src="/assets/app.js?v=20260326-auto-close-live-1"></script>
   </body>
 </html>

@@ -224,6 +224,7 @@ type tickMsg time.Time
 type refreshLoadedMsg struct {
 	Seq           int
 	System        SystemStatus
+	AutoClose     service.AutoCloseInspection
 	Opportunities []OpportunityListItem
 	Executions    []entity.ExecutionRecord
 	Stats         repository.SnapshotStats
@@ -342,6 +343,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.data.System = msg.System
+		m.data.AutoClose = msg.AutoClose
 		m.data.Opportunities = msg.Opportunities
 		m.data.Executions = msg.Executions
 		m.data.Stats = msg.Stats
@@ -1469,11 +1471,12 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 		defer cancel()
 
 		var (
-			system   SystemStatus
-			opps     []OpportunityListItem
-			execs    []entity.ExecutionRecord
-			stats    repository.SnapshotStats
-			allPlans []entity.ExecutionPlan
+			system    SystemStatus
+			autoClose service.AutoCloseInspection
+			opps      []OpportunityListItem
+			execs     []entity.ExecutionRecord
+			stats     repository.SnapshotStats
+			allPlans  []entity.ExecutionPlan
 		)
 
 		var (
@@ -1491,11 +1494,17 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 			})
 		}
 
-		wg.Add(5)
+		wg.Add(6)
 		go func() {
 			defer wg.Done()
 			var err error
 			system, err = client.getSystemStatus(ctx)
+			setErr(err)
+		}()
+		go func() {
+			defer wg.Done()
+			var err error
+			autoClose, err = client.getAutoCloseCandidates(ctx)
 			setErr(err)
 		}()
 		go func() {
@@ -1545,6 +1554,7 @@ func fetchRefreshCmd(client *Client, seq int) tea.Cmd {
 		return refreshLoadedMsg{
 			Seq:           seq,
 			System:        system,
+			AutoClose:     autoClose,
 			Opportunities: opps,
 			Executions:    execs,
 			Stats:         stats,

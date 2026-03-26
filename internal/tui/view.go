@@ -187,18 +187,32 @@ func (m Model) renderExecutionBody(height int) string {
 func (m Model) renderSystemBody(height int) string {
 	leftWidth, rightWidth := splitWidth(m.width-2, 45)
 	if m.width < 120 {
-		topHeight, bottomHeight := splitStackedHeights(height)
-		if bottomHeight <= 0 {
+		topHeight, restHeight := splitStackedHeights(height)
+		if restHeight <= 0 {
 			return m.renderConnectorPanel(leftWidth+rightWidth, topHeight)
 		}
-		return lipgloss.JoinVertical(lipgloss.Left,
+		midHeight, bottomHeight := splitStackedHeights(restHeight)
+		sections := []string{
 			m.renderConnectorPanel(leftWidth+rightWidth, topHeight),
-			m.renderConfigPanel(leftWidth+rightWidth, bottomHeight),
+			m.renderConfigPanel(leftWidth+rightWidth, midHeight),
+		}
+		if bottomHeight > 0 {
+			sections = append(sections, m.renderAutoClosePanel(leftWidth+rightWidth, bottomHeight))
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, sections...)
+	}
+	topHeight, bottomHeight := splitStackedHeights(height)
+	right := m.renderConfigPanel(rightWidth, height)
+	if bottomHeight > 0 {
+		right = lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.renderConfigPanel(rightWidth, topHeight),
+			m.renderAutoClosePanel(rightWidth, bottomHeight),
 		)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
 		m.renderConnectorPanel(leftWidth, height),
-		m.renderConfigPanel(rightWidth, height),
+		right,
 	)
 }
 
@@ -472,6 +486,81 @@ func (m Model) renderConfigPanel(width int, height int) string {
 	}
 	if m.isLoading(loadSystem) && len(m.data.System.Watchlist) == 0 && len(m.data.System.DeepScanWatchlist) == 0 {
 		lines = append(lines, "", ui.subtle.Render("Loading strategy and execution config..."))
+	}
+	return renderPanel(width, height, strings.Join(lines, "\n"))
+}
+
+func (m Model) renderAutoClosePanel(width int, height int) string {
+	items := m.data.AutoClose.Candidates
+	lines := []string{
+		ui.panelTitle.Render(fmt.Sprintf("Auto Close Live  %d", len(items))),
+		ui.subtle.Render("Shows live executions, the current close decision, and what a manual sweep would act on."),
+		"",
+		fmt.Sprintf("evaluated=%s  eligible=%d  should_close=%d  errors=%d",
+			fmtTime(m.data.AutoClose.EvaluatedAtMs),
+			m.data.AutoClose.Eligible,
+			m.data.AutoClose.ShouldClose,
+			m.data.AutoClose.DecisionErrors,
+		),
+		"",
+	}
+	if len(items) == 0 {
+		lines = append(lines, ui.subtle.Render("No live execution is currently tracked for auto-close."))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
+	}
+
+	visibleRows := maxInt(1, panelListContentHeight(height)/listRowHeight)
+	_, end := visibleWindow(0, len(items), visibleRows)
+	for _, item := range items[:end] {
+		rec := item.Execution
+		decision := item.Decision
+		plan := entity.ExecutionPlan{}
+		hasPlan := false
+		if item.Plan != nil {
+			plan = *item.Plan
+			hasPlan = true
+		}
+
+		actionLabel := "holding"
+		actionTone := "accent"
+		switch {
+		case decision.Error != "":
+			actionLabel = "decision_error"
+			actionTone = "bad"
+		case decision.ShouldClose:
+			actionLabel = decision.Trigger
+			if strings.TrimSpace(actionLabel) == "" {
+				actionLabel = "close_now"
+			}
+			actionTone = "warn"
+		case !decision.Eligible:
+			actionLabel = "skipped"
+			actionTone = "bad"
+		case !decision.AutoCloseEnabled:
+			actionLabel = "auto_close_off"
+			actionTone = "bad"
+		}
+
+		reason := decision.Reason
+		if decision.Error != "" {
+			reason = decision.Error
+		}
+		if strings.TrimSpace(reason) == "" {
+			reason = "--"
+		}
+
+		allocated := executionAllocatedNotional(rec, plan, hasPlan)
+		block := strings.Join([]string{
+			fmt.Sprintf("%-7s %-24s %s", clip(rec.Symbol, 7), clip(rec.PlanKey, 24), statusText(rec.Status)),
+			fmt.Sprintf("    due %-19s alloc %-12s auto_close %-3s %s",
+				clip(fmtTime(rec.TargetCloseTimeMs), 19),
+				clip(renderAllocatedNotionalValue(allocated), 12),
+				boolWord(rec.AutoClose),
+				toneStyle(actionTone).Render(actionLabel),
+			),
+			fmt.Sprintf("    %s", clip(reason, maxInt(10, width-8))),
+		}, "\n")
+		lines = append(lines, block)
 	}
 	return renderPanel(width, height, strings.Join(lines, "\n"))
 }

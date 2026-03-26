@@ -276,6 +276,12 @@ select {
   gap: 16px;
 }
 
+.auto-close-board {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
 .execution-subhead {
   margin-bottom: 12px;
 }
