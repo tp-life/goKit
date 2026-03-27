@@ -15,6 +15,7 @@ type stubOpportunityRepo struct {
 
 type limitAwareOpportunityRepo struct {
 	stubOpportunityRepo
+	listLimits    []int
 	summaryLimits []int
 }
 
@@ -28,6 +29,15 @@ func (r stubOpportunityRepo) ListLatest(_ context.Context, _ int) ([]entity.Oppo
 
 func (r stubOpportunityRepo) ListLatestSummary(_ context.Context, _ int) ([]repository.OpportunitySummary, error) {
 	return summariesFromOpportunities(r.items), nil
+}
+
+func (r *limitAwareOpportunityRepo) ListLatest(_ context.Context, limit int) ([]entity.Opportunity, error) {
+	r.listLimits = append(r.listLimits, limit)
+	out := append([]entity.Opportunity(nil), r.items...)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (r *limitAwareOpportunityRepo) ListLatestSummary(_ context.Context, limit int) ([]repository.OpportunitySummary, error) {
@@ -88,69 +98,45 @@ func (r stubOpportunityRepo) DeleteOlderThan(_ context.Context, _ int64, _ int) 
 	return 0, nil
 }
 
-func TestFilterOpportunitiesToCurrentSettlementCycle_KeepsNearestFutureCycle(t *testing.T) {
-	now := time.Date(2026, 3, 24, 18, 40, 0, 0, time.UTC)
-	items := []entity.Opportunity{
-		{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(20 * time.Minute).UnixMilli()},
-		{Symbol: "ETH", ProjectedFundingTimeMs: now.Add(20 * time.Minute).UnixMilli()},
-		{Symbol: "SOL", ProjectedFundingTimeMs: now.Add(80 * time.Minute).UnixMilli()},
+func TestApplyOpportunityLimit_DefaultAndExplicitLimit(t *testing.T) {
+	items := []int{1, 2, 3, 4, 5}
+
+	gotDefault := applyOpportunityLimit(items, 0)
+	if len(gotDefault) != 5 {
+		t.Fatalf("expected default limit to keep all 5 items, got %d", len(gotDefault))
 	}
 
-	got := filterOpportunitiesToCurrentSettlementCycle(now, items)
-	if len(got) != 2 {
-		t.Fatalf("expected 2 opportunities in nearest future cycle, got %d", len(got))
-	}
-	if got[0].Symbol != "BTC" || got[1].Symbol != "ETH" {
-		t.Fatalf("expected to preserve original order for nearest cycle, got %#v", got)
+	gotLimited := applyOpportunityLimit(items, 3)
+	if len(gotLimited) != 3 {
+		t.Fatalf("expected explicit limit to keep 3 items, got %d", len(gotLimited))
 	}
 }
 
-func TestFilterOpportunitiesToCurrentSettlementCycle_FallsBackToLatestPastCycle(t *testing.T) {
-	now := time.Date(2026, 3, 24, 18, 40, 0, 0, time.UTC)
-	items := []entity.Opportunity{
-		{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(-5 * time.Minute).UnixMilli()},
-		{Symbol: "ETH", EarliestFundingTimeMs: now.Add(-5 * time.Minute).UnixMilli()},
-		{Symbol: "SOL", LatestFundingTimeMs: now.Add(-25 * time.Minute).UnixMilli()},
-	}
-
-	got := filterOpportunitiesToCurrentSettlementCycle(now, items)
-	if len(got) != 2 {
-		t.Fatalf("expected latest past cycle to remain visible, got %d items", len(got))
-	}
-	if got[0].Symbol != "BTC" || got[1].Symbol != "ETH" {
-		t.Fatalf("expected latest past-cycle items in original order, got %#v", got)
-	}
-}
-
-func TestFilterOpportunitiesToCurrentSettlementCycle_DropsItemsWithoutCycle(t *testing.T) {
-	now := time.Date(2026, 3, 24, 18, 40, 0, 0, time.UTC)
-	items := []entity.Opportunity{{Symbol: "BTC"}, {Symbol: "ETH"}}
-
-	got := filterOpportunitiesToCurrentSettlementCycle(now, items)
-	if len(got) != 0 {
-		t.Fatalf("expected no opportunities when cycle time is missing, got %d", len(got))
-	}
-}
-
-func TestOpportunityQueryService_ListLatestAppliesCurrentCycleFilterAndLimit(t *testing.T) {
+func TestOpportunityQueryService_ListLatestFetchesWholeLatestBatchBeforeLimit(t *testing.T) {
 	now := time.Now()
-	svc := NewOpportunityQueryService(stubOpportunityRepo{
-		items: []entity.Opportunity{
-			{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(10 * time.Minute).UnixMilli()},
-			{Symbol: "ETH", ProjectedFundingTimeMs: now.Add(10 * time.Minute).UnixMilli()},
-			{Symbol: "SOL", ProjectedFundingTimeMs: now.Add(30 * time.Minute).UnixMilli()},
+	repo := &limitAwareOpportunityRepo{
+		stubOpportunityRepo: stubOpportunityRepo{
+			items: []entity.Opportunity{
+				{Symbol: "SOL", ProjectedFundingTimeMs: now.Add(30 * time.Minute).UnixMilli()},
+				{Symbol: "BTC", ProjectedFundingTimeMs: now.Add(10 * time.Minute).UnixMilli()},
+				{Symbol: "ETH", ProjectedFundingTimeMs: now.Add(50 * time.Minute).UnixMilli()},
+			},
 		},
-	})
+	}
+	svc := NewOpportunityQueryService(repo)
 
-	got, err := svc.ListLatest(context.Background(), 1)
+	got, err := svc.ListLatest(context.Background(), 2)
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("expected limit to apply after cycle filter, got %d items", len(got))
+	if len(repo.listLimits) != 1 || repo.listLimits[0] != 0 {
+		t.Fatalf("expected repo ListLatest to be called without pre-limit, got %#v", repo.listLimits)
 	}
-	if got[0].Symbol != "BTC" {
-		t.Fatalf("expected first nearest-cycle item to survive limit, got %s", got[0].Symbol)
+	if len(got) != 2 {
+		t.Fatalf("expected limit to apply after full-batch fetch, got %d items", len(got))
+	}
+	if got[0].Symbol != "SOL" || got[1].Symbol != "BTC" {
+		t.Fatalf("expected service to preserve latest batch order before limit, got %#v", got)
 	}
 }
 
@@ -175,9 +161,9 @@ func TestOpportunityQueryService_ListLatestSummaryFetchesWholeBatchBeforeLimit(t
 		t.Fatalf("expected summary repo to be called without pre-limit, got %#v", repo.summaryLimits)
 	}
 	if len(got) != 2 {
-		t.Fatalf("expected limit to apply after cycle filter, got %d items", len(got))
+		t.Fatalf("expected limit to apply after full-batch fetch, got %d items", len(got))
 	}
-	if got[0].Symbol != "BTC" || got[1].Symbol != "ETH" {
-		t.Fatalf("expected nearest-cycle summaries to survive, got %#v", got)
+	if got[0].Symbol != "SOL" || got[1].Symbol != "BTC" {
+		t.Fatalf("expected service to preserve latest batch order before limit, got %#v", got)
 	}
 }

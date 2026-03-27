@@ -30,29 +30,43 @@ type apiEnvelope[T any] struct {
 }
 
 type StrategyStatus struct {
-	Enabled                        bool                          `json:"enabled"`
-	HoldHours                      float64                       `json:"hold_hours"`
-	EffectiveNotional              float64                       `json:"effective_notional"`
-	MinNetPNL                      float64                       `json:"min_net_pnl"`
-	EntryMode                      string                        `json:"entry_mode"`
-	ExitMode                       string                        `json:"exit_mode"`
-	MaxDataAge                     string                        `json:"max_data_age"`
-	MaxSpreadBps                   float64                       `json:"max_spread_bps"`
-	DynamicMaxSpreadMultiplier     float64                       `json:"dynamic_max_spread_multiplier"`
-	DynamicMaxSpreadReferenceHours float64                       `json:"dynamic_max_spread_reference_hours"`
-	EntryLeadTime                  string                        `json:"entry_lead_time"`
-	EntryCutoffTime                string                        `json:"entry_cutoff_time"`
-	CapitalTotalUSDT               float64                       `json:"capital_total_usdt"`
-	CapitalUtilization             float64                       `json:"capital_utilization"`
-	Leverage                       float64                       `json:"leverage"`
-	FeesByExchange                 map[string]exchange.FeeConfig `json:"fees_by_exchange"`
-	FundingHistoryLookback         string                        `json:"funding_history_lookback"`
-	FundingSmoothingCurrentWeight  float64                       `json:"funding_smoothing_current_weight"`
-	DynamicCandidateLimit          int                           `json:"dynamic_candidate_limit"`
-	RotationBatchSize              int                           `json:"rotation_batch_size"`
-	RotationInterval               string                        `json:"rotation_interval"`
-	DeepScanHoldDuration           string                        `json:"deep_scan_hold_duration"`
-	CoreSymbols                    []string                      `json:"core_symbols"`
+	Mode                                       string                        `json:"mode"`
+	Enabled                                    bool                          `json:"enabled"`
+	HoldHours                                  float64                       `json:"hold_hours"`
+	HoldSelectionMode                          string                        `json:"hold_selection_mode"`
+	EffectiveNotional                          float64                       `json:"effective_notional"`
+	MinNetPNL                                  float64                       `json:"min_net_pnl"`
+	EntryMode                                  string                        `json:"entry_mode"`
+	ExitMode                                   string                        `json:"exit_mode"`
+	MaxDataAge                                 string                        `json:"max_data_age"`
+	MaxSpreadBps                               float64                       `json:"max_spread_bps"`
+	DynamicMaxSpreadMultiplier                 float64                       `json:"dynamic_max_spread_multiplier"`
+	DynamicMaxSpreadReferenceHours             float64                       `json:"dynamic_max_spread_reference_hours"`
+	EntryLeadTime                              string                        `json:"entry_lead_time"`
+	EntryCutoffTime                            string                        `json:"entry_cutoff_time"`
+	CapitalTotalUSDT                           float64                       `json:"capital_total_usdt"`
+	CapitalUtilization                         float64                       `json:"capital_utilization"`
+	Leverage                                   float64                       `json:"leverage"`
+	FeesByExchange                             map[string]exchange.FeeConfig `json:"fees_by_exchange"`
+	FundingHistoryLookback                     string                        `json:"funding_history_lookback"`
+	FundingSmoothingCurrentWeight              float64                       `json:"funding_smoothing_current_weight"`
+	DynamicCandidateLimit                      int                           `json:"dynamic_candidate_limit"`
+	RotationBatchSize                          int                           `json:"rotation_batch_size"`
+	RotationInterval                           string                        `json:"rotation_interval"`
+	DeepScanHoldDuration                       string                        `json:"deep_scan_hold_duration"`
+	CoreSymbols                                []string                      `json:"core_symbols"`
+	RollingReviewSettleGracePeriod             string                        `json:"rolling_review_settle_grace_period"`
+	RollingReviewFreshSnapshotMaxWait          string                        `json:"rolling_review_fresh_snapshot_max_wait"`
+	RollingReviewCloseOnSnapshotTimeout        bool                          `json:"rolling_review_close_on_snapshot_timeout"`
+	RollingReviewContinueOnSameDirection       bool                          `json:"rolling_review_continue_on_same_direction"`
+	RollingReviewCloseOnUnprofitable           bool                          `json:"rolling_review_close_on_unprofitable"`
+	RollingReviewRequireIncrementalNetPositive bool                          `json:"rolling_review_require_incremental_net_positive"`
+	RollingReviewMinIncrementalNetPNL          float64                       `json:"rolling_review_min_incremental_net_pnl"`
+	RollingFlipEnabled                         bool                          `json:"rolling_flip_enabled"`
+	RollingFlipRequireNetPositive              bool                          `json:"rolling_flip_require_net_positive"`
+	RollingFlipMinNetPNL                       float64                       `json:"rolling_flip_min_net_pnl"`
+	RollingFlipSlippageMultiplier              float64                       `json:"rolling_flip_slippage_multiplier"`
+	RollingFlipExtraSafetyBufferUSDT           float64                       `json:"rolling_flip_extra_safety_buffer_usdt"`
 }
 
 type ExecutionStatus struct {
@@ -69,6 +83,10 @@ type ExecutionStatus struct {
 	ActiveAllocatedNotionalUSDT float64 `json:"active_allocated_notional_usdt"`
 	RemainingAutoBudgetUSDT     float64 `json:"remaining_auto_budget_usdt"`
 	RemainingLiveSlots          int     `json:"remaining_live_slots"`
+	ActiveRollingRecords        int     `json:"active_rolling_records"`
+	ActiveRollingGroups         int     `json:"active_rolling_groups"`
+	RollingDueReviews           int     `json:"rolling_due_reviews"`
+	RollingWaitingReviews       int     `json:"rolling_waiting_reviews"`
 }
 
 type SystemStatus struct {

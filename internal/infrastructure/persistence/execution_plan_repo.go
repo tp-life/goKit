@@ -32,7 +32,7 @@ func (r *ExecutionPlanRepo) SaveBatch(ctx context.Context, batchID, opportunityB
 		return r.client.GetDB(ctx).Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "plan_key"}},
 			DoUpdates: clause.AssignmentColumns([]string{
-				"batch_id", "opportunity_batch_id", "symbol", "long_exchange", "short_exchange",
+				"batch_id", "opportunity_batch_id", "rolling_group_key", "symbol", "long_exchange", "short_exchange",
 				"long_venue_symbol", "short_venue_symbol", "status", "entry_mode", "exit_mode",
 				"target_leverage", "capital_allocated_usdt", "target_notional_usdt", "rounded_notional_usdt",
 				"long_entry_price", "short_entry_price", "long_qty", "short_qty", "long_min_qty",
@@ -42,7 +42,8 @@ func (r *ExecutionPlanRepo) SaveBatch(ctx context.Context, batchID, opportunityB
 				"execution_penalty_model", "execution_penalty_bucket",
 				"net_expected_pnl", "net_expected_pnl_bps", "score", "earliest_funding_time_ms",
 				"latest_funding_time_ms", "projected_funding_time_ms", "required_entry_by_funding_time_ms",
-				"long_funding_event_count", "short_funding_event_count", "funding_window_hours", "funding_computation_mode",
+				"long_funding_event_count", "short_funding_event_count", "funding_window_hours", "strategy_mode", "funding_computation_mode",
+				"next_review_time_ms", "sync_boundary_time_ms", "entry_path_segment_count", "entry_path_stop_reason",
 				"entry_window_open_ms", "entry_window_close_ms", "target_close_time_ms",
 				"as_of_time_ms", "ready_now", "reject_reason", "updated_at",
 			}),

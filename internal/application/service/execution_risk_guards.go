@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
+	"strings"
 	"time"
 
 	"goKit/internal/domain/entity"
@@ -30,7 +30,7 @@ type executionCloseDecision struct {
 // - 当前 basis 没有明显恶化；
 // - 当前预估净收益仍然过线；
 // - 当前依然在入场时间窗内。
-func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.ExecutionPlan) error {
+func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.ExecutionPlan, trigger string) error {
 	if plan == nil {
 		return fmt.Errorf("nil execution plan")
 	}
@@ -52,11 +52,15 @@ func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.
 		return fmt.Errorf("open revalidation: market data is stale for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
 	}
 
-	currentProjection, ok := projectFundingCarryFromCurrentSnapshots(s.cfg, now, longFunding, shortFunding)
+	currentProjection, ok := projectFundingCarryForPlanRevalidation(s.cfg, now, plan, longFunding, shortFunding)
 	if !ok || currentProjection.CarryRate <= 0 {
 		return fmt.Errorf("open revalidation: current funding carry is no longer positive for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
 	}
-	if !isWithinEntryWindowForConfig(now, currentProjection.RequiredEntryByFundingTimeMs, s.cfg.EntryLeadTime, s.cfg.EntryCutoffTime) {
+	// rolling 翻仓属于“当前 live 仓位在 review 点内的方向切换”，
+	// 它的语义不是普通的“离结算点足够近才允许第一次开仓”。
+	// 因此 successor reopen 会保留 funding/basis/余额复核，但跳过通用 entry window 门槛。
+	if !shouldBypassRollingEntryWindowRevalidation(*plan, trigger) &&
+		!isWithinEntryWindowForConfig(now, currentProjection.RequiredEntryByFundingTimeMs, s.cfg.EntryLeadTime, s.cfg.EntryCutoffTime) {
 		return fmt.Errorf("open revalidation: current opportunity is outside entry window for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
 	}
 
@@ -82,6 +86,11 @@ func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.
 		return fmt.Errorf("open revalidation: current net pnl %.4f below minimum %.4f", currentNetExpectedPNL, s.cfg.MinNetPNL)
 	}
 	return nil
+}
+
+func shouldBypassRollingEntryWindowRevalidation(plan entity.ExecutionPlan, trigger string) bool {
+	return normalizedPlanStrategyMode(plan) == StrategyModeRollingCycleAligned &&
+		strings.EqualFold(strings.TrimSpace(trigger), "rolling_flip_reopen")
 }
 
 // evaluateCloseDecision 统一回答：
@@ -113,7 +122,12 @@ func (s *ExecutionService) evaluateCloseDecision(ctx context.Context, now time.T
 			reason:      fmt.Sprintf("execution status %s requires close retry", normalizeExecutionStatus(rec.Status)),
 		}, nil
 	}
-	if rec.TargetCloseTimeMs > 0 && now.UnixMilli() >= rec.TargetCloseTimeMs {
+	// rolling 模式的“到点”并不等于“直接平仓”：
+	// - record.TargetCloseTimeMs 只是下一次 review 的保护性锚点；
+	// - 真正到 review 点后，应先由 rolling monitor 决定继续持有 / 平仓 / 翻仓；
+	// - 因此这里仅对 legacy 计划保留 schedule close 语义。
+	if normalizeStrategyMode(rec.StrategyMode, StrategyModeLegacyProjection) != StrategyModeRollingCycleAligned &&
+		rec.TargetCloseTimeMs > 0 && now.UnixMilli() >= rec.TargetCloseTimeMs {
 		return executionCloseDecision{
 			shouldClose: true,
 			trigger:     "auto_schedule",
@@ -268,65 +282,129 @@ func projectFundingCarryFromCurrentSnapshots(cfg Config, now time.Time, longFund
 		EffectiveFloorRate: shortFunding.FundingRate,
 		EffectiveCapRate:   shortFunding.FundingRate,
 	}
+	if cfg.normalize().StrategyMode == StrategyModeRollingCycleAligned {
+		plan := buildDirectionalFundingPlanForConfig(
+			cfg,
+			now,
+			pickFirstNonEmpty(longFunding.Exchange, "long"),
+			longFunding,
+			longForecast,
+			pickFirstNonEmpty(shortFunding.Exchange, "short"),
+			shortFunding,
+			shortForecast,
+		)
+		return selectPrimaryFundingProjectionForConfig(cfg.normalize(), plan.Projections)
+	}
 	projections := buildFundingProjections(now, cfg.HoldHours, longFunding, longForecast, shortFunding, shortForecast)
-	return selectPrimaryFundingProjection(projections)
+	return selectPrimaryFundingProjectionForConfig(cfg.normalize(), projections)
+}
+
+// projectFundingCarryForPlanRevalidation 会尽量沿用“计划生成时已经选中的持有周期”。
+//
+// 这样做的目的是保证：
+// 1. 计划页上看到的收益窗口；
+// 2. execution plan 里写下来的 ProjectedFundingTimeMs；
+// 3. 真正发单前最后一次 revalidation；
+// 三者尽量围绕同一条 funding 路径做判断。
+//
+// 否则就会出现这种错位：
+// - 计划生成时选的是 4h 窗口；
+// - 发单前 revalidation 却临时改按 1h 窗口重算；
+// - 最终“预期收益”和“实际自动平仓时点”不再对应。
+func projectFundingCarryForPlanRevalidation(cfg Config, now time.Time, plan *entity.ExecutionPlan, longFunding, shortFunding entity.FundingSnapshot) (fundingProjection, bool) {
+	if plan == nil {
+		return fundingProjection{}, false
+	}
+
+	decay := normalizedContinuationDecay(cfg.FundingRateContinuationDecay)
+	longForecast := fundingForecast{
+		CurrentRate:        longFunding.FundingRate,
+		BaselineRate:       longFunding.FundingRate,
+		HistoryMean:        longFunding.FundingRate,
+		Regime:             "spot_only",
+		Confidence:         "low",
+		MeanReversion:      0.20,
+		ContinuationDecay:  decay,
+		EffectiveFloorRate: longFunding.FundingRate,
+		EffectiveCapRate:   longFunding.FundingRate,
+	}
+	shortForecast := fundingForecast{
+		CurrentRate:        shortFunding.FundingRate,
+		BaselineRate:       shortFunding.FundingRate,
+		HistoryMean:        shortFunding.FundingRate,
+		Regime:             "spot_only",
+		Confidence:         "low",
+		MeanReversion:      0.20,
+		ContinuationDecay:  decay,
+		EffectiveFloorRate: shortFunding.FundingRate,
+		EffectiveCapRate:   shortFunding.FundingRate,
+	}
+	if cfg.normalize().StrategyMode == StrategyModeRollingCycleAligned {
+		planProjections := buildDirectionalFundingPlanForConfig(
+			cfg,
+			now,
+			pickFirstNonEmpty(longFunding.Exchange, "long"),
+			longFunding,
+			longForecast,
+			pickFirstNonEmpty(shortFunding.Exchange, "short"),
+			shortFunding,
+			shortForecast,
+		).Projections
+		return selectFundingProjectionForPlan(cfg, plan, planProjections)
+	}
+	projections := buildFundingProjections(now, cfg.HoldHours, longFunding, longForecast, shortFunding, shortForecast)
+	return selectFundingProjectionForPlan(cfg, plan, projections)
 }
 
 func buildFundingProjections(now time.Time, holdHours float64, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
-	nowMs := now.UnixMilli()
-	candidateTimes := buildFundingCandidateTimes(nowMs, longFunding, shortFunding, holdHours)
-	if len(candidateTimes) == 0 {
-		return nil
+	return buildLegacyFundingProjections(now, holdHours, longFunding, longForecast, shortFunding, shortForecast)
+}
+
+func selectFundingProjectionForPlan(cfg Config, plan *entity.ExecutionPlan, projections []fundingProjection) (fundingProjection, bool) {
+	if len(projections) == 0 {
+		return fundingProjection{}, false
+	}
+	if plan == nil {
+		return selectPrimaryFundingProjectionForConfig(cfg.normalize(), projections)
 	}
 
-	projections := make([]fundingProjection, 0, len(candidateTimes))
-	for _, projectedTime := range candidateTimes {
-		longCount := fundingEventCountUntil(nowMs, projectedTime, longFunding.FundingTimeMs, longFunding.FundingIntervalHours)
-		shortCount := fundingEventCountUntil(nowMs, projectedTime, shortFunding.FundingTimeMs, shortFunding.FundingIntervalHours)
-		if longCount == 0 && shortCount == 0 {
+	// 第一优先级：事件数完全匹配。
+	// 对 funding 套利来说，“吃到了几轮 funding”比“绝对时间是否完全相等”更重要。
+	matchedCounts := make([]fundingProjection, 0, len(projections))
+	for _, projection := range projections {
+		if projection.LongFundingEventCount == plan.LongFundingEventCount &&
+			projection.ShortFundingEventCount == plan.ShortFundingEventCount {
+			matchedCounts = append(matchedCounts, projection)
+		}
+	}
+	if len(matchedCounts) > 0 {
+		return nearestFundingProjection(plan.ProjectedFundingTimeMs, matchedCounts), true
+	}
+
+	// 第二优先级：如果事件数已经因为时间推进发生了偏移，至少尽量贴近原计划的兑现时点。
+	if plan.ProjectedFundingTimeMs > 0 {
+		return nearestFundingProjection(plan.ProjectedFundingTimeMs, projections), true
+	}
+
+	return selectPrimaryFundingProjectionForConfig(cfg.normalize(), projections)
+}
+
+func nearestFundingProjection(targetMs int64, projections []fundingProjection) fundingProjection {
+	best := projections[0]
+	bestDiff := absInt64(best.ProjectedFundingTimeMs - targetMs)
+	for i := 1; i < len(projections); i++ {
+		diff := absInt64(projections[i].ProjectedFundingTimeMs - targetMs)
+		if diff < bestDiff {
+			best = projections[i]
+			bestDiff = diff
 			continue
 		}
-
-		shortCarry := projectedLegFundingCarry(shortForecast, shortCount)
-		longCarry := projectedLegFundingCarry(longForecast, longCount)
-		carryRate := shortCarry - longCarry
-		windowHours := float64(projectedTime-nowMs) / float64(time.Hour/time.Millisecond)
-		if windowHours <= 0 {
-			windowHours = 1.0 / 60.0
+		if diff == bestDiff && projections[i].ProjectedFundingTimeMs < best.ProjectedFundingTimeMs {
+			best = projections[i]
+			bestDiff = diff
 		}
-
-		requiredEntryBy := int64(0)
-		if longCount > 0 {
-			requiredEntryBy = longFunding.FundingTimeMs
-		}
-		if shortCount > 0 && (requiredEntryBy == 0 || shortFunding.FundingTimeMs < requiredEntryBy) {
-			requiredEntryBy = shortFunding.FundingTimeMs
-		}
-
-		projections = append(projections, fundingProjection{
-			ProjectedFundingTimeMs:       projectedTime,
-			RequiredEntryByFundingTimeMs: requiredEntryBy,
-			LongFundingEventCount:        longCount,
-			ShortFundingEventCount:       shortCount,
-			FundingWindowHours:           windowHours,
-			CarryRate:                    carryRate,
-			CarryRateHourlyEquivalent:    carryRate / windowHours,
-			ComputationMode:              "event_based_spot_revalidation",
-		})
 	}
-	sort.Slice(projections, func(i, j int) bool {
-		if projections[i].ProjectedFundingTimeMs != projections[j].ProjectedFundingTimeMs {
-			return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
-		}
-		if projections[i].CarryRate != projections[j].CarryRate {
-			return projections[i].CarryRate > projections[j].CarryRate
-		}
-		if projections[i].CarryRateHourlyEquivalent != projections[j].CarryRateHourlyEquivalent {
-			return projections[i].CarryRateHourlyEquivalent > projections[j].CarryRateHourlyEquivalent
-		}
-		return projections[i].RequiredEntryByFundingTimeMs < projections[j].RequiredEntryByFundingTimeMs
-	})
-	return projections
+	return best
 }
 
 func allowedBasisThresholdBpsForConfig(cfg Config, fundingWindowHours float64) float64 {

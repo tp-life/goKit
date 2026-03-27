@@ -58,13 +58,12 @@ type coarseCandidate struct {
 	Score  float64
 }
 
-// fundingProjection 描述“在某个明确方向下，基于当前已知 funding 事件，
-// 这条机会最值得持有到哪个真实结算点”。
+// fundingProjection 描述“在某个明确方向下，某一个候选 funding 兑现窗口”的基础轮廓。
 //
 // 重要：
 // 1. 它不是把 funding 先小时化再线性外推；
 // 2. 它只使用当前已经知道的下一次 fundingRate + fundingTime；
-// 3. 它会在两个真实结算点（long 的下一次、short 的下一次）中，挑出单位收益更高的那个。
+// 3. 它本身只是一条候选路径，真正哪条路径会被选中，要再结合持有窗口选择模式和成本模型。
 //
 // 例如：
 //
@@ -75,7 +74,9 @@ type coarseCandidate struct {
 //   - 持有到 1h：只会吃到 Binance 这一侧的下一次 funding
 //   - 持有到 4h：会吃到 Binance 与 Aster 这两侧各自已知的下一次 funding
 //
-// 最终应该选哪一个结算点，由 CarryRate（真实 funding 收益率）来决定。
+// 最终应该选哪一个结算点，不再由这里拍板，而是交给：
+// - funding 粗筛层：只做轻量 heuristics；
+// - 机会精算层：按净收益 / latest_profitable 等规则真正选窗。
 type fundingProjection struct {
 	ProjectedFundingTimeMs       int64
 	RequiredEntryByFundingTimeMs int64
@@ -85,6 +86,61 @@ type fundingProjection struct {
 	CarryRate                    float64
 	CarryRateHourlyEquivalent    float64
 	ComputationMode              string
+	StrategyMode                 string
+	IncludedSegmentCount         int
+	NextReviewTimeMs             int64
+	SyncBoundaryTimeMs           int64
+	PathEndReason                string
+	Segments                     []fundingSegment
+}
+
+type opportunityProjectionEvaluation struct {
+	Projection             fundingProjection
+	Detail                 entity.OpportunityProjection
+	MaxAllowedBasisBps     float64
+	SlippagePNL            float64
+	SafetyBufferPNL        float64
+	EntryPenaltyBps        float64
+	ExitPenaltyBps         float64
+	HedgePenaltyBps        float64
+	ExecutionPenaltyBps    float64
+	ExecutionPenaltyModel  string
+	ExecutionPenaltyBucket string
+}
+
+// evaluatedDirectionCandidate 表示“固定一个 long/short 方向后”的完整精算结果。
+//
+// 它和 funding 粗筛层最大的区别是：
+// 1. 这里已经把该方向下所有候选兑现窗口都重新精算过；
+// 2. 也已经按 hold_selection_mode 选出了该方向真正的主窗口；
+// 3. 最终两个方向谁更优，不再看 funding 粗筛主窗口，而是比较这里的最终主窗口净收益。
+//
+// 这样做可以避免：
+// - 方向 A 在最早窗口更强，方向 B 在更晚窗口更优；
+// - 但旧逻辑因为先看 funding 粗筛主窗口，把方向 B 提前过滤掉；
+// - 导致页面与预测详情里展示的，不是“全方向、全窗口重算后”的真正最优方案。
+type evaluatedDirectionCandidate struct {
+	LongExchange  string
+	ShortExchange string
+
+	LongFunding  entity.FundingSnapshot
+	ShortFunding entity.FundingSnapshot
+	LongBook     entity.BookTopSnapshot
+	ShortBook    entity.BookTopSnapshot
+	LongMeta     entity.Symbol
+	ShortMeta    entity.Symbol
+
+	LongForecast  fundingForecast
+	ShortForecast fundingForecast
+
+	EntryFeePNL        float64
+	ExitFeePNL         float64
+	BasisBps           float64
+	ProjectionVariants []fundingProjection
+	WindowEvaluations  []opportunityProjectionEvaluation
+	PrimaryWindow      opportunityProjectionEvaluation
+	FundingSegments    []entity.OpportunityFundingSegment
+	EntryPathSegments  []entity.OpportunityFundingSegment
 }
 
 // StrategyRunner 负责把“交易所原始市场数据”组织成三层流程：
@@ -556,16 +612,18 @@ func (r *StrategyRunner) opportunityLoop(ctx context.Context) {
 //
 // 计算步骤（逐 symbol、逐交易所对）：
 // 1) 读取双边 funding + 盘口 + symbol 元数据（任一缺失直接跳过）；
-// 2) 用 bestFundingDirection 同时评估两个方向：
+// 2) 对两个方向都做完整精算：
 //   - Long A / Short B
 //   - Long B / Short A
-//     并选择 carry 更高的一边；
-//     3. 资金收益：
-//     grossFundingPNL = notional * projection.CarryRate
-//     其中 projection.CarryRate 来自“事件时间轴模型”，不是简单小时化线性外推；
-//     4. 成本扣减：entry fee + exit fee + slippage + safety buffer；
-//     5. 风控与执行窗校验：数据新鲜度、basis、最小净利润、入场时间窗；
-//     6. 产出 Opportunity（包含方向、窗口、事件计数、预估净收益）。
+//
+// 3) 每个方向内部都会：
+//   - 枚举 hold_hours 内全部真实 funding 兑现窗口；
+//   - 按窗口重算 gross funding / 手续费 / 滑点 / 安全缓冲；
+//   - 再按 hold_selection_mode 选出该方向自己的主窗口；
+//
+// 4) 最后比较“两个方向各自主窗口”的最终净收益，选出真正更优的一边；
+// 5) 风控与执行窗校验：数据新鲜度、basis、最小净利润、入场时间窗；
+// 6) 产出 Opportunity（包含方向、窗口、事件计数、预估净收益）。
 //
 // 精算阶段默认遍历整个基础池。
 //
@@ -604,59 +662,43 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 				forecastA := r.forecastFunding(context.Background(), now, fA)
 				forecastB := r.forecastFunding(context.Background(), now, fB)
 
-				longExchange, shortExchange, projection, ok := r.bestFundingDirection(now, exA, fA, forecastA, exB, fB, forecastB)
-				if !ok {
+				candidateAB, okAB := r.evaluateDirectionCandidate(now, symbol, exA, fA, forecastA, bA, metaA, exB, fB, forecastB, bB, metaB)
+				candidateBA, okBA := r.evaluateDirectionCandidate(now, symbol, exB, fB, forecastB, bB, metaB, exA, fA, forecastA, bA, metaA)
+				if !okAB && !okBA {
 					continue
 				}
 
-				longFunding, shortFunding := fA, fB
-				longBook, shortBook := bA, bB
-				longMeta, shortMeta := metaA, metaB
-				longForecast, shortForecast := forecastA, forecastB
-				if strings.EqualFold(longExchange, exB) {
-					longFunding, shortFunding = fB, fA
-					longBook, shortBook = bB, bA
-					longMeta, shortMeta = metaB, metaA
-					longForecast, shortForecast = forecastB, forecastA
+				selected := candidateAB
+				switch {
+				case !okAB:
+					selected = candidateBA
+				case okBA && selectBetterDirectionCandidate(r.cfg.normalize(), candidateBA, candidateAB):
+					selected = candidateBA
 				}
-				projectionVariants := r.projectFundingCarryVariants(now, longFunding, longForecast, shortFunding, shortForecast)
-				estimateMode, estimateConfidence := fundingEstimateProfile(projection, longForecast, shortForecast)
+
+				longExchange, shortExchange := selected.LongExchange, selected.ShortExchange
+				longFunding, shortFunding := selected.LongFunding, selected.ShortFunding
+				longBook, shortBook := selected.LongBook, selected.ShortBook
+				longMeta, shortMeta := selected.LongMeta, selected.ShortMeta
+				longForecast, shortForecast := selected.LongForecast, selected.ShortForecast
+				projection := selected.PrimaryWindow.Projection
 
 				// 保留“小时化等价值”只用于展示和打分，不再作为 funding 收益的核心计算公式。
 				longHourly := longFunding.FundingRate / float64(maxInt(longFunding.FundingIntervalHours, 1))
 				shortHourly := shortFunding.FundingRate / float64(maxInt(shortFunding.FundingIntervalHours, 1))
+				entryFeePNL := selected.EntryFeePNL
+				exitFeePNL := selected.ExitFeePNL
+				basisBps := selected.BasisBps
+				windowEvaluations := selected.WindowEvaluations
+				primaryWindow := selected.PrimaryWindow
 				grossEdgeHourly := projection.CarryRateHourlyEquivalent
-				notional := r.cfg.EffectiveNotional()
-
-				grossFundingPNL := notional * projection.CarryRate
-				entryFeePNL := r.calcLegFee(notional, longExchange, r.cfg.EntryMode) + r.calcLegFee(notional, shortExchange, r.cfg.EntryMode)
-				exitFeePNL := r.calcLegFee(notional, longExchange, r.cfg.ExitMode) + r.calcLegFee(notional, shortExchange, r.cfg.ExitMode)
-				slippagePNL := notional * r.cfg.SlippageBps / 10000
-				safetyBufferPNL := r.cfg.SafetyBufferUSDT
-				netExpectedPNL := grossFundingPNL - entryFeePNL - exitFeePNL - slippagePNL - safetyBufferPNL
-				netExpectedBps := 0.0
-				if notional > 0 {
-					netExpectedBps = netExpectedPNL / notional * 10000
-				}
-				basisBps := 0.0
-				if longBook.AskPrice > 0 {
-					basisBps = absFloat(shortBook.BidPrice-longBook.AskPrice) / longBook.AskPrice * 10000
-				}
-				// estimateExecutionPenalty 将执行惩罚拆成三段：
-				// 1. entry: 开仓吃到的基础滑点/盘口冲击；
-				// 2. exit: 平仓时残留 basis 与退出执行摩擦；
-				// 3. hedge rollback: 多事件路径更长、单腿异常时需要预留的回滚冗余。
-				//
-				// 同时，这个惩罚还会乘上 exchange / symbol / time bucket 的经验乘子，
-				// 让不同 venue、不同币种、不同时间段的执行质量差异开始显式进入模型。
-				execPenalty := r.estimateExecutionPenalty(now, symbol, longExchange, shortExchange, projection, basisBps)
-				maxAllowedBasisBps := r.allowedBasisThresholdBps(projection)
-				slippagePNL = notional * (execPenalty.EntryPenaltyBps + execPenalty.ExitPenaltyBps) / 10000
-				safetyBufferPNL = r.cfg.SafetyBufferUSDT + notional*execPenalty.HedgeRollbackBps/10000
-				netExpectedPNL = grossFundingPNL - entryFeePNL - exitFeePNL - slippagePNL - safetyBufferPNL
-				if notional > 0 {
-					netExpectedBps = netExpectedPNL / notional * 10000
-				}
+				grossFundingPNL := primaryWindow.Detail.GrossFundingPNL
+				slippagePNL := primaryWindow.SlippagePNL
+				safetyBufferPNL := primaryWindow.SafetyBufferPNL
+				netExpectedPNL := primaryWindow.Detail.NetExpectedPNL
+				netExpectedBps := primaryWindow.Detail.NetExpectedBps
+				maxAllowedBasisBps := primaryWindow.MaxAllowedBasisBps
+				estimateMode, estimateConfidence := fundingEstimateProfile(projection, longForecast, shortForecast)
 				status, reason, eligible := r.evaluateOpportunity(now, projection, netExpectedPNL, basisBps, maxAllowedBasisBps, longFunding, shortFunding, longBook, shortBook)
 				items = append(items, entity.Opportunity{
 					BatchID:                      "",
@@ -690,17 +732,18 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					ExitFeePNL:                   exitFeePNL,
 					SlippagePNL:                  slippagePNL,
 					SafetyBufferPNL:              safetyBufferPNL,
-					EntryPenaltyBps:              execPenalty.EntryPenaltyBps,
-					ExitPenaltyBps:               execPenalty.ExitPenaltyBps,
-					HedgePenaltyBps:              execPenalty.HedgeRollbackBps,
-					ExecutionPenaltyBps:          execPenalty.TotalPenaltyBps,
-					ExecutionPenaltyModel:        execPenalty.ExperienceModel,
-					ExecutionPenaltyBucket:       execPenalty.ExperienceBucket,
+					EntryPenaltyBps:              primaryWindow.EntryPenaltyBps,
+					ExitPenaltyBps:               primaryWindow.ExitPenaltyBps,
+					HedgePenaltyBps:              primaryWindow.HedgePenaltyBps,
+					ExecutionPenaltyBps:          primaryWindow.ExecutionPenaltyBps,
+					ExecutionPenaltyModel:        primaryWindow.ExecutionPenaltyModel,
+					ExecutionPenaltyBucket:       primaryWindow.ExecutionPenaltyBucket,
 					NetExpectedPNL:               netExpectedPNL,
 					NetExpectedBps:               netExpectedBps,
 					BasisBps:                     basisBps,
 					MaxAllowedBasisBps:           maxAllowedBasisBps,
 					Score:                        r.scoreOpportunity(netExpectedPNL, grossEdgeHourly, basisBps),
+					StrategyMode:                 projection.StrategyMode,
 					EarliestFundingTimeMs:        minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
 					LatestFundingTimeMs:          maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
 					ProjectedFundingTimeMs:       projection.ProjectedFundingTimeMs,
@@ -709,9 +752,15 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 					ShortFundingEventCount:       projection.ShortFundingEventCount,
 					FundingWindowHours:           projection.FundingWindowHours,
 					FundingComputationMode:       projection.ComputationMode,
-					ProjectionDetails:            buildOpportunityProjectionDetails(projectionVariants, notional, entryFeePNL, exitFeePNL, slippagePNL, safetyBufferPNL),
+					NextReviewTimeMs:             projection.NextReviewTimeMs,
+					SyncBoundaryTimeMs:           projection.SyncBoundaryTimeMs,
+					EntryPathSegmentCount:        projection.IncludedSegmentCount,
+					EntryPathStopReason:          projection.PathEndReason,
+					ProjectionDetails:            projectionDetails(windowEvaluations),
 					LongFundingRule:              buildFundingRuleMetadata(longFunding, longMeta, longForecast),
 					ShortFundingRule:             buildFundingRuleMetadata(shortFunding, shortMeta, shortForecast),
+					FundingSegments:              selected.FundingSegments,
+					EntryPathSegments:            selected.EntryPathSegments,
 					Status:                       status,
 					RejectReason:                 reason,
 					EligibleForExecution:         eligible,
@@ -788,6 +837,112 @@ func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingPr
 	return OpportunityStatusEligible, "", true
 }
 
+// evaluateDirectionCandidate 会把“固定方向”的所有候选 funding 窗口都精算出来，
+// 然后再按当前 hold_selection_mode 选出这个方向真正的主窗口。
+//
+// 注意它和 bestFundingDirection 的职责不同：
+// - bestFundingDirection 仍属于 funding 粗筛层，只比较轻量 carry 轮廓；
+// - 这里已经进入最终机会精算层，要把手续费、滑点和窗口选择都算进去。
+func (r *StrategyRunner) evaluateDirectionCandidate(
+	now time.Time,
+	symbol string,
+	longExchange string,
+	longFunding entity.FundingSnapshot,
+	longForecast fundingForecast,
+	longBook entity.BookTopSnapshot,
+	longMeta entity.Symbol,
+	shortExchange string,
+	shortFunding entity.FundingSnapshot,
+	shortForecast fundingForecast,
+	shortBook entity.BookTopSnapshot,
+	shortMeta entity.Symbol,
+) (evaluatedDirectionCandidate, bool) {
+	plan := buildDirectionalFundingPlanForConfig(
+		r.cfg,
+		now,
+		longExchange,
+		longFunding,
+		longForecast,
+		shortExchange,
+		shortFunding,
+		shortForecast,
+	)
+	projectionVariants := plan.Projections
+	if len(projectionVariants) == 0 {
+		return evaluatedDirectionCandidate{}, false
+	}
+
+	notional := r.cfg.EffectiveNotional()
+	entryFeePNL := r.calcLegFee(notional, longExchange, r.cfg.EntryMode) + r.calcLegFee(notional, shortExchange, r.cfg.EntryMode)
+	exitFeePNL := r.calcLegFee(notional, longExchange, r.cfg.ExitMode) + r.calcLegFee(notional, shortExchange, r.cfg.ExitMode)
+
+	basisBps := 0.0
+	if longBook.AskPrice > 0 {
+		basisBps = absFloat(shortBook.BidPrice-longBook.AskPrice) / longBook.AskPrice * 10000
+	}
+
+	windowEvaluations := r.evaluateOpportunityProjectionWindows(now, symbol, longExchange, shortExchange, projectionVariants, notional, entryFeePNL, exitFeePNL, basisBps)
+	if len(windowEvaluations) == 0 {
+		return evaluatedDirectionCandidate{}, false
+	}
+	primaryWindow, ok := selectBestOpportunityProjection(r.cfg.normalize(), windowEvaluations)
+	if !ok {
+		return evaluatedDirectionCandidate{}, false
+	}
+
+	return evaluatedDirectionCandidate{
+		LongExchange:       longExchange,
+		ShortExchange:      shortExchange,
+		LongFunding:        longFunding,
+		ShortFunding:       shortFunding,
+		LongBook:           longBook,
+		ShortBook:          shortBook,
+		LongMeta:           longMeta,
+		ShortMeta:          shortMeta,
+		LongForecast:       longForecast,
+		ShortForecast:      shortForecast,
+		EntryFeePNL:        entryFeePNL,
+		ExitFeePNL:         exitFeePNL,
+		BasisBps:           basisBps,
+		ProjectionVariants: projectionVariants,
+		WindowEvaluations:  windowEvaluations,
+		PrimaryWindow:      primaryWindow,
+		FundingSegments:    fundingSegmentsToOpportunitySegments(plan.Segments),
+		EntryPathSegments:  fundingSegmentsToOpportunitySegments(primaryWindow.Projection.Segments),
+	}, true
+}
+
+// selectBetterDirectionCandidate 比较的是“最终主窗口”的结果，而不是 funding 粗筛阶段的轻量 carry。
+//
+// 这可以保证：
+// - 页面上展示的主收益；
+// - projection 明细里标记为优选的窗口；
+// - 以及最终写进 execution plan 的兑现时间；
+// 都来自同一个真正最优的方向/窗口组合。
+func selectBetterDirectionCandidate(cfg Config, left, right evaluatedDirectionCandidate) bool {
+	if left.PrimaryWindow.Detail.NetExpectedPNL != right.PrimaryWindow.Detail.NetExpectedPNL {
+		return left.PrimaryWindow.Detail.NetExpectedPNL > right.PrimaryWindow.Detail.NetExpectedPNL
+	}
+	if cfg.HoldSelectionMode == HoldSelectionModeLatestProfitable || cfg.HoldSelectionMode == HoldSelectionModeStrictTarget {
+		if opportunityProjectionLater(left.PrimaryWindow, right.PrimaryWindow) {
+			return true
+		}
+		if opportunityProjectionLater(right.PrimaryWindow, left.PrimaryWindow) {
+			return false
+		}
+	}
+	if left.PrimaryWindow.Detail.CarryRate != right.PrimaryWindow.Detail.CarryRate {
+		return left.PrimaryWindow.Detail.CarryRate > right.PrimaryWindow.Detail.CarryRate
+	}
+	if left.BasisBps != right.BasisBps {
+		return left.BasisBps < right.BasisBps
+	}
+	if left.LongExchange != right.LongExchange {
+		return left.LongExchange < right.LongExchange
+	}
+	return left.ShortExchange < right.ShortExchange
+}
+
 // bestFundingDirection 会把同一个交易所对的两个方向都算一遍：
 // 1. Long A / Short B
 // 2. Long B / Short A
@@ -801,8 +956,10 @@ func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingPr
 //
 // 因此，如果后续 funding 快照变化，反方向变得更优，下一轮计算自然会切换方向。
 func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA entity.FundingSnapshot, forecastA fundingForecast, exB string, fB entity.FundingSnapshot, forecastB fundingForecast) (string, string, fundingProjection, bool) {
-	projAB, okAB := r.projectFundingCarry(now, fA, forecastA, fB, forecastB)
-	projBA, okBA := r.projectFundingCarry(now, fB, forecastB, fA, forecastA)
+	planAB := buildDirectionalFundingPlanForConfig(r.cfg, now, exA, fA, forecastA, exB, fB, forecastB)
+	projAB, okAB := selectPrimaryFundingProjectionForConfig(r.cfg.normalize(), planAB.Projections)
+	planBA := buildDirectionalFundingPlanForConfig(r.cfg, now, exB, fB, forecastB, exA, fA, forecastA)
+	projBA, okBA := selectPrimaryFundingProjectionForConfig(r.cfg.normalize(), planBA.Projections)
 	if !okAB && !okBA {
 		return "", "", fundingProjection{}, false
 	}
@@ -839,117 +996,241 @@ func (r *StrategyRunner) bestFundingDirection(now time.Time, exA string, fA enti
 // - longFunding: 假设做多腿所在交易所的 funding 快照
 // - shortFunding: 假设做空腿所在交易所的 funding 快照
 //
-// 这里不把 funding 先统一小时化后线性外推，而是优先按事件时间轴逐点估算：
-// - 候选结算点 = 两侧 funding 事件时间轴上、直到 holdHours horizon 之前的所有结算点
-// - 对每个候选结算点，计算到该时点时双腿各自会发生几次 funding（会考虑多次结算）
-// - 主视图 / 主计划默认选择“当前时间窗里最早兑现的那个时点”
-// - 多窗口 projection details 仍然会保留后续候选，便于观察更远窗口的 carry 变化
+// 这里会按 strategy.mode 分流：
+// - legacy_projection: 枚举 holdHours 内所有候选结算点；
+// - rolling_cycle_aligned: 只构建当前 sync boundary 之前、方向仍连续成立的 entry path。
 //
-// 这样可以正确覆盖：
+// 无论哪种模式，projectFundingCarry 都只给出 funding 粗筛层的“主候选窗口”；
+// 真正写入机会/计划的最佳窗口，还要在后面的净收益评估阶段再决定。
+//
+// 这样可以覆盖：
 // - 一边 1h 结算，一边 4h / 8h 结算；
 // - 两边 funding 都为负，但负得不一样；
-// - 当前主显示收益严格对应“当前事件窗口”而不是更远退出点。
+// - rolling 模式下，不会把 boundary 上本应等待真实快照的 funding 硬预测过去。
 func (r *StrategyRunner) projectFundingCarry(now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) (fundingProjection, bool) {
 	projections := r.projectFundingCarryVariants(now, longFunding, longForecast, shortFunding, shortForecast)
-	return selectPrimaryFundingProjection(projections)
+	return selectPrimaryFundingProjectionForConfig(r.cfg.normalize(), projections)
 }
 
 func (r *StrategyRunner) projectFundingCarryVariants(now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
-	nowMs := now.UnixMilli()
-	candidateTimes := buildFundingCandidateTimes(nowMs, longFunding, shortFunding, r.cfg.HoldHours)
-	if len(candidateTimes) == 0 {
-		return nil
-	}
-
-	projections := make([]fundingProjection, 0, len(candidateTimes))
-	for _, projectedTime := range candidateTimes {
-		longCount := fundingEventCountUntil(nowMs, projectedTime, longFunding.FundingTimeMs, longFunding.FundingIntervalHours)
-		shortCount := fundingEventCountUntil(nowMs, projectedTime, shortFunding.FundingTimeMs, shortFunding.FundingIntervalHours)
-		if longCount == 0 && shortCount == 0 {
-			continue
-		}
-
-		// 第一笔已知 funding 事件仍使用当前快照；
-		// 只有当持仓窗口跨到第 2 次及以后事件时，才使用预测器给出的“分 event 未来费率路径”参与估算。
-		shortCarry := projectedLegFundingCarry(shortForecast, shortCount)
-		longCarry := projectedLegFundingCarry(longForecast, longCount)
-		carryRate := shortCarry - longCarry
-		windowHours := float64(projectedTime-nowMs) / float64(time.Hour/time.Millisecond)
-		if windowHours <= 0 {
-			windowHours = 1.0 / 60.0
-		}
-		hourlyEq := carryRate / windowHours
-
-		requiredEntryBy := int64(0)
-		if longCount > 0 {
-			requiredEntryBy = longFunding.FundingTimeMs
-		}
-		if shortCount > 0 {
-			if requiredEntryBy == 0 || shortFunding.FundingTimeMs < requiredEntryBy {
-				requiredEntryBy = shortFunding.FundingTimeMs
-			}
-		}
-
-		projection := fundingProjection{
-			ProjectedFundingTimeMs:       projectedTime,
-			RequiredEntryByFundingTimeMs: requiredEntryBy,
-			LongFundingEventCount:        longCount,
-			ShortFundingEventCount:       shortCount,
-			FundingWindowHours:           windowHours,
-			CarryRate:                    carryRate,
-			CarryRateHourlyEquivalent:    hourlyEq,
-			ComputationMode:              "event_based_known_next_funding",
-		}
-		if longForecast.Regime != "" || shortForecast.Regime != "" {
-			projection.ComputationMode = "event_based_regime_aware_forecast"
-		}
-		projections = append(projections, projection)
-	}
-	sort.Slice(projections, func(i, j int) bool {
-		if projections[i].ProjectedFundingTimeMs != projections[j].ProjectedFundingTimeMs {
-			return projections[i].ProjectedFundingTimeMs < projections[j].ProjectedFundingTimeMs
-		}
-		if projections[i].CarryRate != projections[j].CarryRate {
-			return projections[i].CarryRate > projections[j].CarryRate
-		}
-		if projections[i].CarryRateHourlyEquivalent != projections[j].CarryRateHourlyEquivalent {
-			return projections[i].CarryRateHourlyEquivalent > projections[j].CarryRateHourlyEquivalent
-		}
-		return projections[i].RequiredEntryByFundingTimeMs < projections[j].RequiredEntryByFundingTimeMs
-	})
-	return projections
+	plan := buildDirectionalFundingPlanForConfig(
+		r.cfg,
+		now,
+		pickFirstNonEmpty(longFunding.Exchange, "long"),
+		longFunding,
+		longForecast,
+		pickFirstNonEmpty(shortFunding.Exchange, "short"),
+		shortFunding,
+		shortForecast,
+	)
+	return plan.Projections
 }
 
-func selectPrimaryFundingProjection(projections []fundingProjection) (fundingProjection, bool) {
+// selectPrimaryFundingProjectionForConfig 是“轻量 funding 粗筛层”的窗口选择器。
+//
+// 注意它和真正的机会精算不是同一层：
+// - 这里还没有盘口 / basis / 执行惩罚等完整成本；
+// - 因此它只负责给 funding 粗筛一个主窗口，不能替代最终净收益选择。
+//
+// 当前语义：
+// - strict_target: 直接选 hold_hours 内最后一个真实结算窗口；
+// - latest_profitable: 选 hold_hours 内“最晚且 carry 仍然为正”的 funding 窗口；
+// - 其他模式：保留原来的“最早候选窗口优先”，避免粗筛层过度激进。
+func selectPrimaryFundingProjectionForConfig(cfg Config, projections []fundingProjection) (fundingProjection, bool) {
 	if len(projections) == 0 {
 		return fundingProjection{}, false
+	}
+	if cfg.HoldSelectionMode == HoldSelectionModeStrictTarget {
+		return projections[len(projections)-1], true
+	}
+	if cfg.HoldSelectionMode == HoldSelectionModeLatestProfitable {
+		for i := len(projections) - 1; i >= 0; i-- {
+			if projections[i].CarryRate > 0 {
+				return projections[i], true
+			}
+		}
 	}
 	return projections[0], true
 }
 
-func buildOpportunityProjectionDetails(projections []fundingProjection, notional, entryFeePNL, exitFeePNL, slippagePNL, safetyBufferPNL float64) []entity.OpportunityProjection {
-	out := make([]entity.OpportunityProjection, 0, len(projections))
+func (r *StrategyRunner) evaluateOpportunityProjectionWindows(now time.Time, symbol, longExchange, shortExchange string, projections []fundingProjection, notional, entryFeePNL, exitFeePNL, basisBps float64) []opportunityProjectionEvaluation {
+	out := make([]opportunityProjectionEvaluation, 0, len(projections))
 	for i, projection := range projections {
+		execPenalty := r.estimateExecutionPenalty(now, symbol, longExchange, shortExchange, projection, basisBps)
+		slippagePNL := notional * (execPenalty.EntryPenaltyBps + execPenalty.ExitPenaltyBps) / 10000
+		safetyBufferPNL := r.cfg.SafetyBufferUSDT + notional*execPenalty.HedgeRollbackBps/10000
 		grossFundingPNL := notional * projection.CarryRate
 		netExpectedPNL := grossFundingPNL - entryFeePNL - exitFeePNL - slippagePNL - safetyBufferPNL
 		netExpectedBps := 0.0
 		if notional > 0 {
 			netExpectedBps = netExpectedPNL / notional * 10000
 		}
-		out = append(out, entity.OpportunityProjection{
-			ProjectionRank:               i + 1,
-			IsBestProjection:             i == 0,
-			ProjectedFundingTimeMs:       projection.ProjectedFundingTimeMs,
-			RequiredEntryByFundingTimeMs: projection.RequiredEntryByFundingTimeMs,
-			LongFundingEventCount:        projection.LongFundingEventCount,
-			ShortFundingEventCount:       projection.ShortFundingEventCount,
-			FundingWindowHours:           projection.FundingWindowHours,
-			CarryRate:                    projection.CarryRate,
-			CarryRateHourlyEquivalent:    projection.CarryRateHourlyEquivalent,
-			GrossFundingPNL:              grossFundingPNL,
-			NetExpectedPNL:               netExpectedPNL,
-			NetExpectedBps:               netExpectedBps,
-			ComputationMode:              projection.ComputationMode,
+		out = append(out, opportunityProjectionEvaluation{
+			Projection: projection,
+			Detail: entity.OpportunityProjection{
+				ProjectionRank:               i + 1,
+				IsBestProjection:             false,
+				ProjectedFundingTimeMs:       projection.ProjectedFundingTimeMs,
+				RequiredEntryByFundingTimeMs: projection.RequiredEntryByFundingTimeMs,
+				LongFundingEventCount:        projection.LongFundingEventCount,
+				ShortFundingEventCount:       projection.ShortFundingEventCount,
+				FundingWindowHours:           projection.FundingWindowHours,
+				CarryRate:                    projection.CarryRate,
+				CarryRateHourlyEquivalent:    projection.CarryRateHourlyEquivalent,
+				GrossFundingPNL:              grossFundingPNL,
+				NetExpectedPNL:               netExpectedPNL,
+				NetExpectedBps:               netExpectedBps,
+				ComputationMode:              projection.ComputationMode,
+				StrategyMode:                 projection.StrategyMode,
+				IncludedSegmentCount:         projection.IncludedSegmentCount,
+				NextReviewTimeMs:             projection.NextReviewTimeMs,
+				SyncBoundaryTimeMs:           projection.SyncBoundaryTimeMs,
+				PathEndReason:                projection.PathEndReason,
+			},
+			MaxAllowedBasisBps:     r.allowedBasisThresholdBps(projection),
+			SlippagePNL:            slippagePNL,
+			SafetyBufferPNL:        safetyBufferPNL,
+			EntryPenaltyBps:        execPenalty.EntryPenaltyBps,
+			ExitPenaltyBps:         execPenalty.ExitPenaltyBps,
+			HedgePenaltyBps:        execPenalty.HedgeRollbackBps,
+			ExecutionPenaltyBps:    execPenalty.TotalPenaltyBps,
+			ExecutionPenaltyModel:  execPenalty.ExperienceModel,
+			ExecutionPenaltyBucket: execPenalty.ExperienceBucket,
+		})
+	}
+
+	bestIdx := bestOpportunityProjectionIndex(r.cfg, out)
+	if bestIdx >= 0 {
+		out[bestIdx].Detail.IsBestProjection = true
+	}
+	return out
+}
+
+func selectBestOpportunityProjection(cfg Config, items []opportunityProjectionEvaluation) (opportunityProjectionEvaluation, bool) {
+	idx := bestOpportunityProjectionIndex(cfg, items)
+	if idx < 0 {
+		return opportunityProjectionEvaluation{}, false
+	}
+	return items[idx], true
+}
+
+// bestOpportunityProjectionIndex 决定“机会主窗口”到底是哪一档。
+//
+// 这是整个套利收益与自动平仓时点对齐的关键入口：
+// 1. 页面上的主收益、最佳兑现时间，来自这里；
+// 2. execution plan 的 ProjectedFundingTimeMs，来自这里；
+// 3. 计划性自动平仓的目标时点，也最终跟着这里走。
+//
+// latest_profitable 的语义是：
+// - 在 hold_hours 内，优先选“最晚且已经达到最小净收益门槛”的窗口；
+// - 这样可以让仓位尽量多覆盖几轮 funding，去摊薄开平仓成本；
+// - 如果更晚的窗口已经不满足门槛，再退回到更早但仍然赚钱的窗口。
+//
+// strict_target 的语义是：
+// - 直接选 hold_hours 内最后一个真实结算窗口；
+// - 无论这个窗口最终是否过最小净收益门槛，都不再偷偷回退到更早窗口；
+// - 这样可以保证“页面上的收益口径”和“真实计划持有到的结算点”严格一致。
+//
+// 若整个窗口内没有任何一档达到门槛，则退回 best_net。
+// 这样做的原因是：即使这笔单最终不会被执行，页面上仍然希望看到“最不差”的那档收益，
+// 便于排查到底是收益太低，还是持有窗口/手续费配置太紧。
+func bestOpportunityProjectionIndex(cfg Config, items []opportunityProjectionEvaluation) int {
+	if len(items) == 0 {
+		return -1
+	}
+	if cfg.HoldSelectionMode == HoldSelectionModeStrictTarget {
+		bestStrictIdx := 0
+		for i := 1; i < len(items); i++ {
+			if opportunityProjectionLater(items[i], items[bestStrictIdx]) {
+				bestStrictIdx = i
+			}
+		}
+		return bestStrictIdx
+	}
+	if cfg.HoldSelectionMode == HoldSelectionModeLatestProfitable {
+		bestLatestIdx := -1
+		for i := range items {
+			if items[i].Detail.NetExpectedPNL < cfg.MinNetPNL {
+				continue
+			}
+			if bestLatestIdx < 0 || opportunityProjectionLater(items[i], items[bestLatestIdx]) {
+				bestLatestIdx = i
+			}
+		}
+		if bestLatestIdx >= 0 {
+			return bestLatestIdx
+		}
+	}
+
+	bestIdx := 0
+	for i := 1; i < len(items); i++ {
+		if opportunityProjectionBetter(items[i], items[bestIdx]) {
+			bestIdx = i
+		}
+	}
+	return bestIdx
+}
+
+func opportunityProjectionLater(left, right opportunityProjectionEvaluation) bool {
+	if left.Projection.ProjectedFundingTimeMs != right.Projection.ProjectedFundingTimeMs {
+		return left.Projection.ProjectedFundingTimeMs > right.Projection.ProjectedFundingTimeMs
+	}
+	if left.Detail.NetExpectedPNL != right.Detail.NetExpectedPNL {
+		return left.Detail.NetExpectedPNL > right.Detail.NetExpectedPNL
+	}
+	if left.Detail.CarryRate != right.Detail.CarryRate {
+		return left.Detail.CarryRate > right.Detail.CarryRate
+	}
+	return left.Projection.RequiredEntryByFundingTimeMs < right.Projection.RequiredEntryByFundingTimeMs
+}
+
+func opportunityProjectionBetter(left, right opportunityProjectionEvaluation) bool {
+	if left.Detail.NetExpectedPNL != right.Detail.NetExpectedPNL {
+		return left.Detail.NetExpectedPNL > right.Detail.NetExpectedPNL
+	}
+	if left.Detail.CarryRate != right.Detail.CarryRate {
+		return left.Detail.CarryRate > right.Detail.CarryRate
+	}
+	if left.Projection.ProjectedFundingTimeMs != right.Projection.ProjectedFundingTimeMs {
+		return left.Projection.ProjectedFundingTimeMs < right.Projection.ProjectedFundingTimeMs
+	}
+	return left.Projection.RequiredEntryByFundingTimeMs < right.Projection.RequiredEntryByFundingTimeMs
+}
+
+func projectionDetails(items []opportunityProjectionEvaluation) []entity.OpportunityProjection {
+	out := make([]entity.OpportunityProjection, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.Detail)
+	}
+	return out
+}
+
+func fundingSegmentsToOpportunitySegments(items []fundingSegment) []entity.OpportunityFundingSegment {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]entity.OpportunityFundingSegment, 0, len(items))
+	for _, item := range items {
+		out = append(out, entity.OpportunityFundingSegment{
+			SegmentRank:            item.SegmentRank,
+			SettlementTimeMs:       item.SettlementTimeMs,
+			SegmentType:            item.SegmentType,
+			UsesForecast:           item.UsesForecast,
+			SharedSettlement:       item.SharedSettlement,
+			HeldLongExchange:       item.HeldLongExchange,
+			HeldShortExchange:      item.HeldShortExchange,
+			OptimalLongExchange:    item.OptimalLongExchange,
+			OptimalShortExchange:   item.OptimalShortExchange,
+			DirectionMatchesHeld:   item.DirectionMatchesHeld,
+			LongLegSettles:         item.LongLegSettles,
+			ShortLegSettles:        item.ShortLegSettles,
+			LongLegRate:            item.LongLegRate,
+			ShortLegRate:           item.ShortLegRate,
+			LongLegEventIndex:      item.LongLegEventIdx,
+			ShortLegEventIndex:     item.ShortLegEventIdx,
+			CarryRate:              item.CarryRate,
+			HeldDirectionCarryRate: item.HeldDirectionCarryRate,
+			ComputationMode:        item.ComputationMode,
 		})
 	}
 	return out

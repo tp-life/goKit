@@ -49,92 +49,142 @@ log:
 strategy:
   # 策略总开关（false 时仅服务启动，不跑策略循环）。
   enabled: true
+  # 策略模式：
+  # - legacy_projection: 当前仓库主链里的“候选窗口累计 + 选主窗口”模式
+  # - rolling_cycle_aligned: 按结算段滚动 review / 续持 / 翻仓的目标模式
+  #
+  # 当前这份示例按 rolling 设计组织配置；
+  # 代码里已有兼容桥，会把新配置层映射回现有运行时字段。
+  mode: "rolling_cycle_aligned"
 
-  # 统一使用 canonical symbol（基础币）做监控范围。
-  # Binance / Aster 的 BTCUSDT、Hyperliquid 的 BTC 最终都会映射到 BTC。
-  allowed_symbols: ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LINK", "AVAX", "LTC"]
+  universe:
+    # 统一使用 canonical symbol（基础币）做监控范围。
+    # Binance / Aster 的 BTCUSDT、Hyperliquid 的 BTC 最终都会映射到 BTC。
+    allowed_symbols: ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LINK", "AVAX", "LTC"]
+    # 核心币常驻深扫池，适合 BTC / ETH / SOL 这类“不想错过”的币。
+    core_symbols: ["BTC", "ETH", "SOL"]
+    # 报价资产过滤（例如 USDT）。
+    quote_asset: "USDT"
 
-  # 报价资产过滤（例如 USDT）。
-  quote_asset: "USDT"
+  capital:
+    # 总资金（USDT），用于推导可分配名义资金。
+    total_capital_usdt: 1000
+    # 资金利用率（0~1）。
+    capital_utilization: 0.8
+    # 目标杠杆。
+    leverage: 2
+    # 假设名义价值（当无法从资金*杠杆推导时的兜底值）。
+    assumed_notional: 1600
 
-  # Funding 机会的最大评估持有窗口（小时）。
-  # 例如设为 24，算法会允许评估到未来 24h 的结算路径，而不只看最近一次结算。
-  hold_hours: 24
+  opportunity:
+    # 允许往后看的最大持有窗口（小时）。
+    # rolling 模式下它主要决定“机会视角最多往后看多远”，不是固定最终持有到多久。
+    hold_hours: 24
+    # 兼容当前 legacy 主链的主窗口选择模式。
+    # rolling 逻辑真正落地前，兼容桥会使用这个字段回退到旧行为。
+    legacy_hold_selection_mode: "latest_profitable"
+    # 扣除手续费/滑点/安全垫后的最小净收益门槛（USDT）。
+    min_net_pnl: 1.5
+    # 前端展示机会数量上限（仅展示层建议值，非核心计算截断）。
+    max_displayed_opportunities: 20
 
-  # 总资金（USDT），用于推导可分配名义资金。
-  total_capital_usdt: 1000
-  # 资金利用率（0~1）。
-  capital_utilization: 0.8
-  # 目标杠杆。
-  leverage: 2
-  # 假设名义价值（当无法从资金*杠杆推导时的兜底值）。
-  assumed_notional: 1600
+  execution_cost:
+    # 开平仓总滑点假设（bps），会从预期收益中直接扣除。
+    slippage_bps: 2
+    # 额外安全垫（USDT），用于覆盖模型外误差。
+    safety_buffer_usdt: 0.2
+    # 入场下单模式（maker/taker/mixed）。
+    entry_mode: "taker"
+    # 出场下单模式（maker/taker/mixed）。
+    exit_mode: "taker"
 
-  # 扣除手续费/滑点/安全垫后的最小净收益门槛（USDT）。
-  min_net_pnl: 1.5
-  # 前端展示机会数量上限（仅展示层建议值，非核心计算截断）。
-  max_displayed_opportunities: 20
+  market_data:
+    # 行情最大允许延迟（超过则判为 stale）。
+    max_data_age: 15s
+    # funding 快照落库周期。
+    funding_snapshot_persist_interval: 60s
+    # 盘口 top 快照落库周期。
+    book_snapshot_persist_interval: 20s
+    # 快照保留时长（超出后清理）。
+    snapshot_retention: 168h
+    # 机会计算循环周期。
+    opportunity_calc_interval: 5s
+    # 盘口快照最小价格变化阈值（bps），低于该值可不落库。
+    book_snapshot_min_price_change_bps: 0.5
+    # 盘口快照最小数量变化比例，低于该值可不落库。
+    book_snapshot_min_qty_change_ratio: 0.05
 
-  # 开平仓总滑点假设（bps），会从预期收益中直接扣除。
-  slippage_bps: 2
-  # 额外安全垫（USDT），用于覆盖模型外误差。
-  safety_buffer_usdt: 0.2
+  spread_guard:
+    # 跨所 basis 基础阈值（bps）。
+    # 注意：实际可用阈值会按持有时长做动态放宽。
+    max_spread_bps: 12
+    # 动态阈值最大放大倍数：最终阈值不会超过 max_spread_bps * 该倍数。
+    dynamic_max_spread_multiplier: 1.5
+    # 动态阈值参考持有时长（小时）：funding_window_hours 达到该值时放大到上限。
+    dynamic_max_spread_reference_hours: 24
+    # 开仓窗口上边界：距离 required_entry_by 最多提前多久允许开仓。
+    entry_lead_time: 180s
+    # 开仓窗口下边界：距离 required_entry_by 少于该时间则停止开仓。
+    entry_cutoff_time: 45s
 
-  # 入场下单模式（maker/taker/mixed）。
-  entry_mode: "taker"
-  # 出场下单模式（maker/taker/mixed）。
-  exit_mode: "taker"
+  prediction:
+    # funding 平滑估算的历史回看窗口。
+    funding_history_lookback: 6h
+    # 当前 funding 快照在平滑估算中的权重（0~1）。
+    funding_smoothing_current_weight: 0.7
+    # 对同一腿未来第2次及以后 funding 的费率衰减系数。
+    funding_rate_continuation_decay: 0.6
+    # 允许在 sync boundary 之前，对 early venue 的中间单边结算点做预测。
+    allow_intermediate_forecast_before_boundary: true
+    # 禁止在 sync boundary 时使用预测值替代 shared real funding。
+    forbid_boundary_forecast: true
 
-  # 行情最大允许延迟（超过则判为 stale）。
-  max_data_age: 15s
-  # 跨所 basis 基础阈值（bps）。
-  # 注意：实际可用阈值会按持有时长做动态放宽（见下面两个参数）。
-  max_spread_bps: 12
-  # 动态阈值最大放大倍数：最终阈值不会超过 max_spread_bps * 该倍数。
-  dynamic_max_spread_multiplier: 1.5
-  # 动态阈值参考持有时长（小时）：funding_window_hours 达到该值时放大到上限。
-  dynamic_max_spread_reference_hours: 24
+  rolling:
+    # EntryPath 是否只保留“方向连续一致”的 segment 前缀。
+    entry_path_require_consistent_direction: true
+    # 允许 single_forecast_segment 最多延伸多少个中间周期。
+    # =0 表示只要还没到 boundary，就不做额外数量限制。
+    max_single_exchange_forecast_segments: 0
+    # rolling 层的预测护栏；通常建议与 prediction 段保持一致。
+    allow_intermediate_forecast_before_boundary: true
+    forbid_boundary_forecast: true
+    review:
+      # 到 review 点后，为 funding 入账和边界抖动预留的短缓冲。
+      settle_grace_period: 15s
+      # 到达 review 点后，最多等待多久让最新 funding 快照刷新到内存。
+      fresh_snapshot_max_wait: 20s
+      # 若超时仍没有 fresh snapshot，是否保守平仓。
+      close_on_snapshot_timeout: true
+      # 若新一轮方向与当前持仓一致，是否允许继续持有。
+      continue_on_same_direction: true
+      # 若从当前 review 点往后看已无正向收益，是否直接平仓。
+      close_on_unprofitable: true
+      # 续持时是否要求“从现在开始的增量净收益”仍为正。
+      require_incremental_net_positive: true
+      # 续持的最小增量净收益门槛（USDT）；0 表示只要求 > 0。
+      min_incremental_net_pnl: 0
+    flip:
+      # shared segment 到来且方向反向时，是否允许 close -> open successor。
+      enabled: true
+      # 是否要求翻仓后的净收益为正且过门槛。
+      require_net_positive: true
+      # 翻仓最小净收益门槛（USDT）。
+      min_net_pnl: 1.5
+      # 翻仓额外滑点乘子，用于覆盖“平旧仓 + 开新仓”的额外摩擦。
+      slippage_multiplier: 1.5
+      # 翻仓额外安全垫（USDT）。
+      extra_safety_buffer_usdt: 0.2
 
-  # 开仓窗口上边界：距离 required_entry_by 最多提前多久允许开仓。
-  entry_lead_time: 180s
-  # 开仓窗口下边界：距离 required_entry_by 少于该时间则停止开仓。
-  entry_cutoff_time: 45s
-
-  # funding 快照落库周期。
-  funding_snapshot_persist_interval: 60s
-  # 盘口 top 快照落库周期。
-  book_snapshot_persist_interval: 20s
-  # 快照保留时长（超出后清理）。
-  snapshot_retention: 168h
-  # 机会计算循环周期。
-  opportunity_calc_interval: 5s
-
-  # funding 平滑估算的历史回看窗口。
-  # 注意：若持仓只覆盖当前这一轮结算，系统仍直接使用当前 funding 快照；
-  # 只有跨到后续多轮结算时，才会将“当前 funding 快照”和该窗口内的历史均值做混合。
-  funding_history_lookback: 6h
-  # 当前 funding 快照在平滑估算中的权重（0~1）。
-  # 越高越贴近当前市场，越低越偏向历史均值。
-  funding_smoothing_current_weight: 0.7
-
-  # 对同一腿未来第2次及以后 funding 的费率衰减系数，降低 1h 费率瞬时极值外推风险。
-  # 1.0=不衰减（激进）；0.6=保守默认。
-  funding_rate_continuation_decay: 0.6
-
-  # 盘口快照最小价格变化阈值（bps），低于该值可不落库。
-  book_snapshot_min_price_change_bps: 0.5
-  # 盘口快照最小数量变化比例，低于该值可不落库。
-  book_snapshot_min_qty_change_ratio: 0.05
-
-  # 全市场 funding 粗筛后，最多挑多少个 symbol 进入动态深扫池。
-  # =0 表示不设上限，所有 funding 候选都允许进入深扫池。
-  dynamic_candidate_limit: 30
-  # 每轮额外抽多少个“没进 TopN 的币”做冷门轮转补扫；=0 表示关闭轮转。
-  rotation_batch_size: 25
-  # 多久重算一次深扫池。
-  rotation_interval: 30s
-  # 某个 symbol 一旦进入深扫池，至少保留这么久，避免 websocket 频繁抖动。
-  deep_scan_hold_duration: 3m
+  scan:
+    # 全市场 funding 粗筛后，最多挑多少个 symbol 进入动态深扫池。
+    # =0 表示不设上限，所有 funding 候选都允许进入深扫池。
+    dynamic_candidate_limit: 30
+    # 每轮额外抽多少个“没进 TopN 的币”做冷门轮转补扫；=0 表示关闭轮转。
+    rotation_batch_size: 25
+    # 多久重算一次深扫池。
+    rotation_interval: 30s
+    # 某个 symbol 一旦进入深扫池，至少保留这么久，避免 websocket 频繁抖动。
+    deep_scan_hold_duration: 3m
 
   execution:
     # true = 允许真实下单；false = 仅做 dry-run 记录，不会向交易所发单。
@@ -143,8 +193,9 @@ strategy:
     auto_entry: true
     # 是否自动平仓。
     auto_close: true
-    # 在最后一个 funding 时间之后，再额外等待一小段时间执行自动平仓。
-    close_grace_period: 2m
+    # 兼容当前执行链使用的“计划性平仓缓冲”。
+    # rolling 模式建议与 strategy.rolling.review.settle_grace_period 保持一致。
+    close_grace_period: 15s
     # 执行引擎轮询周期。
     loop_interval: 3s
     # 每轮最多读取多少条最新执行计划/记录。
@@ -160,14 +211,15 @@ strategy:
     # =0 表示不限制，仍受 max_latest_plans 与 max_live_plans 共同约束。
     max_auto_open_per_loop: 0
     # 持仓期间允许承受的最大“按当前可成交方向估算”的浮亏（USDT）。
-    # =0 表示关闭这条提前平仓护栏。
+    # latest_profitable 模式下，若你想尽量持有到目标 funding 窗口，建议先保持 0；
+    # 如果你想保留异常行情止损，再逐步调到 8~10 这类更宽的阈值。
     max_unrealized_loss_usdt: 0
     # 若当前解仓方向的跨所 basis 恶化超过该阈值（bps），则提前触发自动平仓。
-    # =0 表示关闭这条基差恶化护栏。
+    # latest_profitable 模式下，若你想减少“尚未到目标结算点就被提前平掉”的概率，建议先保持 0。
     max_unwind_basis_bps: 0
     # 持仓期间的紧急可用余额比例下限。
     # 例如设为 0.05 表示 available_balance / equity 低于 5% 时提前平仓。
-    # =0 表示关闭这条保证金缓冲护栏。
+    # latest_profitable 模式下，若当前资金缓冲足够，也建议先保持 0，避免常规持有被提前打断。
     emergency_min_available_balance_ratio: 0
     # 每条主腿从发请求到拿到同步结果，最多允许等待多久。
     # 超时后系统不会无限卡住，而会立刻用 client_order_id 做 best-effort 查单/查仓。

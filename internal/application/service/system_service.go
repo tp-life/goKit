@@ -1,6 +1,8 @@
 package service
 
 import (
+	"time"
+
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 	"goKit/internal/infrastructure/exchange"
@@ -40,12 +42,34 @@ func (s *SystemService) Status() map[string]any {
 	}
 	activeLivePlans := 0
 	activeAllocatedNotional := 0.0
+	activeRollingRecords := 0
+	activeRollingGroups := map[string]struct{}{}
+	rollingDueReviews := 0
+	rollingWaitingReviews := 0
+	nowMs := time.Now().UTC().UnixMilli()
 	for _, rec := range activeRecords {
 		if !countsTowardLivePlanLimit(rec) {
 			continue
 		}
 		activeLivePlans++
 		activeAllocatedNotional += rec.AllocatedNotionalUSDT
+
+		// rolling 统计只关心“当前真的会被 rolling monitor 继续观察的 live opened 仓位”。
+		// pending_close / close_failed 这类尾部状态虽然仍占用 live slot，
+		// 但它们已经不再参与 review / continue / flip 的策略判断。
+		if !shouldMonitorRollingRecord(rec) {
+			continue
+		}
+		activeRollingRecords++
+		if rec.RollingGroupKey != "" {
+			activeRollingGroups[rec.RollingGroupKey] = struct{}{}
+		}
+		switch {
+		case rec.NextReviewTimeMs > 0 && nowMs >= rec.NextReviewTimeMs:
+			rollingDueReviews++
+		case rec.NextReviewTimeMs > 0:
+			rollingWaitingReviews++
+		}
 	}
 	effectiveNotional := s.cfg.EffectiveNotional()
 	remainingBudget := effectiveNotional - activeAllocatedNotional
@@ -66,29 +90,43 @@ func (s *SystemService) Status() map[string]any {
 		"deep_scan_watchlist": s.store.DeepScanWatchlist(),
 		"connectors":          s.store.Statuses(),
 		"strategy": map[string]any{
-			"enabled":                            s.cfg.Enabled,
-			"hold_hours":                         s.cfg.HoldHours,
-			"effective_notional":                 effectiveNotional,
-			"min_net_pnl":                        s.cfg.MinNetPNL,
-			"entry_mode":                         s.cfg.EntryMode,
-			"exit_mode":                          s.cfg.ExitMode,
-			"max_data_age":                       s.cfg.MaxDataAge.String(),
-			"max_spread_bps":                     s.cfg.MaxSpreadBps,
-			"dynamic_max_spread_multiplier":      s.cfg.DynamicMaxSpreadMultiplier,
-			"dynamic_max_spread_reference_hours": s.cfg.DynamicMaxSpreadReferenceHours,
-			"entry_lead_time":                    s.cfg.EntryLeadTime.String(),
-			"entry_cutoff_time":                  s.cfg.EntryCutoffTime.String(),
-			"capital_total_usdt":                 s.cfg.TotalCapitalUSDT,
-			"capital_utilization":                s.cfg.CapitalUtilization,
-			"leverage":                           s.cfg.Leverage,
-			"fees_by_exchange":                   feesByExchange,
-			"funding_history_lookback":           s.cfg.FundingHistoryLookback.String(),
-			"funding_smoothing_current_weight":   s.cfg.FundingSmoothingCurrentWeight,
-			"dynamic_candidate_limit":            s.cfg.DynamicCandidateLimit,
-			"rotation_batch_size":                s.cfg.RotationBatchSize,
-			"rotation_interval":                  s.cfg.RotationInterval.String(),
-			"deep_scan_hold_duration":            s.cfg.DeepScanHoldDuration.String(),
-			"core_symbols":                       s.cfg.CoreSymbols,
+			"enabled":                                         s.cfg.Enabled,
+			"mode":                                            s.cfg.StrategyMode,
+			"hold_hours":                                      s.cfg.HoldHours,
+			"hold_selection_mode":                             s.cfg.HoldSelectionMode,
+			"effective_notional":                              effectiveNotional,
+			"min_net_pnl":                                     s.cfg.MinNetPNL,
+			"entry_mode":                                      s.cfg.EntryMode,
+			"exit_mode":                                       s.cfg.ExitMode,
+			"max_data_age":                                    s.cfg.MaxDataAge.String(),
+			"max_spread_bps":                                  s.cfg.MaxSpreadBps,
+			"dynamic_max_spread_multiplier":                   s.cfg.DynamicMaxSpreadMultiplier,
+			"dynamic_max_spread_reference_hours":              s.cfg.DynamicMaxSpreadReferenceHours,
+			"entry_lead_time":                                 s.cfg.EntryLeadTime.String(),
+			"entry_cutoff_time":                               s.cfg.EntryCutoffTime.String(),
+			"capital_total_usdt":                              s.cfg.TotalCapitalUSDT,
+			"capital_utilization":                             s.cfg.CapitalUtilization,
+			"leverage":                                        s.cfg.Leverage,
+			"fees_by_exchange":                                feesByExchange,
+			"funding_history_lookback":                        s.cfg.FundingHistoryLookback.String(),
+			"funding_smoothing_current_weight":                s.cfg.FundingSmoothingCurrentWeight,
+			"dynamic_candidate_limit":                         s.cfg.DynamicCandidateLimit,
+			"rotation_batch_size":                             s.cfg.RotationBatchSize,
+			"rotation_interval":                               s.cfg.RotationInterval.String(),
+			"deep_scan_hold_duration":                         s.cfg.DeepScanHoldDuration.String(),
+			"core_symbols":                                    s.cfg.CoreSymbols,
+			"rolling_review_settle_grace_period":              s.cfg.RollingReviewSettleGracePeriod.String(),
+			"rolling_review_fresh_snapshot_max_wait":          s.cfg.RollingReviewFreshSnapshotMaxWait.String(),
+			"rolling_review_close_on_snapshot_timeout":        s.cfg.RollingReviewCloseOnSnapshotTimeout,
+			"rolling_review_continue_on_same_direction":       s.cfg.RollingReviewContinueOnSameDirection,
+			"rolling_review_close_on_unprofitable":            s.cfg.RollingReviewCloseOnUnprofitable,
+			"rolling_review_require_incremental_net_positive": s.cfg.RollingReviewRequireIncrementalNetPositive,
+			"rolling_review_min_incremental_net_pnl":          s.cfg.RollingReviewMinIncrementalNetPNL,
+			"rolling_flip_enabled":                            s.cfg.RollingFlipEnabled,
+			"rolling_flip_require_net_positive":               s.cfg.RollingFlipRequireNetPositive,
+			"rolling_flip_min_net_pnl":                        s.cfg.RollingFlipMinNetPNL,
+			"rolling_flip_slippage_multiplier":                s.cfg.RollingFlipSlippageMultiplier,
+			"rolling_flip_extra_safety_buffer_usdt":           s.cfg.RollingFlipExtraSafetyBufferUSDT,
 		},
 		"execution": map[string]any{
 			"live_trading_enabled":           s.cfg.Execution.Enabled,
@@ -104,6 +142,10 @@ func (s *SystemService) Status() map[string]any {
 			"active_allocated_notional_usdt": activeAllocatedNotional,
 			"remaining_auto_budget_usdt":     remainingBudget,
 			"remaining_live_slots":           remainingLiveSlots,
+			"active_rolling_records":         activeRollingRecords,
+			"active_rolling_groups":          len(activeRollingGroups),
+			"rolling_due_reviews":            rollingDueReviews,
+			"rolling_waiting_reviews":        rollingWaitingReviews,
 		},
 	}
 }

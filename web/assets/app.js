@@ -185,6 +185,35 @@ function fmtSpan(ms) {
   return `${secs}秒`;
 }
 
+// Go 后端把 duration 序列化成类似 `15s`、`5m0s`、`1h30m0s`。
+// 前端只需要把这些值换算成毫秒，用来把“funding 兑现点”推导成“预计平仓点”。
+function parseGoDurationMs(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+
+  const unitMs = {
+    ns: 1 / 1e6,
+    us: 1 / 1e3,
+    "µs": 1 / 1e3,
+    ms: 1,
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+  };
+
+  const matches = text.matchAll(/(-?\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g);
+  let total = 0;
+  let matched = false;
+  for (const match of matches) {
+    const amount = Number(match[1]);
+    const factor = unitMs[match[2]];
+    if (!Number.isFinite(amount) || !Number.isFinite(factor)) continue;
+    total += amount * factor;
+    matched = true;
+  }
+  return matched ? total : 0;
+}
+
 function priceText(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "--";
@@ -212,6 +241,27 @@ function statusClass(status) {
 
 function boolText(value) {
   return value ? "是" : "否";
+}
+
+function holdSelectionModeText(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (!mode) return "--";
+  if (mode === "latest_profitable") return "最晚盈利窗口";
+  if (mode === "strict_target") return "严格目标窗口";
+  if (mode === "best_net") return "净收益优先";
+  return value;
+}
+
+function strategyModeText(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (!mode) return "--";
+  if (mode === "rolling_cycle_aligned") return "按结算段滚动";
+  if (mode === "legacy_projection") return "累计窗口投影";
+  return value;
+}
+
+function isRollingStrategyMode(value) {
+  return String(value || "").trim().toLowerCase() === "rolling_cycle_aligned";
 }
 
 function midpoint(bid, ask) {
@@ -259,8 +309,13 @@ function opportunityDirection(item) {
   return `${item.long_exchange} 做多 / ${item.short_exchange} 做空`;
 }
 
+function bestProjection(item) {
+  const rows = Array.isArray(item?.projection_details) ? item.projection_details : [];
+  return rows.find((row) => row?.is_best_projection) || rows[0] || null;
+}
+
 function fundingSpread(item) {
-  const bestProjectionCarry = Number(item?.projection_details?.[0]?.carry_rate);
+  const bestProjectionCarry = Number(bestProjection(item)?.carry_rate);
   if (Number.isFinite(bestProjectionCarry)) {
     return bestProjectionCarry;
   }
@@ -329,6 +384,55 @@ function holdingDurationText(item) {
     return fmtDuration(totalMinutes * 60 * 1000);
   }
   return "--";
+}
+
+function closeGraceMs() {
+  return parseGoDurationMs(state.system?.execution?.close_grace_period);
+}
+
+function holdLimitText() {
+  const hours = Number(state.system?.strategy?.hold_hours || 0);
+  if (!Number.isFinite(hours) || hours <= 0) return "--";
+  return `${fmtNumber(hours, 1)} h`;
+}
+
+function closeGraceText() {
+  return state.system?.execution?.close_grace_period || "--";
+}
+
+// 机会级别还没有落真实 execution plan 时，前端用
+// projected funding time + close grace 推导一个“预计平仓时间”。
+function opportunityExpectedCloseMs(item) {
+  if (!item || typeof item !== "object") return 0;
+  if (isRollingStrategyMode(item.strategy_mode)) {
+    const nextReviewMs = Number(item.next_review_time_ms || 0);
+    if (Number.isFinite(nextReviewMs) && nextReviewMs > 0) {
+      return nextReviewMs + closeGraceMs();
+    }
+  }
+  const projectedMs = Number(
+    item.projected_funding_time_ms || item.latest_funding_time_ms || 0,
+  );
+  if (!Number.isFinite(projectedMs) || projectedMs <= 0) return 0;
+  return projectedMs + closeGraceMs();
+}
+
+function opportunityExpectedCloseText(item) {
+  return fmtTime(opportunityExpectedCloseMs(item));
+}
+
+function opportunityExpectedHoldText(item) {
+  const closeMs = opportunityExpectedCloseMs(item);
+  if (closeMs > 0) {
+    return fmtDuration(closeMs - Date.now());
+  }
+  return holdingDurationText(item);
+}
+
+function executionRemainingHoldText(item) {
+  const targetCloseMs = Number(item?.target_close_time_ms ?? 0);
+  if (!Number.isFinite(targetCloseMs) || targetCloseMs <= 0) return "--";
+  return fmtDuration(targetCloseMs - Date.now());
 }
 
 function opportunityProducedTimeMs(item) {
@@ -640,6 +744,9 @@ function renderOverview() {
 
   els.strategySummary.innerHTML = [
     infoCell("策略开关", boolText(strategy.enabled)),
+    infoCell("策略模式", strategyModeText(strategy.mode)),
+    infoCell("持有上限", `${fmtNumber(strategy.hold_hours || 0, 1)} 小时`),
+    infoCell("持有窗口模式", holdSelectionModeText(strategy.hold_selection_mode)),
     infoCell(
       "总资金",
       `${fmtNumber(strategy.capital_total_usdt || 0, 2)} USDT`,
@@ -655,6 +762,11 @@ function renderOverview() {
     infoCell("最大数据年龄", strategy.max_data_age || "--"),
     infoCell("入场提前", strategy.entry_lead_time || "--"),
     infoCell("入场截止", strategy.entry_cutoff_time || "--"),
+    infoCell("Review 缓冲", strategy.rolling_review_settle_grace_period || "--"),
+    infoCell(
+      "Review 快照等待",
+      strategy.rolling_review_fresh_snapshot_max_wait || "--",
+    ),
   ].join("");
 
   els.executionSummary.innerHTML = [
@@ -667,7 +779,7 @@ function renderOverview() {
     infoCell("自动平仓", boolText(execution.auto_close)),
     infoCell("自动分配资金", boolText(execution.auto_allocate_capital)),
     infoCell("轮询间隔", execution.loop_interval || "--"),
-    infoCell("平仓保护期", execution.close_grace_period || "--"),
+    infoCell("结算后缓冲", execution.close_grace_period || "--"),
     infoCell("最新计划窗口", String(execution.max_latest_plans || 0)),
     infoCell(
       "每轮开仓上限",
@@ -690,6 +802,8 @@ function renderOverview() {
       `${fmtNumber(execution.remaining_auto_budget_usdt || 0, 2)} USDT`,
       Number(execution.remaining_auto_budget_usdt || 0) > 0 ? "good" : "warn",
     ),
+    infoCell("Rolling 分组", String(execution.active_rolling_groups || 0)),
+    infoCell("待 Review", String(execution.rolling_due_reviews || 0)),
   ].join("");
 }
 
@@ -844,6 +958,11 @@ function syntheticPlanForOpportunity(item) {
     short_venue_symbol: item.short_venue_symbol,
     net_expected_pnl: item.net_expected_pnl,
     projected_funding_time_ms: item.projected_funding_time_ms,
+    strategy_mode: item.strategy_mode,
+    next_review_time_ms: item.next_review_time_ms,
+    sync_boundary_time_ms: item.sync_boundary_time_ms,
+    entry_path_segment_count: item.entry_path_segment_count,
+    entry_path_stop_reason: item.entry_path_stop_reason,
     latest_funding_time_ms: item.latest_funding_time_ms,
     funding_event_count: item.funding_event_count,
     funding_event_count_estimate: item.funding_event_count_estimate,
@@ -855,6 +974,7 @@ function syntheticPlanForOpportunity(item) {
     short_leverage: targetLeverage,
     long_entry_price: longEntryPrice,
     short_entry_price: shortEntryPrice,
+    target_close_time_ms: opportunityExpectedCloseMs(item),
   };
 
   if (targetNotional > 0 && longEntryPrice > 0) {
@@ -1112,6 +1232,10 @@ function planCompactMeta(item, linkedOpp) {
       "杠杆",
       `${fmtNumber(planLongLeverage(item), 2)}x / ${fmtNumber(planShortLeverage(item), 2)}x`,
     ),
+    compactStat(
+      "持有模式",
+      holdSelectionModeText(state.system?.strategy?.hold_selection_mode),
+    ),
     compactStat("Funding", fundingEventsText(item)),
     compactStat("预计持仓", planExpectedHoldText(item)),
     compactStat(
@@ -1183,7 +1307,12 @@ function renderCompactExecutionCard(item) {
           "占用名义",
           allocatedNotional == null ? "--" : fmtMoney(allocatedNotional, 2),
         )}
+        ${compactStat(
+          "持有模式",
+          holdSelectionModeText(state.system?.strategy?.hold_selection_mode),
+        )}
         ${compactStat("计划持仓", executionPlannedHoldText(item))}
+        ${compactStat("剩余持有", executionRemainingHoldText(item))}
         ${compactStat("最晚平仓", fmtTime(item.target_close_time_ms))}
         ${compactStat("开仓单", String(openCount))}
         ${compactStat("平仓单", String(closeCount))}
@@ -1293,6 +1422,9 @@ function renderAutoCloseCandidateCard(item) {
   const execution = item?.execution || {};
   const plan = item?.plan || null;
   const allocatedNotional = executionAllocatedNotional(execution);
+  const plannedHold = plan
+    ? planExpectedHoldText(plan)
+    : executionPlannedHoldText(execution);
   const reasonText = autoCloseReasonText(item);
   return `
     <div class="plan-card plan-card-compact">
@@ -1310,6 +1442,12 @@ function renderAutoCloseCandidateCard(item) {
         ${compactStat("状态", explainStatus(execution.status))}
         ${compactStat("自动平仓", execution.auto_close ? "YES" : "NO")}
         ${compactStat("占用名义", allocatedNotional == null ? "--" : fmtMoney(allocatedNotional, 2))}
+        ${compactStat(
+          "持有模式",
+          holdSelectionModeText(state.system?.strategy?.hold_selection_mode),
+        )}
+        ${compactStat("计划持仓", plannedHold)}
+        ${compactStat("剩余持有", executionRemainingHoldText(execution))}
         ${compactStat("目标平仓", fmtTime(execution.target_close_time_ms))}
         ${compactStat("开仓时间", fmtTime(execution.opened_at_ms))}
         ${compactStat("决策", autoCloseDecisionText(item), autoCloseDecisionClass(item))}
@@ -1421,7 +1559,9 @@ function renderOpportunitySummary(items) {
         ${summaryMetric("最早结算倒计时", fmtDuration(earliestDelta))}
         ${summaryMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${summaryMetric("进入计划说明", planStatus.reason || "--")}
-        ${summaryMetric("建议持有时长", holdingDurationText(item))}
+        ${summaryMetric("持有模式", holdSelectionModeText(state.system?.strategy?.hold_selection_mode))}
+        ${summaryMetric("预计持有时长", opportunityExpectedHoldText(item))}
+        ${summaryMetric("预计持有到", opportunityExpectedCloseText(item))}
         ${summaryMetric("产生时间", fmtTime(opportunityProducedTimeMs(item)))}
       </div>
     </div>
@@ -1449,7 +1589,7 @@ function renderOpportunityList(items) {
             <div><span>Basis</span><strong>${fmtSignedBps(item.basis_bps, 2)}</strong></div>
             <div><span>事件化时均 edge</span><strong>${fmtPctRatio(fundingSpreadHourly(item), 5)}</strong></div>
             <div><span>最早结算</span><strong>${fmtDuration(earliestDelta)}</strong></div>
-            <div><span>建议持有</span><strong>${holdingDurationText(item)}</strong></div>
+            <div><span>预计持有</span><strong>${opportunityExpectedHoldText(item)}</strong></div>
             <div><span>产生时间</span><strong>${fmtTime(opportunityProducedTimeMs(item))}</strong></div>
           </div>
           <div class="opportunity-foot dual-pill">
@@ -1553,8 +1693,9 @@ function renderProjectionDetails(item) {
             <th>窗口</th>
             <th>Long 事件</th>
             <th>Short 事件</th>
-            <th>Carry</th>
+            <th>Carry率</th>
             <th>时均</th>
+            <th>资金收益</th>
             <th>净收益</th>
           </tr>
         </thead>
@@ -1570,6 +1711,7 @@ function renderProjectionDetails(item) {
                   <td>${row.short_funding_event_count || 0}</td>
                   <td class="${classForNumber(row.carry_rate)}">${fmtPctRatio(row.carry_rate, 5)}</td>
                   <td class="${classForNumber(row.carry_rate_hourly_equivalent)}">${fmtPctRatio(row.carry_rate_hourly_equivalent, 5)}</td>
+                  <td class="${classForNumber(row.gross_funding_pnl)}">${fmtMoney(row.gross_funding_pnl)}</td>
                   <td class="${classForNumber(row.net_expected_pnl)}">${fmtMoney(row.net_expected_pnl)}</td>
                 </tr>`,
             )
@@ -1588,8 +1730,38 @@ function renderOpportunityDetail(items) {
     return;
   }
 
-  const fundingDelta = fundingSpread(item);
-  const hourlyDelta = fundingSpreadHourly(item);
+  const selectedProjection = bestProjection(item);
+  const fundingDelta = Number.isFinite(Number(selectedProjection?.carry_rate))
+    ? Number(selectedProjection.carry_rate)
+    : fundingSpread(item);
+  const hourlyDelta = Number.isFinite(
+    Number(selectedProjection?.carry_rate_hourly_equivalent),
+  )
+    ? Number(selectedProjection.carry_rate_hourly_equivalent)
+    : fundingSpreadHourly(item);
+  const grossFundingPNL = Number.isFinite(Number(selectedProjection?.gross_funding_pnl))
+    ? Number(selectedProjection.gross_funding_pnl)
+    : Number(item.gross_funding_pnl || 0);
+  const selectedLongEvents = Number.isFinite(
+    Number(selectedProjection?.long_funding_event_count),
+  )
+    ? Number(selectedProjection.long_funding_event_count)
+    : Number(item.long_funding_event_count || 0);
+  const selectedShortEvents = Number.isFinite(
+    Number(selectedProjection?.short_funding_event_count),
+  )
+    ? Number(selectedProjection.short_funding_event_count)
+    : Number(item.short_funding_event_count || 0);
+  const selectedProjectedFundingTimeMs = Number.isFinite(
+    Number(selectedProjection?.projected_funding_time_ms),
+  )
+    ? Number(selectedProjection.projected_funding_time_ms)
+    : Number(item.projected_funding_time_ms || item.latest_funding_time_ms || 0);
+  const selectedFundingWindowHours = Number.isFinite(
+    Number(selectedProjection?.funding_window_hours),
+  )
+    ? Number(selectedProjection.funding_window_hours)
+    : Number(item.funding_window_hours || 0);
   const nextLongMs = Number(item.long_funding_time_ms || 0) - Date.now();
   const nextShortMs = Number(item.short_funding_time_ms || 0) - Date.now();
   const matchedPlan = bestPlanForOpportunity(item);
@@ -1616,25 +1788,35 @@ function renderOpportunityDetail(items) {
       <div class="detail-metric-grid">
         ${detailMetric("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl))}
         ${detailMetric("净收益率", fmtSignedBps(item.net_expected_bps, 2), classForNumber(item.net_expected_bps))}
-        ${detailMetric("窗口内 funding carry", fmtPctRatio(fundingDelta, 5), classForNumber(fundingDelta))}
-        ${detailMetric("事件化时均 edge", fmtPctRatio(hourlyDelta, 5), classForNumber(hourlyDelta))}
+        ${detailMetric("优选窗口 Carry率", fmtPctRatio(fundingDelta, 5), classForNumber(fundingDelta))}
+        ${detailMetric("优选窗口时均 edge", fmtPctRatio(hourlyDelta, 5), classForNumber(hourlyDelta))}
         ${detailMetric("Basis", fmtSignedBps(item.basis_bps, 2))}
         ${detailMetric("动态价差阈值", fmtSignedBps(maxAllowedBasisForItem(item), 2))}
-        ${detailMetric("资金收益", fmtMoney(item.gross_funding_pnl), classForNumber(item.gross_funding_pnl))}
+        ${detailMetric("优选窗口资金收益", fmtMoney(grossFundingPNL), classForNumber(grossFundingPNL))}
         ${detailMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${detailMetric("预计投入资金", displayPlan ? fmtMoney(planCapitalAllocated(displayPlan), 2) : "--")}
         ${detailMetric("目标杠杆", displayPlan ? `${fmtNumber(planTargetLeverage(displayPlan), 2)}x` : "--")}
         ${detailMetric("Long / Short 杠杆", displayPlan ? `${fmtNumber(planLongLeverage(displayPlan), 2)}x / ${fmtNumber(planShortLeverage(displayPlan), 2)}x` : "--")}
         ${detailMetric("仓位指标", displayPlan ? (planPositionSkewBps(displayPlan) == null ? "--" : fmtSignedBps(planPositionSkewBps(displayPlan), 2)) : "--")}
         ${detailMetric("目标仓位(名义)", targetNotionalText(item, displayPlan))}
+        ${detailMetric("策略模式", strategyModeText(item.strategy_mode))}
+        ${detailMetric("持有模式", holdSelectionModeText(state.system?.strategy?.hold_selection_mode))}
+        ${detailMetric("持有上限", holdLimitText())}
+        ${detailMetric("结算后缓冲", closeGraceText())}
+        ${detailMetric("下次 Review", fmtTime(item.next_review_time_ms))}
+        ${detailMetric("共享 Boundary", fmtTime(item.sync_boundary_time_ms))}
+        ${detailMetric("Entry Path", `${Number(item.entry_path_segment_count || 0)} 段`)}
+        ${detailMetric("停止原因", item.entry_path_stop_reason || "--")}
         ${detailMetric("Long 结算倒计时", fmtDuration(nextLongMs))}
         ${detailMetric("Short 结算倒计时", fmtDuration(nextShortMs))}
-        ${detailMetric("预计 funding 兑现点", fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms))}
+        ${detailMetric("预计 funding 兑现", fmtTime(selectedProjectedFundingTimeMs))}
+        ${detailMetric("预计持有到", opportunityExpectedCloseText(item))}
         ${detailMetric("最晚入场时间", fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms))}
-        ${detailMetric("Funding 事件窗口", `${fmtNumber(item.funding_window_hours || 0, 2)} h`)}
-        ${detailMetric("建议持有时长", holdingDurationText(item))}
+        ${detailMetric("Funding 事件窗口", `${fmtNumber(selectedFundingWindowHours, 2)} h`)}
+        ${detailMetric("结算前持有", holdingDurationText(item))}
+        ${detailMetric("预计总持有", opportunityExpectedHoldText(item))}
         ${detailMetric("产生时间", fmtTime(opportunityProducedTimeMs(item)))}
-        ${detailMetric("Funding 事件次数", fundingEventsText(item))}
+        ${detailMetric("Funding 事件次数", `Long ${selectedLongEvents} 次 / Short ${selectedShortEvents} 次`)}
         ${detailMetric("估算模式", fundingEstimateModeText(item))}
         ${detailMetric("估算置信度", fundingEstimateConfidenceText(item))}
         ${detailMetric("平滑回看窗口", fundingSmoothingLookbackText())}
@@ -1658,15 +1840,15 @@ function renderOpportunityDetail(items) {
       </div>
 
       <div class="detail-grid-2">
-        ${fundingRuleSummaryCard("做多腿 funding rule", item.long_funding_rule, item.long_funding_event_count)}
-        ${fundingRuleSummaryCard("做空腿 funding rule", item.short_funding_rule, item.short_funding_event_count)}
+        ${fundingRuleSummaryCard("做多腿 funding rule", item.long_funding_rule, selectedLongEvents)}
+        ${fundingRuleSummaryCard("做空腿 funding rule", item.short_funding_rule, selectedShortEvents)}
       </div>
 
       <div class="detail-section detail-section-tight">
         <div class="detail-section-head">
           <div>
             <div class="detail-section-title">候选持有窗口 / Projection 明细</div>
-            <div class="detail-subtitle">同一条机会只保留一个最佳 projection 进入主列表，但这里会展示同方向下多个候选兑现窗口，帮助理解为什么最终选中了当前窗口。</div>
+            <div class="detail-subtitle">系统会在允许持有窗口内评估多个兑现点，主卡片展示当前策略选中的窗口，这里则展开所有候选路径。</div>
           </div>
           <span class="pill good">${Array.isArray(item.projection_details) ? item.projection_details.length : 0} 个窗口</span>
         </div>
@@ -1698,7 +1880,7 @@ function renderOpportunityDetail(items) {
           <div class="formula-box">
             净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲
             <br />
-            说明：这里不是只看“当前这一期” funding，而是按当前最优持有窗口估算；若只覆盖当前这一轮结算，则直接使用当前 funding 快照；若会跨到后续多轮结算，则对后续事件结合近期历史均值做平滑估算。
+            说明：这里不是只看“当前这一期” funding，而是按当前策略选中的持有窗口估算；若只覆盖当前这一轮结算，则直接使用当前 funding 快照；若会跨到后续多轮结算，则对后续事件结合近期历史均值做平滑估算。
           </div>
         </div>
 
@@ -1710,6 +1892,9 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">计划说明</span><span class="detail-v">${planStatus.reason || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">计划主键</span><span class="detail-v">${matchedPlan?.plan_key || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">计划状态</span><span class="detail-v">${matchedPlan?.status || "--"}</span></div>
+            <div class="detail-item"><span class="detail-k">持有模式</span><span class="detail-v">${holdSelectionModeText(state.system?.strategy?.hold_selection_mode)}</span></div>
+            <div class="detail-item"><span class="detail-k">持有上限</span><span class="detail-v">${holdLimitText()}</span></div>
+            <div class="detail-item"><span class="detail-k">结算后缓冲</span><span class="detail-v">${closeGraceText()}</span></div>
             <div class="detail-item"><span class="detail-k">Funding 计算模式</span><span class="detail-v">${fundingModeText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">当前机会批次</span><span class="detail-v">${state.currentOpportunityBatchId || item.batch_id || "--"}</span></div>
             <div class="detail-item"><span class="detail-k">机会产生时间</span><span class="detail-v">${fmtTime(opportunityProducedTimeMs(item))}</span></div>
@@ -1723,6 +1908,9 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">最早结算时间</span><span class="detail-v">${fmtTime(item.earliest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">最晚结算时间</span><span class="detail-v">${fmtTime(item.latest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">预计 funding 兑现点</span><span class="detail-v">${fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)}</span></div>
+            <div class="detail-item"><span class="detail-k">预计持有到</span><span class="detail-v">${opportunityExpectedCloseText(item)}</span></div>
+            <div class="detail-item"><span class="detail-k">结算前持有</span><span class="detail-v">${holdingDurationText(item)}</span></div>
+            <div class="detail-item"><span class="detail-k">预计总持有</span><span class="detail-v">${opportunityExpectedHoldText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">最晚入场时间</span><span class="detail-v">${fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">Funding 事件次数</span><span class="detail-v">${fundingEventsText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">Funding 事件窗口</span><span class="detail-v">${fmtNumber(item.funding_window_hours || 0, 2)} h</span></div>

@@ -69,6 +69,7 @@
 - `docs/multi_exchange_architecture.md`：多交易所架构设计，解释 Market/Trade adapter、canonical symbol、venue profile、execution 边界与后续演进原则。
 - `docs/unified_exchange_and_arbitrage_architecture_v1.md`：统一交易所接入与统一套利计算架构设计文档（v1），更聚焦“统一接入 + 统一套利计算主链”的专项设计。
 - `docs/arbitrage_algorithm_and_funding_timeline.md`：套利算法、funding 时间轴、机会计算与自动执行时序说明。
+- `docs/rolling_cycle_aligned_strategy_design.md`：按结算段滚动决策的 funding 套利设计，包含持续监控、续持、翻仓与新配置结构。
 - `docs/task_breakdown_v1.md`：实施任务拆解（Task Breakdown v1），记录工作包、验收标准、当前完成度与后续优先级。
 - `docs/code_design_v1_scanner_to_planner.md`：代码设计文档 v1，记录从 scanner 到 planner 的第一阶段设计。
 - `docs/code_design_v2_execution_safety.md`：代码设计文档 v2，记录执行安全、回滚与 auto-close safety 的设计。

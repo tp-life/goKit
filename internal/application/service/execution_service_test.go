@@ -453,6 +453,124 @@ func TestPlacePlanOrders_OpenPartialFailureTriggersHedgeClose(t *testing.T) {
 	}
 }
 
+func TestPlacePlanOrders_SplitsOpenLegByVenueMaxQty(t *testing.T) {
+	store := NewMarketStore()
+	longSymbol := entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "1", MinQty: "1"}
+	if err := longSymbol.SetExecutionMeta(entity.SymbolExecutionMeta{MarketMaxQty: 2}); err != nil {
+		t.Fatalf("set long symbol execution meta: %v", err)
+	}
+	store.UpsertSymbol(longSymbol)
+	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "1", MinQty: "1"})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
+
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, orderStatus: exchange.OrderStatus{Status: "FILLED", Terminal: true}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, orderStatus: exchange.OrderStatus{Status: "FILLED", Terminal: true}}
+	orderRepo := &testOrderRepo{}
+
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.store = store
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-split-open-max-qty",
+		Symbol:           "BTCUSDT",
+		LongExchange:     "longex",
+		ShortExchange:    "shortex",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          5,
+		ShortQty:         1,
+		LongEntryPrice:   101,
+		ShortEntryPrice:  102,
+		EntryMode:        "taker",
+	}
+
+	results, errMsg := svc.placePlanOrders(context.Background(), plan, "open", "auto")
+	if errMsg != "" {
+		t.Fatalf("expected split open flow without aggregated error, got %s", errMsg)
+	}
+	if len(longAdapter.placed) != 3 {
+		t.Fatalf("expected long leg to split into 3 child orders, got %d", len(longAdapter.placed))
+	}
+	wantQtys := []float64{2, 2, 1}
+	for i, want := range wantQtys {
+		if longAdapter.placed[i].Quantity != want {
+			t.Fatalf("expected child order %d qty %.0f, got %.8f", i, want, longAdapter.placed[i].Quantity)
+		}
+	}
+	if len(results) != 4 {
+		t.Fatalf("expected 4 order records after split open, got %d", len(results))
+	}
+	if len(orderRepo.items) != 4 {
+		t.Fatalf("expected 4 persisted order records, got %d", len(orderRepo.items))
+	}
+	if longAdapter.placed[1].ClientOrderID == longAdapter.placed[0].ClientOrderID || longAdapter.placed[2].ClientOrderID == longAdapter.placed[0].ClientOrderID {
+		t.Fatalf("expected split child orders to use distinct client order ids")
+	}
+}
+
+func TestPlacePlanOrders_SplitsHedgeCloseByVenueMaxQty(t *testing.T) {
+	store := NewMarketStore()
+	longSymbol := entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "1", MinQty: "1"}
+	if err := longSymbol.SetExecutionMeta(entity.SymbolExecutionMeta{LimitMaxQty: 2, MarketMaxQty: 2}); err != nil {
+		t.Fatalf("set long symbol execution meta: %v", err)
+	}
+	store.UpsertSymbol(longSymbol)
+	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "1", MinQty: "1"})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
+
+	longAdapter := &testTradeAdapter{
+		name:        "longex",
+		enabled:     true,
+		orderStatus: exchange.OrderStatus{Status: "FILLED", ExecutedQty: 2, Terminal: true},
+	}
+	shortAdapter := &testTradeAdapter{
+		name:     "shortex",
+		enabled:  true,
+		placeErr: errors.New("short leg failed"),
+	}
+
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.store = store
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-split-hedge-max-qty",
+		Symbol:           "BTCUSDT",
+		LongExchange:     "longex",
+		ShortExchange:    "shortex",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          5,
+		ShortQty:         1,
+		LongEntryPrice:   101,
+		ShortEntryPrice:  102,
+		EntryMode:        "taker",
+	}
+
+	results, errMsg := svc.placePlanOrders(context.Background(), plan, "open", "auto")
+	if !strings.Contains(errMsg, "short leg failed") {
+		t.Fatalf("expected aggregated error to include failed leg, got %s", errMsg)
+	}
+	if len(longAdapter.closed) != 3 {
+		t.Fatalf("expected hedge close to split into 3 child orders, got %d", len(longAdapter.closed))
+	}
+	wantQtys := []float64{2, 2, 1}
+	for i, want := range wantQtys {
+		req := longAdapter.closed[i]
+		if req.Quantity != want {
+			t.Fatalf("expected hedge child order %d qty %.0f, got %.8f", i, want, req.Quantity)
+		}
+		if !req.ReduceOnly {
+			t.Fatalf("expected hedge child order %d to be reduce-only", i)
+		}
+		if req.OrderType != "LIMIT" || req.TimeInForce != "IOC" {
+			t.Fatalf("expected hedge child order %d to use LIMIT/IOC, got %s/%s", i, req.OrderType, req.TimeInForce)
+		}
+	}
+	if len(results) != 7 {
+		t.Fatalf("expected 7 records (3 open split + 1 failed leg + 3 hedge split), got %d", len(results))
+	}
+}
+
 func TestPlacePlanOrders_ExecutesPrimaryLegsConcurrently(t *testing.T) {
 	store := NewMarketStore()
 	store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
@@ -1987,6 +2105,46 @@ func TestRunAutoOpen_RespectsMaxAutoOpenPerLoop(t *testing.T) {
 	}
 }
 
+func TestRunAutoOpen_WaitsForFreshPlanBatchAfterServiceStart(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			readyPlan("plan-auto-fresh", "BTC", "longex", "shortex", 100, 16, 1600),
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.MinNetPNL = 0.1
+	svc.markStarted(now)
+	seedAutoOpenMarket(svc.store, now, "BTC", "longex", "shortex", 100)
+
+	svc.runAutoOpen(context.Background())
+
+	if len(orderRepo.items) != 0 {
+		t.Fatalf("expected stale pre-start plan batch to be ignored, got %d order records", len(orderRepo.items))
+	}
+	if len(execRepo.items) != 0 {
+		t.Fatalf("expected no execution records before fresh batch arrives, got %d", len(execRepo.items))
+	}
+
+	planRepo.items[0].AsOfTimeMs = now.Add(time.Second).UnixMilli()
+
+	svc.runAutoOpen(context.Background())
+
+	if len(orderRepo.items) != 2 {
+		t.Fatalf("expected fresh post-start plan batch to open once, got %d order records", len(orderRepo.items))
+	}
+	if len(execRepo.items) != 1 {
+		t.Fatalf("expected one execution after fresh batch arrives, got %d", len(execRepo.items))
+	}
+}
+
 func TestRunAutoOpen_AutoAllocatesRemainingBudgetAcrossCandidates(t *testing.T) {
 	now := time.Now().UTC()
 	orderRepo := &testOrderRepo{}
@@ -2291,5 +2449,263 @@ func TestRunAutoClose_TriggersDrawdownGuardForLivePositions(t *testing.T) {
 	}
 	if rec.ClosedAtMs == 0 {
 		t.Fatal("expected close timestamp to be recorded")
+	}
+}
+
+func TestRunRollingMonitor_ContinueUpdatesReviewAnchor(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:               "plan-roll-continue",
+				RollingGroupKey:       buildRollingGroupKey("BTC", "aster", "binance"),
+				Symbol:                "BTC",
+				LongExchange:          "aster",
+				ShortExchange:         "binance",
+				StrategyMode:          StrategyModeRollingCycleAligned,
+				Status:                executionStateOpened,
+				LiveTrading:           true,
+				AutoClose:             true,
+				AllocatedNotionalUSDT: 1000,
+				TargetCloseTimeMs:     now.Add(-time.Minute).UnixMilli(),
+				NextReviewTimeMs:      now.Add(-2 * time.Minute).UnixMilli(),
+				CurrentSyncBoundaryMs: now.Add(58 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:            "plan-roll-continue",
+				RollingGroupKey:    buildRollingGroupKey("BTC", "aster", "binance"),
+				Symbol:             "BTC",
+				LongExchange:       "aster",
+				ShortExchange:      "binance",
+				LongVenueSymbol:    "BTCUSDT",
+				ShortVenueSymbol:   "BTCUSDT",
+				LongQty:            10,
+				ShortQty:           10,
+				LongEntryPrice:     100,
+				ShortEntryPrice:    100,
+				StrategyMode:       StrategyModeRollingCycleAligned,
+				NextReviewTimeMs:   now.Add(-2 * time.Minute).UnixMilli(),
+				SyncBoundaryTimeMs: now.Add(58 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "aster", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	shortAdapter := &testTradeAdapter{name: "binance", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"aster":   longAdapter,
+		"binance": shortAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.StrategyMode = StrategyModeRollingCycleAligned
+	svc.cfg.RollingReviewSettleGracePeriod = 0
+	svc.cfg.RollingReviewFreshSnapshotMaxWait = time.Second
+	svc.cfg.RollingReviewCloseOnSnapshotTimeout = true
+	svc.cfg.RollingReviewRequireIncrementalNetPositive = true
+	svc.cfg.RollingReviewMinIncrementalNetPNL = 0.1
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "aster", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "aster",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          -0.003,
+		FundingTimeMs:        now.Add(1 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 1,
+		EventTimeMs:          now.UnixMilli(),
+	})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          -0.012,
+		FundingTimeMs:        now.Add(2 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 4,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	svc.runRollingMonitor(context.Background())
+
+	rec, err := svc.execRepo.FindByPlanKey(context.Background(), "plan-roll-continue")
+	if err != nil {
+		t.Fatalf("expected execution record lookup to succeed, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected execution record to exist")
+	}
+	if rec.Status != executionStateOpened {
+		t.Fatalf("expected rolling continue to keep status opened, got %s", rec.Status)
+	}
+	if want := now.Add(1 * time.Hour).UnixMilli(); rec.NextReviewTimeMs != want {
+		t.Fatalf("expected next review to move to earliest current settlement, got %d want %d", rec.NextReviewTimeMs, want)
+	}
+	if want := now.Add(2 * time.Hour).UnixMilli(); rec.CurrentSyncBoundaryMs != want {
+		t.Fatalf("expected sync boundary to move forward, got %d want %d", rec.CurrentSyncBoundaryMs, want)
+	}
+	if rec.ReviewCount != 1 {
+		t.Fatalf("expected review count 1, got %d", rec.ReviewCount)
+	}
+	if rec.LastTransitionEvent != "rolling_review_continue" {
+		t.Fatalf("expected last transition event rolling_review_continue, got %s", rec.LastTransitionEvent)
+	}
+	if len(longAdapter.closed) != 0 || len(shortAdapter.closed) != 0 {
+		t.Fatalf("expected continue decision not to place close orders, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+}
+
+func TestRunRollingMonitor_FlipClosesCurrentAndOpensSuccessor(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	currentPlan := entity.ExecutionPlan{
+		PlanKey:             "plan-roll-old",
+		RollingGroupKey:     buildRollingGroupKey("BTC", "aster", "binance"),
+		Symbol:              "BTC",
+		LongExchange:        "aster",
+		ShortExchange:       "binance",
+		LongVenueSymbol:     "BTCUSDT",
+		ShortVenueSymbol:    "BTCUSDT",
+		LongQty:             10,
+		ShortQty:            10,
+		LongEntryPrice:      100,
+		ShortEntryPrice:     100,
+		RoundedNotionalUSDT: 1000,
+		TargetNotionalUSDT:  1000,
+		EntryMode:           "taker",
+		ExitMode:            "taker",
+		EntryFeePNL:         0.2,
+		ExitFeePNL:          0.2,
+		SlippagePNL:         0.1,
+		SafetyBufferPNL:     0.1,
+		StrategyMode:        StrategyModeRollingCycleAligned,
+		NextReviewTimeMs:    now.Add(-2 * time.Minute).UnixMilli(),
+		SyncBoundaryTimeMs:  now.Add(-2 * time.Minute).UnixMilli(),
+	}
+	successorPlan := entity.ExecutionPlan{
+		PlanKey:             "plan-roll-new",
+		RollingGroupKey:     buildRollingGroupKey("BTC", "aster", "binance"),
+		Symbol:              "BTC",
+		LongExchange:        "binance",
+		ShortExchange:       "aster",
+		LongVenueSymbol:     "BTCUSDT",
+		ShortVenueSymbol:    "BTCUSDT",
+		LongQty:             10,
+		ShortQty:            10,
+		LongEntryPrice:      100,
+		ShortEntryPrice:     100,
+		RoundedNotionalUSDT: 1000,
+		TargetNotionalUSDT:  1000,
+		EntryMode:           "taker",
+		ExitMode:            "taker",
+		EntryFeePNL:         0.2,
+		ExitFeePNL:          0.2,
+		SlippagePNL:         0.1,
+		SafetyBufferPNL:     0.1,
+		StrategyMode:        StrategyModeRollingCycleAligned,
+		Status:              "watching",
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:               currentPlan.PlanKey,
+				RollingGroupKey:       currentPlan.RollingGroupKey,
+				Symbol:                "BTC",
+				LongExchange:          "aster",
+				ShortExchange:         "binance",
+				StrategyMode:          StrategyModeRollingCycleAligned,
+				Status:                executionStateOpened,
+				LiveTrading:           true,
+				AutoClose:             true,
+				AllocatedNotionalUSDT: 1000,
+				TargetCloseTimeMs:     now.Add(-time.Minute).UnixMilli(),
+				NextReviewTimeMs:      currentPlan.NextReviewTimeMs,
+				CurrentSyncBoundaryMs: currentPlan.SyncBoundaryTimeMs,
+			},
+		},
+	}
+	planRepo := &testPlanRepo{items: []entity.ExecutionPlan{currentPlan, successorPlan}}
+
+	longAdapter := &testTradeAdapter{name: "aster", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	shortAdapter := &testTradeAdapter{name: "binance", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"aster":   longAdapter,
+		"binance": shortAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.StrategyMode = StrategyModeRollingCycleAligned
+	svc.cfg.MinNetPNL = 0.1
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.RollingFlipEnabled = true
+	svc.cfg.RollingFlipRequireNetPositive = true
+	svc.cfg.RollingFlipMinNetPNL = 0.1
+	svc.cfg.RollingFlipSlippageMultiplier = 1
+	svc.cfg.RollingFlipExtraSafetyBufferUSDT = 0
+	svc.cfg.RollingReviewSettleGracePeriod = 0
+	svc.cfg.RollingReviewFreshSnapshotMaxWait = time.Second
+	svc.cfg.RollingReviewCloseOnSnapshotTimeout = true
+	svc.cfg.RollingReviewRequireIncrementalNetPositive = true
+	svc.cfg.RollingReviewMinIncrementalNetPNL = 0.1
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "aster", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10", FundingIntervalHours: 1})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10", FundingIntervalHours: 1})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "aster", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.02, AskPrice: 100.03, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "aster",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          -0.001,
+		FundingTimeMs:        now.Add(1 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 1,
+		EventTimeMs:          now.UnixMilli(),
+	})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          -0.010,
+		FundingTimeMs:        now.Add(1 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 1,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	svc.runRollingMonitor(context.Background())
+
+	oldRec, err := svc.execRepo.FindByPlanKey(context.Background(), currentPlan.PlanKey)
+	if err != nil {
+		t.Fatalf("expected old execution record lookup to succeed, got %v", err)
+	}
+	if oldRec == nil {
+		t.Fatal("expected old execution record to exist")
+	}
+	if oldRec.Status != executionStateClosed {
+		t.Fatalf("expected flip to close old record, got %s", oldRec.Status)
+	}
+	if oldRec.SuccessorPlanKey != successorPlan.PlanKey {
+		t.Fatalf("expected old record to link successor plan, got %s", oldRec.SuccessorPlanKey)
+	}
+
+	newRec, err := svc.execRepo.FindByPlanKey(context.Background(), successorPlan.PlanKey)
+	if err != nil {
+		t.Fatalf("expected successor execution record lookup to succeed, got %v", err)
+	}
+	if newRec == nil {
+		t.Fatal("expected successor execution record to exist")
+	}
+	if newRec.PredecessorPlanKey != currentPlan.PlanKey {
+		t.Fatalf("expected successor to reference predecessor, got %s", newRec.PredecessorPlanKey)
+	}
+	if newRec.Status != executionStateOpened {
+		t.Fatalf("expected successor open to finish opened, got %s", newRec.Status)
+	}
+	if len(longAdapter.closed) != 1 || len(shortAdapter.closed) != 1 {
+		t.Fatalf("expected flip close to hit both venues, got aster=%d binance=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+	if len(longAdapter.placed) != 1 || len(shortAdapter.placed) != 1 {
+		t.Fatalf("expected successor open to place one order on each venue, got aster=%d binance=%d", len(longAdapter.placed), len(shortAdapter.placed))
 	}
 }

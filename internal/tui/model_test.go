@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"goKit/internal/application/service"
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 )
@@ -204,5 +205,21 @@ func TestEnsureMarketCmd_SkipsCurrentSymbolWhenSnapshotIsFresh(t *testing.T) {
 
 	if cmd := m.ensureMarketCmd(); cmd != nil {
 		t.Fatal("expected fresh market snapshot to skip refresh")
+	}
+}
+
+func TestOpportunityExpectedCloseTimeMs_RollingModeUsesNextReview(t *testing.T) {
+	nextReview := time.Now().Add(45 * time.Minute).UnixMilli()
+	projectedFunding := time.Now().Add(3 * time.Hour).UnixMilli()
+
+	got := opportunityExpectedCloseTimeMs(OpportunityListItem{
+		StrategyMode:           service.StrategyModeRollingCycleAligned,
+		NextReviewTimeMs:       nextReview,
+		ProjectedFundingTimeMs: projectedFunding,
+	}, ExecutionStatus{CloseGracePeriod: "15s"})
+
+	want := nextReview + 15_000
+	if got != want {
+		t.Fatalf("expected rolling expected close to use next review %d, got %d", want, got)
 	}
 }

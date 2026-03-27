@@ -60,6 +60,9 @@ type ExecutionService struct {
 	orderEventCh    chan exchange.OrderEvent
 	mu              sync.Mutex
 	exchangeFailure map[string]exchangeFailureState
+	startedAt       time.Time
+	autoOpenWarm    bool
+	warmupLogged    bool
 }
 
 func NewExecutionService(p ExecutionServiceParams) *ExecutionService {
@@ -80,6 +83,7 @@ func StartExecutionEngine(lc fx.Lifecycle, svc *ExecutionService) {
 	var cancel context.CancelFunc
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
+			svc.markStarted(time.Now().UTC())
 			runCtx, c := context.WithCancel(context.Background())
 			cancel = c
 			go svc.orderEventLoop(runCtx)
@@ -114,10 +118,19 @@ func (s *ExecutionService) loop(ctx context.Context) {
 				s.runAutoOpen(ctx)
 			}
 			if s.cfg.Execution.AutoClose {
+				s.runRollingMonitor(ctx)
 				s.runAutoClose(ctx)
 			}
 		}
 	}
+}
+
+func (s *ExecutionService) markStarted(startedAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startedAt = startedAt
+	s.autoOpenWarm = false
+	s.warmupLogged = false
 }
 
 func (s *ExecutionService) runAutoOpen(ctx context.Context) {
@@ -126,14 +139,20 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 		s.logger.Error("execution_auto_open_list_plans_failed", slog.Any("err", err))
 		return
 	}
+	if !s.ensureFreshPlanBatchAfterStart(plans) {
+		return
+	}
 	activeRecords, err := s.execRepo.ListActiveLive(ctx)
 	if err != nil {
 		s.logger.Error("execution_auto_open_list_active_records_failed", slog.Any("err", err))
 		return
 	}
+	activeRollingGroups := collectActiveRollingGroups(activeRecords)
 
 	candidates := make([]entity.ExecutionPlan, 0, len(plans))
 	for _, plan := range plans {
+		// 先做一轮轻量过滤，把明显不应参与 auto-open 的计划挡掉。
+		// 这样后面的预算分配和 open 调用只会面对“当前真的可能开出去”的候选。
 		if !plan.ReadyNow || strings.ToLower(plan.Status) != "ready" {
 			continue
 		}
@@ -143,6 +162,9 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 			continue
 		}
 		if rec != nil {
+			continue
+		}
+		if shouldBlockRollingAutoOpen(plan, activeRollingGroups) {
 			continue
 		}
 		candidates = append(candidates, plan)
@@ -183,6 +205,9 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 				break
 			}
 
+			// 自动预算模式不让第一条 candidate 独占全部剩余额度。
+			// 这里按“本轮剩余可开目标数”均摊预算，让同一轮里的多个 ready plan
+			// 至少有机会各自拿到一份可执行的目标名义。
 			scaledPlan, scaleErr := s.scalePlanForAutoBudget(candidate, remainingBudget/float64(remainingTargets))
 			if scaleErr != nil {
 				s.logger.Warn(
@@ -199,13 +224,111 @@ func (s *ExecutionService) runAutoOpen(ctx context.Context) {
 		rec, openErr := s.openPlan(ctx, &planToOpen, "auto", s.cfg.Execution.Enabled)
 		openAttempts++
 		if rec != nil && countsTowardLivePlanLimit(*rec) {
+			// 一旦某条 plan 成功占用了 live slot，就立刻回写本轮 loop 的局部统计。
+			// 这样后续候选会立即感知：
+			// - 剩余预算减少了
+			// - 剩余 live slot 变少了
+			// - rolling group 可能已经被占住了
 			activeLiveCount++
 			activeAllocatedNotional += s.allocatedNotionalForRecord(ctx, *rec, &planToOpen)
+			if normalizedPlanStrategyMode(planToOpen) == StrategyModeRollingCycleAligned && strings.TrimSpace(planToOpen.RollingGroupKey) != "" {
+				activeRollingGroups[planToOpen.RollingGroupKey] = struct{}{}
+			}
 		}
 		if openErr != nil {
 			s.logger.Error("execution_auto_open_failed", slog.String("plan_key", planToOpen.PlanKey), slog.Any("err", openErr))
 		}
 	}
+}
+
+// ensureFreshPlanBatchAfterStart 防止服务刚重启时，自动开仓继续消费“重启前残留的旧批次计划”。
+//
+// 背景：
+//   - StrategyRunner 会按 opportunity_calc_interval 周期生成新的 opportunity / plan batch；
+//   - ExecutionService 的 auto-open 循环则会持续读取 execution_plans 最新批次；
+//   - 如果服务刚重启，而数据库里恰好还躺着一批旧模式/旧参数生成的 ready plan，
+//     就可能在“新批次尚未生成”的几秒内被误开出去。
+//
+// 这里的策略是：
+// - 只有当最新 plan batch 的 AsOfTimeMs 已经晚于本次服务启动时间，才允许 auto-open；
+// - 一旦看到过一批“启动后生成”的 plan，后续本次进程内就不再重复卡这道门。
+func (s *ExecutionService) ensureFreshPlanBatchAfterStart(plans []entity.ExecutionPlan) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.autoOpenWarm {
+		return true
+	}
+	if s.startedAt.IsZero() {
+		s.autoOpenWarm = true
+		return true
+	}
+
+	startedAtMs := s.startedAt.UnixMilli()
+	latestAsOfMs := int64(0)
+	for _, plan := range plans {
+		if plan.AsOfTimeMs > latestAsOfMs {
+			latestAsOfMs = plan.AsOfTimeMs
+		}
+	}
+	if latestAsOfMs >= startedAtMs {
+		s.autoOpenWarm = true
+		s.warmupLogged = false
+		s.logger.Info(
+			"execution_auto_open_fresh_plan_batch_ready",
+			slog.Time("started_at", s.startedAt),
+			slog.Int64("latest_plan_as_of_ms", latestAsOfMs),
+		)
+		return true
+	}
+	if !s.warmupLogged {
+		s.warmupLogged = true
+		s.logger.Info(
+			"execution_auto_open_waiting_for_fresh_plan_batch",
+			slog.Time("started_at", s.startedAt),
+			slog.Int64("latest_plan_as_of_ms", latestAsOfMs),
+		)
+	}
+	return false
+}
+
+// collectActiveRollingGroups 提前把“当前仍然活跃的 rolling 仓位组”收集出来。
+//
+// auto-open 在同一轮扫描里会读取一批 ready plan。
+// 如果不先做这层分组去重，就可能出现：
+// - 老仓位还没平；
+// - 新方向 plan 已经 ready；
+// - 系统又把同一组的 successor 提前开出来；
+// 最终同一币种 / 同一交易所对出现双持仓。
+func collectActiveRollingGroups(records []entity.ExecutionRecord) map[string]struct{} {
+	out := make(map[string]struct{}, len(records))
+	for _, rec := range records {
+		if normalizeStrategyMode(rec.StrategyMode, "") != StrategyModeRollingCycleAligned {
+			continue
+		}
+		key := strings.TrimSpace(rec.RollingGroupKey)
+		if key == "" {
+			continue
+		}
+		out[key] = struct{}{}
+	}
+	return out
+}
+
+func shouldBlockRollingAutoOpen(plan entity.ExecutionPlan, activeRollingGroups map[string]struct{}) bool {
+	if normalizedPlanStrategyMode(plan) != StrategyModeRollingCycleAligned {
+		return false
+	}
+	key := strings.TrimSpace(plan.RollingGroupKey)
+	if key == "" {
+		return false
+	}
+	_, blocked := activeRollingGroups[key]
+	return blocked
+}
+
+func normalizedPlanStrategyMode(plan entity.ExecutionPlan) string {
+	return normalizeStrategyMode(plan.StrategyMode, StrategyModeLegacyProjection)
 }
 
 func (s *ExecutionService) runAutoClose(ctx context.Context) {
@@ -380,7 +503,7 @@ func (s *ExecutionService) openPlan(ctx context.Context, plan *entity.ExecutionP
 	// - 它只依赖当前市场快照，不需要消耗交易 API；
 	// - 能先把“机会已经过期/恶化”的 plan 拦掉；
 	// - 也能减少在明显不该开仓时仍去拉余额、增加 API 压力。
-	if err := s.revalidatePlanBeforeOpen(time.Now().UTC(), plan); err != nil {
+	if err := s.revalidatePlanBeforeOpen(time.Now().UTC(), plan, trigger); err != nil {
 		if transitionErr := applyExecutionEvent(rec, executionEvent{
 			Name:         "open_revalidation_failed",
 			TargetStatus: executionStateRiskBlocked,
@@ -568,13 +691,17 @@ func (s *ExecutionService) newExecutionRecord(plan *entity.ExecutionPlan, live b
 		PlanKey:               plan.PlanKey,
 		BatchID:               plan.BatchID,
 		OpportunityBatchID:    plan.OpportunityBatchID,
+		RollingGroupKey:       plan.RollingGroupKey,
 		Symbol:                plan.Symbol,
 		LongExchange:          plan.LongExchange,
 		ShortExchange:         plan.ShortExchange,
+		StrategyMode:          normalizedPlanStrategyMode(*plan),
 		LiveTrading:           live,
 		AutoClose:             s.cfg.Execution.AutoClose,
 		AllocatedNotionalUSDT: firstPositiveFloat(plan.RoundedNotionalUSDT, plan.TargetNotionalUSDT),
 		TargetCloseTimeMs:     plan.TargetCloseTimeMs,
+		NextReviewTimeMs:      plan.NextReviewTimeMs,
+		CurrentSyncBoundaryMs: plan.SyncBoundaryTimeMs,
 	}
 }
 
@@ -609,6 +736,25 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 		{role: "long_leg", exchange: plan.LongExchange, side: ternarySide(phase == "open", "BUY", "SELL"), venueSymbol: plan.LongVenueSymbol, qty: plan.LongQty, price: plan.LongEntryPrice},
 		{role: "short_leg", exchange: plan.ShortExchange, side: ternarySide(phase == "open", "SELL", "BUY"), venueSymbol: plan.ShortVenueSymbol, qty: plan.ShortQty, price: plan.ShortEntryPrice},
 	}
+	buildOrderRecord := func(execStatus, phaseName, legRole, exchangeName string, reduceOnly bool, req exchange.TradeOrderRequest) entity.OrderRecord {
+		return entity.OrderRecord{
+			PlanKey:         plan.PlanKey,
+			ExecutionStatus: execStatus,
+			Phase:           phaseName,
+			LegRole:         legRole,
+			Exchange:        exchangeName,
+			Symbol:          plan.Symbol,
+			VenueSymbol:     req.VenueSymbol,
+			ClientOrderID:   req.ClientOrderID,
+			Side:            req.Side,
+			OrderType:       req.OrderType,
+			TimeInForce:     req.TimeInForce,
+			ReduceOnly:      reduceOnly,
+			RequestedQty:    req.Quantity,
+			RequestedPrice:  req.Price,
+			Status:          "PENDING",
+		}
+	}
 
 	// successfulLeg 只记录那些“主腿已经看起来成交成功”的结果。
 	//
@@ -630,9 +776,9 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 	// 3. 汇总 successes / errors；
 	// 4. 决定是否进入 hedge rollback。
 	type primaryLegResult struct {
-		record      entity.OrderRecord
-		errText     string
-		exposureLeg *exposedLeg
+		records      []entity.OrderRecord
+		errTexts     []string
+		exposureLegs []exposedLeg
 	}
 
 	// 对套利来说，两条主腿之间的时间差本身就是风险来源。
@@ -664,30 +810,14 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 			if strings.TrimSpace(trigger) != "" {
 				req.Reason = trigger
 			}
-			orderRecord := entity.OrderRecord{
-				PlanKey:         plan.PlanKey,
-				ExecutionStatus: phase,
-				Phase:           phase,
-				LegRole:         leg.role,
-				Exchange:        leg.exchange,
-				Symbol:          plan.Symbol,
-				VenueSymbol:     req.VenueSymbol,
-				ClientOrderID:   req.ClientOrderID,
-				Side:            req.Side,
-				OrderType:       req.OrderType,
-				TimeInForce:     req.TimeInForce,
-				ReduceOnly:      req.ReduceOnly,
-				RequestedQty:    req.Quantity,
-				RequestedPrice:  req.Price,
-				Status:          "PENDING",
-			}
+			orderRecord := buildOrderRecord(phase, phase, leg.role, leg.exchange, req.ReduceOnly, req)
 
 			if adapter == nil || !adapter.Enabled() {
 				orderRecord.Status = "SKIPPED"
 				orderRecord.ErrorMessage = fmt.Sprintf("trade adapter %s disabled or missing credentials", leg.exchange)
 				legResults[index] = primaryLegResult{
-					record:  orderRecord,
-					errText: orderRecord.ErrorMessage,
+					records:  []entity.OrderRecord{orderRecord},
+					errTexts: []string{orderRecord.ErrorMessage},
 				}
 				return
 			}
@@ -695,90 +825,103 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 				orderRecord.Status = "CIRCUIT_OPEN"
 				orderRecord.ErrorMessage = err.Error()
 				legResults[index] = primaryLegResult{
-					record:  orderRecord,
-					errText: orderRecord.ErrorMessage,
+					records:  []entity.OrderRecord{orderRecord},
+					errTexts: []string{orderRecord.ErrorMessage},
 				}
 				return
 			}
 
-			var (
-				resp exchange.TradeOrderResult
-				err  error
-			)
-			legCtx, cancel := s.primaryLegContext(ctx)
-			defer cancel()
-			if phase == "open" {
-				resp, err = adapter.PlaceOrder(legCtx, req)
-			} else {
-				resp, err = adapter.ClosePosition(legCtx, req)
+			// 交易所如果声明了单笔 maxQty，这里必须先拆单再发。
+			//
+			// 背后的原因是：
+			// 1. 执行层目标是“完成整条套利腿”，不是随便打一笔能过的单；
+			// 2. 如果只把请求数量截断到 maxQty，系统会误以为整条腿都已经提交，
+			//    实际上却只开出一部分，单腿风险更高；
+			// 3. 因此这里会把一条腿拆成多笔子单，并让每笔子单都进入原有的
+			//    reconcile / 落库 / hedge rollback 路径。
+			splitReqs, splitErr := splitTradeRequestsByVenueLimit(meta, req)
+			if splitErr != nil {
+				orderRecord.Status = "ERROR"
+				orderRecord.ErrorMessage = splitErr.Error()
+				legResults[index] = primaryLegResult{
+					records:  []entity.OrderRecord{orderRecord},
+					errTexts: []string{orderRecord.ErrorMessage},
+				}
+				return
 			}
-			if err != nil {
-				if s.isPrimaryLegTimeout(err) {
-					// 主腿超时并不等于“交易所一定没有接到这笔单”。
-					// 请求可能已经发出，只是响应在本地超时边界之后才回来。
-					//
-					// 因此这里不会立刻把它当成纯粹失败，而是：
-					// 1. 先把记录标成 TIMEOUT；
-					// 2. 再用同一个 client_order_id 做一轮 best-effort reconcile；
-					// 3. 如果查单/查仓证明它其实已经成交，就把这条腿重新归回成功路径。
-					orderRecord.Status = "TIMEOUT"
-					orderRecord.ErrorMessage = err.Error()
-					orderRecord = s.reconcileTimedOutPrimaryLeg(ctx, adapter, orderRecord, req)
-					if phase == "open" && !isOrderFullySatisfied(orderRecord) {
-						orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, req)
+
+			records := make([]entity.OrderRecord, 0, len(splitReqs))
+			errTexts := make([]string, 0, len(splitReqs))
+			exposureLegs := make([]exposedLeg, 0, len(splitReqs))
+			stopOnAttention := phase == "open"
+			for _, childReq := range splitReqs {
+				orderRecord = buildOrderRecord(phase, phase, leg.role, leg.exchange, childReq.ReduceOnly, childReq)
+
+				var (
+					resp exchange.TradeOrderResult
+					err  error
+				)
+				legCtx, cancel := s.primaryLegContext(ctx)
+				if phase == "open" {
+					resp, err = adapter.PlaceOrder(legCtx, childReq)
+				} else {
+					resp, err = adapter.ClosePosition(legCtx, childReq)
+				}
+				cancel()
+				if err != nil {
+					if s.isPrimaryLegTimeout(err) {
+						// 子单超时并不一定代表这笔子单真的没成交，所以仍然要立即 reconcile。
+						orderRecord.Status = "TIMEOUT"
+						orderRecord.ErrorMessage = err.Error()
+						orderRecord = s.reconcileTimedOutPrimaryLeg(ctx, adapter, orderRecord, childReq)
+						if phase == "open" && !isOrderFullySatisfied(orderRecord) {
+							orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, childReq)
+						}
+						if isOrderFullySatisfied(orderRecord) {
+							s.registerAPISuccess(leg.exchange)
+						}
+					} else {
+						orderRecord.Status = "ERROR"
+						orderRecord.ErrorMessage = err.Error()
 					}
-					if isOrderFullySatisfied(orderRecord) {
-						s.registerAPISuccess(leg.exchange)
-						var exposure *exposedLeg
-						if phase == "open" && orderHasOpenExposure(orderRecord) {
-							exposure = &exposedLeg{role: leg.role, exchange: leg.exchange, req: req}
-						}
-						legResults[index] = primaryLegResult{
-							record:      orderRecord,
-							exposureLeg: exposure,
-						}
-						return
+					if !isOrderFullySatisfied(orderRecord) {
+						s.registerAPIFailure(leg.exchange)
 					}
 				} else {
-					orderRecord.Status = "ERROR"
-					orderRecord.ErrorMessage = err.Error()
+					s.registerAPISuccess(leg.exchange)
+					orderRecord.Status = pickNonEmpty(resp.Status, "SUBMITTED")
+					orderRecord.VenueOrderID = resp.VenueOrderID
+					orderRecord.ExecutedQty = resp.ExecutedQty
+					orderRecord.AvgPrice = resp.AveragePrice
+					orderRecord.RawResponse = resp.RawResponse
+					orderRecord = s.reconcileOrder(ctx, adapter, orderRecord, childReq)
+					if phase == "open" && !isOrderFullySatisfied(orderRecord) {
+						orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, childReq)
+					}
 				}
-				s.registerAPIFailure(leg.exchange)
-				var exposure *exposedLeg
+
 				if phase == "open" && orderHasOpenExposure(orderRecord) {
-					exposure = &exposedLeg{role: leg.role, exchange: leg.exchange, req: req}
+					exposureReq := childReq
+					if hasMeaningfulExecutedQty(orderRecord.ExecutedQty, childReq.Quantity) {
+						exposureReq.Quantity = round8(math.Min(orderRecord.ExecutedQty, childReq.Quantity))
+					}
+					exposureLegs = append(exposureLegs, exposedLeg{role: leg.role, exchange: leg.exchange, req: exposureReq})
 				}
-				legResults[index] = primaryLegResult{
-					record:      orderRecord,
-					errText:     pickNonEmpty(orderRecord.ErrorMessage, fmt.Sprintf("%s:%s", leg.exchange, err.Error())),
-					exposureLeg: exposure,
+
+				records = append(records, orderRecord)
+				if !isOrderFullySatisfied(orderRecord) {
+					errTexts = append(errTexts, pickNonEmpty(orderRecord.ErrorMessage, describeOrderAttention(orderRecord)))
+					if stopOnAttention {
+						break
+					}
+				} else if orderRecord.ErrorMessage != "" {
+					errTexts = append(errTexts, orderRecord.ErrorMessage)
 				}
-				return
-			}
-
-			s.registerAPISuccess(leg.exchange)
-			orderRecord.Status = pickNonEmpty(resp.Status, "SUBMITTED")
-			orderRecord.VenueOrderID = resp.VenueOrderID
-			orderRecord.ExecutedQty = resp.ExecutedQty
-			orderRecord.AvgPrice = resp.AveragePrice
-			orderRecord.RawResponse = resp.RawResponse
-			orderRecord = s.reconcileOrder(ctx, adapter, orderRecord, req)
-			if phase == "open" && !isOrderFullySatisfied(orderRecord) {
-				orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, req)
-			}
-
-			var exposure *exposedLeg
-			if phase == "open" && orderHasOpenExposure(orderRecord) {
-				exposure = &exposedLeg{role: leg.role, exchange: leg.exchange, req: req}
-			}
-			errText := ""
-			if !isOrderFullySatisfied(orderRecord) {
-				errText = describeOrderAttention(orderRecord)
 			}
 			legResults[index] = primaryLegResult{
-				record:      orderRecord,
-				errText:     errText,
-				exposureLeg: exposure,
+				records:      records,
+				errTexts:     errTexts,
+				exposureLegs: exposureLegs,
 			}
 		}(idx, leg)
 	}
@@ -789,28 +932,29 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 	exposures := make([]exposedLeg, 0, 2)
 	primaryNeedsRecovery := false
 	for _, legResult := range legResults {
-		orderRecord := legResult.record
-		if !isOrderFullySatisfied(orderRecord) {
+		legFullySatisfied := len(legResult.records) > 0
+		for _, orderRecord := range legResult.records {
+			if !isOrderFullySatisfied(orderRecord) {
+				legFullySatisfied = false
+			}
+			_ = s.orderRepo.Create(ctx, &orderRecord)
+			results = append(results, orderRecord)
+			s.logger.Info("execution_order_placed",
+				slog.String("plan_key", plan.PlanKey),
+				slog.String("phase", phase),
+				slog.String("trigger", trigger),
+				slog.String("exchange", orderRecord.Exchange),
+				slog.String("symbol", plan.Symbol),
+				slog.String("side", orderRecord.Side),
+				slog.Float64("qty", orderRecord.RequestedQty),
+				slog.String("status", orderRecord.Status),
+			)
+		}
+		if !legFullySatisfied {
 			primaryNeedsRecovery = true
 		}
-		if legResult.errText != "" {
-			errors = append(errors, legResult.errText)
-		}
-		if legResult.exposureLeg != nil {
-			exposures = append(exposures, *legResult.exposureLeg)
-		}
-		_ = s.orderRepo.Create(ctx, &orderRecord)
-		results = append(results, orderRecord)
-		s.logger.Info("execution_order_placed",
-			slog.String("plan_key", plan.PlanKey),
-			slog.String("phase", phase),
-			slog.String("trigger", trigger),
-			slog.String("exchange", orderRecord.Exchange),
-			slog.String("symbol", plan.Symbol),
-			slog.String("side", orderRecord.Side),
-			slog.Float64("qty", orderRecord.RequestedQty),
-			slog.String("status", orderRecord.Status),
-		)
+		errors = append(errors, legResult.errTexts...)
+		exposures = append(exposures, legResult.exposureLegs...)
 	}
 
 	// 只有 open 阶段才会触发 hedge rollback。
@@ -841,48 +985,50 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 				okLeg.req.Quantity,
 				firstPositiveFloat(okLeg.req.Price, referencePriceForLeg(plan, okLeg.role)),
 			)
-			hedgeResp := exchange.TradeOrderResult{}
-			hedgeErr := error(nil)
-			rec := entity.OrderRecord{
-				PlanKey:         plan.PlanKey,
-				ExecutionStatus: "hedge_close",
-				Phase:           "hedge_close",
-				LegRole:         okLeg.role,
-				Exchange:        okLeg.exchange,
-				Symbol:          plan.Symbol,
-				VenueSymbol:     hedgeReq.VenueSymbol,
-				ClientOrderID:   hedgeReq.ClientOrderID,
-				Side:            hedgeReq.Side,
-				OrderType:       hedgeReq.OrderType,
-				TimeInForce:     hedgeReq.TimeInForce,
-				ReduceOnly:      true,
-				RequestedQty:    hedgeReq.Quantity,
-				RequestedPrice:  hedgeReq.Price,
-				Status:          "PENDING",
-			}
 			if adapter == nil || !adapter.Enabled() {
+				rec := buildOrderRecord("hedge_close", "hedge_close", okLeg.role, okLeg.exchange, true, hedgeReq)
 				rec.Status = "SKIPPED"
 				rec.ErrorMessage = fmt.Sprintf("hedge trade adapter %s disabled", okLeg.exchange)
 				errors = append(errors, rec.ErrorMessage)
+				_ = s.orderRepo.Create(ctx, &rec)
+				results = append(results, rec)
 			} else {
-				hedgeResp, hedgeErr = adapter.ClosePosition(ctx, hedgeReq)
-				if hedgeErr != nil {
-					s.registerAPIFailure(okLeg.exchange)
+				hedgeReqs, hedgeSplitErr := splitTradeRequestsByVenueLimit(meta, hedgeReq)
+				if hedgeSplitErr != nil {
+					rec := buildOrderRecord("hedge_close", "hedge_close", okLeg.role, okLeg.exchange, true, hedgeReq)
 					rec.Status = "ERROR"
-					rec.ErrorMessage = hedgeErr.Error()
-					errors = append(errors, fmt.Sprintf("hedge:%s:%s", okLeg.exchange, hedgeErr.Error()))
-				} else {
-					s.registerAPISuccess(okLeg.exchange)
-					rec.Status = pickNonEmpty(hedgeResp.Status, "SUBMITTED")
-					rec.VenueOrderID = hedgeResp.VenueOrderID
-					rec.ExecutedQty = hedgeResp.ExecutedQty
-					rec.AvgPrice = hedgeResp.AveragePrice
-					rec.RawResponse = hedgeResp.RawResponse
-					rec = s.reconcileOrder(ctx, adapter, rec, hedgeReq)
+					rec.ErrorMessage = hedgeSplitErr.Error()
+					errors = append(errors, fmt.Sprintf("hedge:%s:%s", okLeg.exchange, hedgeSplitErr.Error()))
+					_ = s.orderRepo.Create(ctx, &rec)
+					results = append(results, rec)
+					continue
+				}
+				for _, hedgeChildReq := range hedgeReqs {
+					hedgeResp := exchange.TradeOrderResult{}
+					hedgeErr := error(nil)
+					rec := buildOrderRecord("hedge_close", "hedge_close", okLeg.role, okLeg.exchange, true, hedgeChildReq)
+					hedgeResp, hedgeErr = adapter.ClosePosition(ctx, hedgeChildReq)
+					if hedgeErr != nil {
+						s.registerAPIFailure(okLeg.exchange)
+						rec.Status = "ERROR"
+						rec.ErrorMessage = hedgeErr.Error()
+						errors = append(errors, fmt.Sprintf("hedge:%s:%s", okLeg.exchange, hedgeErr.Error()))
+					} else {
+						s.registerAPISuccess(okLeg.exchange)
+						rec.Status = pickNonEmpty(hedgeResp.Status, "SUBMITTED")
+						rec.VenueOrderID = hedgeResp.VenueOrderID
+						rec.ExecutedQty = hedgeResp.ExecutedQty
+						rec.AvgPrice = hedgeResp.AveragePrice
+						rec.RawResponse = hedgeResp.RawResponse
+						rec = s.reconcileOrder(ctx, adapter, rec, hedgeChildReq)
+						if !isOrderFullySatisfied(rec) {
+							errors = append(errors, describeOrderAttention(rec))
+						}
+					}
+					_ = s.orderRepo.Create(ctx, &rec)
+					results = append(results, rec)
 				}
 			}
-			_ = s.orderRepo.Create(ctx, &rec)
-			results = append(results, rec)
 		}
 	}
 
@@ -1210,6 +1356,59 @@ func (s *ExecutionService) buildRecoveryCloseRequest(plan *entity.ExecutionPlan,
 		ClientOrderID:   buildClientOrderID(plan, "hedge", legRole),
 		Reason:          "open_leg_failed_hedge",
 	}
+}
+
+func splitClientOrderID(base string, part int) string {
+	base = strings.TrimSpace(base)
+	if base == "" || part <= 1 {
+		return base
+	}
+	return fmt.Sprintf("%s-p%d", base, part)
+}
+
+// splitTradeRequestsByVenueLimit 会在交易所声明了单笔 maxQty 时，自动把一笔大单拆成多笔子单。
+//
+// 设计取舍：
+// 1. 不简单把数量截断到 maxQty，因为那会留下“只开出一半”的单腿风险；
+// 2. 也不在 adapter 内部偷偷聚合，因为执行层需要把每一笔子单都落成 OrderRecord；
+// 3. 因此拆单发生在执行层，请求仍按原来的风控/落库/回补路径逐笔处理。
+func splitTradeRequestsByVenueLimit(meta entity.Symbol, req exchange.TradeOrderRequest) ([]exchange.TradeOrderRequest, error) {
+	maxQty := meta.ExecutionMeta().MaxQtyForOrderType(req.OrderType)
+	if maxQty <= 0 || req.Quantity <= maxQty+1e-9 {
+		return []exchange.TradeOrderRequest{req}, nil
+	}
+
+	minQty := parseFloat(meta.MinQty)
+	remaining := roundDownStep(req.Quantity, meta.StepSize)
+	if remaining <= 0 {
+		return nil, fmt.Errorf("invalid order quantity %.8f after step rounding", req.Quantity)
+	}
+
+	out := make([]exchange.TradeOrderRequest, 0, int(math.Ceil(remaining/math.Max(maxQty, 1))))
+	for part := 1; remaining > 1e-9; part++ {
+		chunkQty := math.Min(remaining, maxQty)
+		chunkQty = roundDownStep(chunkQty, meta.StepSize)
+		if chunkQty <= 0 {
+			return nil, fmt.Errorf("unable to split quantity %.8f with max_qty %.8f and step_size %s", req.Quantity, maxQty, meta.StepSize)
+		}
+		nextRemaining := roundDownStep(remaining-chunkQty, meta.StepSize)
+		if nextRemaining > 1e-9 && minQty > 0 && nextRemaining < minQty {
+			mergedQty := roundDownStep(remaining, meta.StepSize)
+			if mergedQty > 0 && mergedQty <= maxQty+1e-9 {
+				chunkQty = mergedQty
+				nextRemaining = 0
+			} else {
+				return nil, fmt.Errorf("unable to split quantity %.8f into valid chunks under max_qty %.8f and min_qty %.8f", req.Quantity, maxQty, minQty)
+			}
+		}
+
+		chunkReq := req
+		chunkReq.Quantity = round8(chunkQty)
+		chunkReq.ClientOrderID = splitClientOrderID(req.ClientOrderID, part)
+		out = append(out, chunkReq)
+		remaining = nextRemaining
+	}
+	return out, nil
 }
 
 func (s *ExecutionService) tradeCapabilities(exchangeName string) exchange.TradeCapabilities {

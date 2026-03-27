@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -113,6 +114,7 @@ type exchangeInfoFilter struct {
 	TickSize    string `json:"tickSize"`
 	StepSize    string `json:"stepSize"`
 	MinQty      string `json:"minQty"`
+	MaxQty      string `json:"maxQty"`
 	Notional    string `json:"notional"`
 	MinNotional string `json:"minNotional"`
 }
@@ -128,6 +130,11 @@ type exchangeInfoSymbol struct {
 
 type exchangeInfoResponse struct {
 	Symbols []exchangeInfoSymbol `json:"symbols"`
+}
+
+func parseExchangeInfoFloat(raw string) float64 {
+	value, _ := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	return value
 }
 
 type fundingInfoItem struct {
@@ -196,17 +203,38 @@ func (c *CEXMarketClient) FetchTradableSymbols(ctx context.Context, quoteAsset s
 			Enabled:              true,
 			Watched:              true,
 		}
+		execMeta := entity.SymbolExecutionMeta{}
 
 		for _, f := range sym.Filters {
 			switch f.FilterType {
 			case "PRICE_FILTER":
 				item.TickSize = f.TickSize
-			case "LOT_SIZE", "MARKET_LOT_SIZE":
+			case "LOT_SIZE":
 				if item.StepSize == "" {
 					item.StepSize = f.StepSize
 				}
 				if item.MinQty == "" {
 					item.MinQty = f.MinQty
+				}
+				if maxQty := parseExchangeInfoFloat(f.MaxQty); maxQty > 0 {
+					execMeta.LimitMaxQty = maxQty
+				}
+			case "MARKET_LOT_SIZE":
+				// Binance-like venue 经常同时返回 LOT_SIZE 和 MARKET_LOT_SIZE。
+				// 对策略来说，两者都要保留：
+				// - LOT_SIZE    决定 LIMIT/IOC 这类路径的单笔上限；
+				// - MARKET_LOT_SIZE 决定 MARKET 单的单笔上限。
+				//
+				// 如果这里只有 MARKET_LOT_SIZE，也继续回填 step/min，
+				// 避免执行层连最基本的数量取整信息都拿不到。
+				if item.StepSize == "" {
+					item.StepSize = f.StepSize
+				}
+				if item.MinQty == "" {
+					item.MinQty = f.MinQty
+				}
+				if maxQty := parseExchangeInfoFloat(f.MaxQty); maxQty > 0 {
+					execMeta.MarketMaxQty = maxQty
 				}
 			case "MIN_NOTIONAL":
 				if f.MinNotional != "" {
@@ -215,6 +243,12 @@ func (c *CEXMarketClient) FetchTradableSymbols(ctx context.Context, quoteAsset s
 					item.MinNotional = f.Notional
 				}
 			}
+		}
+		if execMeta.MarketMaxQty <= 0 {
+			execMeta.MarketMaxQty = execMeta.LimitMaxQty
+		}
+		if err := item.SetExecutionMeta(execMeta); err != nil {
+			return nil, err
 		}
 
 		if interval, ok := intervals[item.VenueSymbol]; ok && interval > 0 {

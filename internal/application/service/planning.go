@@ -35,6 +35,7 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 			OpportunityBatchID:           opportunityBatchID,
 			Symbol:                       opp.Symbol,
 			Status:                       "watching",
+			RollingGroupKey:              buildRollingGroupKey(opp.Symbol, opp.LongExchange, opp.ShortExchange),
 			LongExchange:                 opp.LongExchange,
 			ShortExchange:                opp.ShortExchange,
 			LongVenueSymbol:              longMeta.VenueSymbol,
@@ -67,10 +68,17 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 			LongFundingEventCount:        opp.LongFundingEventCount,
 			ShortFundingEventCount:       opp.ShortFundingEventCount,
 			FundingWindowHours:           opp.FundingWindowHours,
+			StrategyMode:                 normalizeStrategyMode(opp.StrategyMode, StrategyModeLegacyProjection),
 			FundingComputationMode:       opp.FundingComputationMode,
+			NextReviewTimeMs:             opp.NextReviewTimeMs,
+			SyncBoundaryTimeMs:           opp.SyncBoundaryTimeMs,
+			EntryPathSegmentCount:        opp.EntryPathSegmentCount,
+			EntryPathStopReason:          opp.EntryPathStopReason,
 			AsOfTimeMs:                   now.UnixMilli(),
 		}
 
+		// 机会层更关心“收益在什么时候兑现”，执行层则更关心“何时必须开仓/复核”。
+		// 因此这里先算出 entry / exit 的通用时间锚，再按 strategy mode 调整 target close。
 		entryAnchor := opp.RequiredEntryByFundingTimeMs
 		if entryAnchor <= 0 {
 			entryAnchor = opp.EarliestFundingTimeMs
@@ -83,6 +91,19 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 		plan.EntryWindowOpenMs = entryAnchor - r.cfg.EntryLeadTime.Milliseconds()
 		plan.EntryWindowCloseMs = entryAnchor - r.cfg.EntryCutoffTime.Milliseconds()
 		plan.TargetCloseTimeMs = exitAnchor + r.cfg.Execution.CloseGracePeriod.Milliseconds()
+		if plan.StrategyMode == StrategyModeRollingCycleAligned && plan.NextReviewTimeMs > 0 {
+			// rolling 模式的首个 execution target 不是“最终预测收益结束点”，
+			// 而是“下一次必须重新 review 的结算点”。
+			//
+			// 这样开仓后系统会在最近 settlement 处重新判断：
+			// - 继续持有
+			// - 平仓
+			// - 方向反转后翻仓
+			//
+			// 机会页里展示的 ProjectedFundingTimeMs 仍然保留 entry path 的收益终点，
+			// 但执行记录上的 TargetCloseTimeMs 会优先锚到 NextReviewTimeMs。
+			plan.TargetCloseTimeMs = plan.NextReviewTimeMs + r.cfg.RollingReviewSettleGracePeriod.Milliseconds()
+		}
 
 		plan.LongEntryPrice = round6(longBook.AskPrice)
 		plan.ShortEntryPrice = round6(shortBook.BidPrice)
@@ -249,6 +270,25 @@ func buildPlanKey(plan entity.ExecutionPlan) string {
 	}, "|")
 	sum := sha1.Sum([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// buildRollingGroupKey 把“同一币种、同一交易所对”的 rolling 计划归到同一组。
+//
+// 它刻意不编码当前方向，因此：
+// - Long A / Short B
+// - Long B / Short A
+// 得到的 group key 一样。
+//
+// 这能让执行层在同一时刻只允许一条 rolling group 持仓存活，
+// 避免方向切换时出现同组双开。
+func buildRollingGroupKey(symbol, leftExchange, rightExchange string) string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	left := strings.ToLower(strings.TrimSpace(leftExchange))
+	right := strings.ToLower(strings.TrimSpace(rightExchange))
+	if left > right {
+		left, right = right, left
+	}
+	return strings.Join([]string{symbol, left, right}, "|")
 }
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }

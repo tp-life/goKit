@@ -165,6 +165,14 @@ func (s *ExecutionService) evaluateAutoCloseCandidate(ctx context.Context, now t
 }
 
 func describeIdleAutoCloseReason(now time.Time, rec entity.ExecutionRecord) string {
+	if normalizeStrategyMode(rec.StrategyMode, StrategyModeLegacyProjection) == StrategyModeRollingCycleAligned {
+		if rec.NextReviewTimeMs > 0 && now.UnixMilli() < rec.NextReviewTimeMs {
+			return fmt.Sprintf("rolling review is waiting until %s; only safety guards are active", time.UnixMilli(rec.NextReviewTimeMs).Local().Format("2006-01-02 15:04:05"))
+		}
+		if rec.NextReviewTimeMs > 0 {
+			return fmt.Sprintf("rolling review point %s has been reached; waiting for rolling monitor decision", time.UnixMilli(rec.NextReviewTimeMs).Local().Format("2006-01-02 15:04:05"))
+		}
+	}
 	if rec.TargetCloseTimeMs > 0 && now.UnixMilli() < rec.TargetCloseTimeMs {
 		return fmt.Sprintf("waiting until target close time %s; safety guards are not triggered", time.UnixMilli(rec.TargetCloseTimeMs).Local().Format("2006-01-02 15:04:05"))
 	}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -277,6 +278,321 @@ func TestProjectFundingCarry_FourHourHoldStillUsesCurrentEventWindow(t *testing.
 	}
 }
 
+func TestEvaluateOpportunityProjectionWindows_SelectsHighestNetWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{SlippageBps: 0, SafetyBufferUSDT: 0}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	windows := r.evaluateOpportunityProjectionWindows(
+		now,
+		"BTC",
+		"binance",
+		"aster",
+		[]fundingProjection{
+			{ProjectedFundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingWindowHours: 1, CarryRate: 0.0010, CarryRateHourlyEquivalent: 0.0010, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(4 * time.Hour).UnixMilli(), FundingWindowHours: 4, CarryRate: 0.0030, CarryRateHourlyEquivalent: 0.00075, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+		},
+		1000,
+		1,
+		1,
+		0,
+	)
+	best, ok := selectBestOpportunityProjection(r.cfg, windows)
+	if !ok {
+		t.Fatal("expected best projection to be selected")
+	}
+	if want := now.Add(4 * time.Hour).UnixMilli(); best.Projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected 4h window to win by net pnl, got %d", best.Projection.ProjectedFundingTimeMs)
+	}
+	if !windows[1].Detail.IsBestProjection || windows[0].Detail.IsBestProjection {
+		t.Fatalf("expected only second window to be marked best, got %+v", windows)
+	}
+}
+
+func TestProjectFundingCarry_LatestProfitablePrefersLatestPositiveWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		HoldHours:                    4,
+		HoldSelectionMode:            HoldSelectionModeLatestProfitable,
+		FundingRateContinuationDecay: 1,
+	}}
+	now := time.Date(2026, 1, 1, 18, 40, 0, 0, time.UTC)
+
+	long := entity.FundingSnapshot{
+		FundingRate:          0.0001,
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          0.0004,
+		FundingTimeMs:        time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if !ok {
+		t.Fatalf("expected projection to be valid")
+	}
+	if want := time.Date(2026, 1, 1, 22, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected latest profitable projection at 22:00, got %d", projection.ProjectedFundingTimeMs)
+	}
+	if projection.LongFundingEventCount != 1 || projection.ShortFundingEventCount != 4 {
+		t.Fatalf("expected latest profitable window to include long=1 short=4 events, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+	}
+}
+
+func TestProjectFundingCarry_StrictTargetPinsLatestWindowEvenWhenCarryTurnsNegative(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		HoldHours:                    4,
+		HoldSelectionMode:            HoldSelectionModeStrictTarget,
+		FundingRateContinuationDecay: 1,
+	}}
+	now := time.Date(2026, 1, 1, 18, 40, 0, 0, time.UTC)
+
+	long := entity.FundingSnapshot{
+		FundingRate:          0.0020,
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          0.0004,
+		FundingTimeMs:        time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if !ok {
+		t.Fatalf("expected projection to be valid")
+	}
+	if want := time.Date(2026, 1, 1, 22, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected strict target projection at 22:00, got %d", projection.ProjectedFundingTimeMs)
+	}
+	if projection.CarryRate >= 0 {
+		t.Fatalf("expected strict target latest window to preserve negative carry, got %.8f", projection.CarryRate)
+	}
+}
+
+func TestEvaluateOpportunityProjectionWindows_LatestProfitablePicksLatestQualifiedWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		HoldSelectionMode: HoldSelectionModeLatestProfitable,
+		MinNetPNL:         1.5,
+		SlippageBps:       0,
+		SafetyBufferUSDT:  0,
+	}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	windows := r.evaluateOpportunityProjectionWindows(
+		now,
+		"BTC",
+		"binance",
+		"aster",
+		[]fundingProjection{
+			{ProjectedFundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingWindowHours: 1, CarryRate: 0.0018, CarryRateHourlyEquivalent: 0.0018, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(2 * time.Hour).UnixMilli(), FundingWindowHours: 2, CarryRate: 0.0022, CarryRateHourlyEquivalent: 0.0011, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(4 * time.Hour).UnixMilli(), FundingWindowHours: 4, CarryRate: 0.0017, CarryRateHourlyEquivalent: 0.000425, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+		},
+		1000,
+		0,
+		0,
+		0,
+	)
+
+	best, ok := selectBestOpportunityProjection(r.cfg, windows)
+	if !ok {
+		t.Fatal("expected latest profitable projection to be selected")
+	}
+	if want := now.Add(4 * time.Hour).UnixMilli(); best.Projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected latest qualified window at 4h, got %d", best.Projection.ProjectedFundingTimeMs)
+	}
+	if !windows[2].Detail.IsBestProjection || windows[0].Detail.IsBestProjection || windows[1].Detail.IsBestProjection {
+		t.Fatalf("expected only latest qualified window to be marked best, got %+v", windows)
+	}
+}
+
+func TestEvaluateOpportunityProjectionWindows_LatestProfitableFallsBackToBestNet(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		HoldSelectionMode: HoldSelectionModeLatestProfitable,
+		MinNetPNL:         1.5,
+		SlippageBps:       0,
+		SafetyBufferUSDT:  0,
+	}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	windows := r.evaluateOpportunityProjectionWindows(
+		now,
+		"BTC",
+		"binance",
+		"aster",
+		[]fundingProjection{
+			{ProjectedFundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingWindowHours: 1, CarryRate: 0.0010, CarryRateHourlyEquivalent: 0.0010, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(2 * time.Hour).UnixMilli(), FundingWindowHours: 2, CarryRate: 0.0014, CarryRateHourlyEquivalent: 0.0007, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(4 * time.Hour).UnixMilli(), FundingWindowHours: 4, CarryRate: 0.0012, CarryRateHourlyEquivalent: 0.0003, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+		},
+		1000,
+		0,
+		0,
+		0,
+	)
+
+	best, ok := selectBestOpportunityProjection(r.cfg, windows)
+	if !ok {
+		t.Fatal("expected fallback projection to be selected")
+	}
+	if want := now.Add(2 * time.Hour).UnixMilli(); best.Projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected fallback to highest-net window at 2h, got %d", best.Projection.ProjectedFundingTimeMs)
+	}
+	if !windows[1].Detail.IsBestProjection || windows[0].Detail.IsBestProjection || windows[2].Detail.IsBestProjection {
+		t.Fatalf("expected fallback best-net window to be marked best, got %+v", windows)
+	}
+}
+
+func TestEvaluateOpportunityProjectionWindows_StrictTargetPinsLatestWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		HoldSelectionMode: HoldSelectionModeStrictTarget,
+		MinNetPNL:         1.5,
+		SlippageBps:       0,
+		SafetyBufferUSDT:  0,
+	}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	windows := r.evaluateOpportunityProjectionWindows(
+		now,
+		"BTC",
+		"binance",
+		"aster",
+		[]fundingProjection{
+			{ProjectedFundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingWindowHours: 1, CarryRate: 0.0022, CarryRateHourlyEquivalent: 0.0022, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(4 * time.Hour).UnixMilli(), FundingWindowHours: 4, CarryRate: 0.0010, CarryRateHourlyEquivalent: 0.00025, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+		},
+		1000,
+		0,
+		0,
+		0,
+	)
+
+	best, ok := selectBestOpportunityProjection(r.cfg, windows)
+	if !ok {
+		t.Fatal("expected strict target projection to be selected")
+	}
+	if want := now.Add(4 * time.Hour).UnixMilli(); best.Projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected strict target to pin 4h window, got %d", best.Projection.ProjectedFundingTimeMs)
+	}
+	if best.Detail.NetExpectedPNL >= r.cfg.MinNetPNL {
+		t.Fatalf("expected strict target example to stay below min net pnl, got %.4f", best.Detail.NetExpectedPNL)
+	}
+	if !windows[1].Detail.IsBestProjection || windows[0].Detail.IsBestProjection {
+		t.Fatalf("expected latest window to be marked best under strict_target, got %+v", windows)
+	}
+}
+
+func TestEvaluateOpportunityProjectionWindows_RepricesPenaltiesPerWindow(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{SlippageBps: 2, SafetyBufferUSDT: 0}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	windows := r.evaluateOpportunityProjectionWindows(
+		now,
+		"BTC",
+		"binance",
+		"aster",
+		[]fundingProjection{
+			{ProjectedFundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingWindowHours: 1, CarryRate: 0.0020, CarryRateHourlyEquivalent: 0.0020, LongFundingEventCount: 1, ShortFundingEventCount: 1},
+			{ProjectedFundingTimeMs: now.Add(8 * time.Hour).UnixMilli(), FundingWindowHours: 8, CarryRate: 0.0020, CarryRateHourlyEquivalent: 0.00025, LongFundingEventCount: 3, ShortFundingEventCount: 3},
+		},
+		1000,
+		0,
+		0,
+		0,
+	)
+	if len(windows) != 2 {
+		t.Fatalf("expected 2 windows, got %d", len(windows))
+	}
+	if windows[1].ExecutionPenaltyBps <= windows[0].ExecutionPenaltyBps {
+		t.Fatalf("expected long window penalty %.4f to exceed short window penalty %.4f", windows[1].ExecutionPenaltyBps, windows[0].ExecutionPenaltyBps)
+	}
+	if windows[1].Detail.NetExpectedPNL >= windows[0].Detail.NetExpectedPNL {
+		t.Fatalf("expected long window net pnl %.4f to be lower after repricing, got short=%.4f long=%.4f", windows[1].Detail.NetExpectedPNL, windows[0].Detail.NetExpectedPNL, windows[1].Detail.NetExpectedPNL)
+	}
+}
+
+func TestSelectBetterDirectionCandidate_UsesFinalNetAcrossDirections(t *testing.T) {
+	cfg := Config{HoldSelectionMode: HoldSelectionModeLatestProfitable}
+
+	left := evaluatedDirectionCandidate{
+		LongExchange:  "aster",
+		ShortExchange: "binance",
+		PrimaryWindow: opportunityProjectionEvaluation{
+			Projection: fundingProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0072,
+			},
+			Detail: entity.OpportunityProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0072,
+				NetExpectedPNL:         6.0,
+			},
+		},
+	}
+	right := evaluatedDirectionCandidate{
+		LongExchange:  "binance",
+		ShortExchange: "aster",
+		PrimaryWindow: opportunityProjectionEvaluation{
+			Projection: fundingProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0050,
+			},
+			Detail: entity.OpportunityProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0050,
+				NetExpectedPNL:         7.5,
+			},
+		},
+	}
+
+	if !selectBetterDirectionCandidate(cfg, right, left) {
+		t.Fatalf("expected reverse direction to win when its final selected window has higher net pnl")
+	}
+	if selectBetterDirectionCandidate(cfg, left, right) {
+		t.Fatalf("expected lower-net direction to lose even when its carry rate is higher")
+	}
+}
+
+func TestSelectBetterDirectionCandidate_PrefersLaterWindowOnNetTieInLatestMode(t *testing.T) {
+	cfg := Config{HoldSelectionMode: HoldSelectionModeLatestProfitable}
+
+	earlier := evaluatedDirectionCandidate{
+		LongExchange:  "aster",
+		ShortExchange: "binance",
+		PrimaryWindow: opportunityProjectionEvaluation{
+			Projection: fundingProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0060,
+			},
+			Detail: entity.OpportunityProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0060,
+				NetExpectedPNL:         6.0,
+			},
+		},
+	}
+	later := evaluatedDirectionCandidate{
+		LongExchange:  "binance",
+		ShortExchange: "aster",
+		PrimaryWindow: opportunityProjectionEvaluation{
+			Projection: fundingProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0060,
+			},
+			Detail: entity.OpportunityProjection{
+				ProjectedFundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+				CarryRate:              0.0060,
+				NetExpectedPNL:         6.0,
+			},
+		},
+	}
+
+	if !selectBetterDirectionCandidate(cfg, later, earlier) {
+		t.Fatalf("expected later window to win tie-break under latest_profitable")
+	}
+}
+
 func TestFundingRateEventMultiplier_Decay(t *testing.T) {
 	m := fundingRateEventMultiplier(5, 0.6)
 	if !(m > 2.3 && m < 2.31) {
@@ -460,6 +776,167 @@ func TestFundingRegimeProfile(t *testing.T) {
 	regime, confidence, _, _ = fundingRegimeProfile(0.1, 0.0003, 0.0002)
 	if regime != "stable_carry" || confidence != "high" {
 		t.Fatalf("unexpected stable regime=%s confidence=%s", regime, confidence)
+	}
+}
+
+func TestBuildRollingDirectionalFundingPlan_BuildsSingleRealAndForecastBeforeBoundary(t *testing.T) {
+	cfg := Config{
+		StrategyMode: StrategyModeRollingCycleAligned,
+		HoldHours:    4,
+		RollingEntryPathRequireConsistentDirection:     true,
+		RollingAllowIntermediateForecastBeforeBoundary: true,
+		RollingForbidBoundaryForecast:                  true,
+	}.normalize()
+
+	now := time.Date(2026, 1, 1, 13, 48, 0, 0, time.UTC)
+	longFunding := entity.FundingSnapshot{
+		Exchange:             "aster",
+		FundingRate:          -0.00356,
+		FundingTimeMs:        time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+	shortFunding := entity.FundingSnapshot{
+		Exchange:             "binance",
+		FundingRate:          -0.012,
+		FundingTimeMs:        time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+
+	plan := buildRollingDirectionalFundingPlan(
+		cfg,
+		now,
+		"aster",
+		longFunding,
+		spotForecast(longFunding.FundingRate, 1),
+		"binance",
+		shortFunding,
+		spotForecast(shortFunding.FundingRate, 1),
+	)
+
+	if len(plan.Segments) != 2 {
+		t.Fatalf("expected 2 rolling segments before sync boundary, got %d", len(plan.Segments))
+	}
+	if plan.Segments[0].SegmentType != fundingSegmentTypeSingleReal || plan.Segments[1].SegmentType != fundingSegmentTypeSingleForecast {
+		t.Fatalf("expected [single_real, single_forecast], got [%s, %s]", plan.Segments[0].SegmentType, plan.Segments[1].SegmentType)
+	}
+	if len(plan.Projections) != 2 {
+		t.Fatalf("expected 2 entry-path projections, got %d", len(plan.Projections))
+	}
+	if want := time.Date(2026, 1, 1, 15, 0, 0, 0, time.UTC).UnixMilli(); plan.Projections[1].ProjectedFundingTimeMs != want {
+		t.Fatalf("expected latest profitable rolling projection at 15:00, got %d", plan.Projections[1].ProjectedFundingTimeMs)
+	}
+	if want := 0.00712; math.Abs(plan.Projections[1].CarryRate-want) > 1e-9 {
+		t.Fatalf("expected cumulative carry %.8f, got %.8f", want, plan.Projections[1].CarryRate)
+	}
+	if plan.Projections[1].StrategyMode != StrategyModeRollingCycleAligned {
+		t.Fatalf("expected rolling projection mode, got %s", plan.Projections[1].StrategyMode)
+	}
+	if plan.Projections[1].NextReviewTimeMs != longFunding.FundingTimeMs {
+		t.Fatalf("expected next review at first settlement %d, got %d", longFunding.FundingTimeMs, plan.Projections[1].NextReviewTimeMs)
+	}
+	if plan.Projections[1].SyncBoundaryTimeMs != shortFunding.FundingTimeMs {
+		t.Fatalf("expected sync boundary %d, got %d", shortFunding.FundingTimeMs, plan.Projections[1].SyncBoundaryTimeMs)
+	}
+	if plan.Projections[1].PathEndReason != fundingProjectionPathEndBoundary {
+		t.Fatalf("expected path to stop at sync boundary, got %s", plan.Projections[1].PathEndReason)
+	}
+}
+
+func TestBuildRollingDirectionalFundingPlan_StopsAtDirectionFlip(t *testing.T) {
+	cfg := Config{
+		StrategyMode: StrategyModeRollingCycleAligned,
+		HoldHours:    4,
+		RollingEntryPathRequireConsistentDirection:     true,
+		RollingAllowIntermediateForecastBeforeBoundary: true,
+		RollingForbidBoundaryForecast:                  true,
+	}.normalize()
+
+	now := time.Date(2026, 1, 1, 13, 48, 0, 0, time.UTC)
+	longFunding := entity.FundingSnapshot{
+		Exchange:             "aster",
+		FundingRate:          -0.00356,
+		FundingTimeMs:        time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+	shortFunding := entity.FundingSnapshot{
+		Exchange:             "binance",
+		FundingRate:          -0.012,
+		FundingTimeMs:        time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+
+	longForecast := fundingForecast{
+		CurrentRate:        longFunding.FundingRate,
+		BaselineRate:       0.001,
+		HistoryMean:        0.001,
+		Regime:             "sign_flip_risk",
+		Confidence:         "guarded",
+		MeanReversion:      0.5,
+		ContinuationDecay:  1,
+		EffectiveFloorRate: -0.01,
+		EffectiveCapRate:   0.01,
+	}
+
+	plan := buildRollingDirectionalFundingPlan(
+		cfg,
+		now,
+		"aster",
+		longFunding,
+		longForecast,
+		"binance",
+		shortFunding,
+		spotForecast(shortFunding.FundingRate, 1),
+	)
+
+	if len(plan.Segments) != 2 {
+		t.Fatalf("expected both segments to be available for inspection, got %d", len(plan.Segments))
+	}
+	if len(plan.Projections) != 1 {
+		t.Fatalf("expected entry path to stop before flipped forecast segment, got %d projections", len(plan.Projections))
+	}
+	if want := time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(); plan.Projections[0].ProjectedFundingTimeMs != want {
+		t.Fatalf("expected entry path to stop at first real segment, got %d", plan.Projections[0].ProjectedFundingTimeMs)
+	}
+	if plan.Projections[0].PathEndReason != fundingProjectionPathEndDirectionFlip {
+		t.Fatalf("expected path end reason %s, got %s", fundingProjectionPathEndDirectionFlip, plan.Projections[0].PathEndReason)
+	}
+}
+
+func TestBestFundingDirection_RollingModeChoosesCurrentEntryDirection(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		StrategyMode: StrategyModeRollingCycleAligned,
+		HoldHours:    4,
+		RollingEntryPathRequireConsistentDirection:     true,
+		RollingAllowIntermediateForecastBeforeBoundary: true,
+		RollingForbidBoundaryForecast:                  true,
+	}}
+
+	now := time.Date(2026, 1, 1, 13, 48, 0, 0, time.UTC)
+	aster := entity.FundingSnapshot{
+		Exchange:             "aster",
+		FundingRate:          -0.00356,
+		FundingTimeMs:        time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+	binance := entity.FundingSnapshot{
+		Exchange:             "binance",
+		FundingRate:          -0.012,
+		FundingTimeMs:        time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+
+	longEx, shortEx, projection, ok := r.bestFundingDirection(now, "aster", aster, spotForecast(aster.FundingRate, 1), "binance", binance, spotForecast(binance.FundingRate, 1))
+	if !ok {
+		t.Fatalf("expected rolling mode to find a valid direction")
+	}
+	if longEx != "aster" || shortEx != "binance" {
+		t.Fatalf("expected rolling direction long aster / short binance, got long=%s short=%s", longEx, shortEx)
+	}
+	if want := time.Date(2026, 1, 1, 15, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected latest profitable entry path at 15:00, got %d", projection.ProjectedFundingTimeMs)
+	}
+	if projection.LongFundingEventCount != 2 || projection.ShortFundingEventCount != 0 {
+		t.Fatalf("expected path counts long=2 short=0, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
 	}
 }
 

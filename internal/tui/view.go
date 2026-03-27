@@ -96,6 +96,8 @@ func (m Model) renderHeader(width int) string {
 	limitLine := strings.Join([]string{
 		m.chip("最小收益 "+compactUSDT(strategy.MinNetPNL, 3), "good"),
 		m.chip("最大价差 "+compactBps(strategy.MaxSpreadBps, 2), "warn"),
+		m.chip("策略 "+strategyModeText(strategy.Mode), "accent"),
+		m.chip("持有模式 "+holdSelectionModeText(strategy.HoldSelectionMode), "accent"),
 		m.chip("提前开仓 "+orDefault(strategy.EntryLeadTime, "--"), "accent"),
 		m.chip("平仓缓冲 "+orDefault(exec.CloseGracePeriod, "--"), "accent"),
 	}, "  ")
@@ -115,11 +117,9 @@ func (m Model) renderHeader(width int) string {
 		m.chip("最近刷新 "+orDefault(formatClock(m.lastRefresh), "--"), "accent"),
 	}
 	if m.loading {
-		label := "同步中"
-		if summary := m.loadingSummary(); summary != "" {
-			label = "同步 " + summary
-		}
-		stateParts = append(stateParts, m.chip(label, "warn"))
+		// 刷新时统一显示“同步中”，避免把 system/opps/exec/batch 这类内部加载分区
+		// 直接暴露给用户，造成“界面正在异常轮动”的错觉。
+		stateParts = append(stateParts, m.chip("同步中", "warn"))
 	}
 	if strings.TrimSpace(m.lastError) != "" {
 		stateParts = append(stateParts, m.chip("错误 "+clip(m.lastError, 48), "bad"))
@@ -459,9 +459,11 @@ func (m Model) renderConfigPanel(width int, height int) string {
 		ui.panelTitle.Render("策略与执行配置"),
 		ui.subtle.Render("展示当前生效的策略参数和监控名单，用来确认系统处于观察模式还是实盘模式。"),
 		"",
-		fmt.Sprintf("策略: 启用=%s  持有=%sh  杠杆=%sx  最小净收益=%s  有效名义=%s",
+		fmt.Sprintf("策略: 启用=%s  模式=%s  持有上限=%sh  持有模式=%s  杠杆=%sx  最小净收益=%s  有效名义=%s",
 			boolWord(strategy.Enabled),
+			strategyModeText(strategy.Mode),
 			fmtNumber(strategy.HoldHours, 1),
+			holdSelectionModeText(strategy.HoldSelectionMode),
 			fmtNumber(strategy.Leverage, 2),
 			fmtMoney(strategy.MinNetPNL, 3),
 			fmtMoney(strategy.EffectiveNotional, 2),
@@ -472,7 +474,7 @@ func (m Model) renderConfigPanel(width int, height int) string {
 			fmtSignedBps(strategy.MaxSpreadBps, 2),
 			orDefault(strategy.MaxDataAge, "--"),
 		),
-		fmt.Sprintf("执行: 实盘=%s  自动开仓=%s  自动平仓=%s  轮询=%s  平仓缓冲=%s  最近计划上限=%d",
+		fmt.Sprintf("执行: 实盘=%s  自动开仓=%s  自动平仓=%s  轮询=%s  结算后缓冲=%s  最近计划上限=%d",
 			boolWord(exec.LiveTradingEnabled),
 			boolWord(exec.AutoEntry),
 			boolWord(exec.AutoClose),
@@ -488,10 +490,36 @@ func (m Model) renderConfigPanel(width int, height int) string {
 			renderLimitSuffix(exec.MaxLivePlans),
 			renderLoopLimit(exec.MaxAutoOpenPerLoop),
 		),
-		"",
-		"监控名单: " + clip(strings.Join(m.data.System.Watchlist, ", "), width-10),
-		"深扫名单: " + clip(strings.Join(m.data.System.DeepScanWatchlist, ", "), width-10),
 	}
+	if isRollingStrategyMode(strategy.Mode) {
+		lines = append(lines,
+			fmt.Sprintf("Review: 缓冲=%s  快照等待=%s  同向续持=%s  增量净收益门槛=%s  不利即平=%s",
+				orDefault(strategy.RollingReviewSettleGracePeriod, "--"),
+				orDefault(strategy.RollingReviewFreshSnapshotMaxWait, "--"),
+				boolWord(strategy.RollingReviewContinueOnSameDirection),
+				fmtMoney(strategy.RollingReviewMinIncrementalNetPNL, 3),
+				boolWord(strategy.RollingReviewCloseOnUnprofitable),
+			),
+			fmt.Sprintf("Flip: 启用=%s  要求净正=%s  最小净收益=%s  滑点倍数=%sx  额外缓冲=%s",
+				boolWord(strategy.RollingFlipEnabled),
+				boolWord(strategy.RollingFlipRequireNetPositive),
+				fmtMoney(strategy.RollingFlipMinNetPNL, 3),
+				fmtNumber(strategy.RollingFlipSlippageMultiplier, 2),
+				fmtMoney(strategy.RollingFlipExtraSafetyBufferUSDT, 3),
+			),
+			fmt.Sprintf("Rolling 监控: 记录=%d  分组=%d  待 Review=%d  未到 Review=%d",
+				exec.ActiveRollingRecords,
+				exec.ActiveRollingGroups,
+				exec.RollingDueReviews,
+				exec.RollingWaitingReviews,
+			),
+		)
+	}
+	lines = append(lines,
+		"",
+		"监控名单: "+clip(strings.Join(m.data.System.Watchlist, ", "), width-10),
+		"深扫名单: "+clip(strings.Join(m.data.System.DeepScanWatchlist, ", "), width-10),
+	)
 	if m.isLoading(loadSystem) && len(m.data.System.Watchlist) == 0 && len(m.data.System.DeepScanWatchlist) == 0 {
 		lines = append(lines, "", ui.subtle.Render("正在加载策略和执行配置..."))
 	}
@@ -627,32 +655,56 @@ func (m Model) renderLivePositionPanel(width int, height int) string {
 
 func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	planLabel, _ := m.opportunityPlanLabel(item)
+	carrySource := any(item)
+	if hasDetail && detail != nil {
+		carrySource = *detail
+	}
+	expectedCloseMs := opportunityExpectedCloseTimeMs(carrySource, m.data.System.Execution)
+	mode := opportunityStrategyMode(carrySource)
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(item.Symbol), ui.subtle.Render(opportunityDirection(item))),
 		strings.Join([]string{
 			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
 			renderField("净收益率", renderBpsValue(item.NetExpectedBps, 2)),
-			renderField("资金费收益", renderPctValue(fundingSpread(item), 5)),
-			renderField("时均边际", renderPctValue(fundingSpreadHourly(item), 5)),
+			renderField("优选 Carry率", renderPctValue(fundingSpread(carrySource), 5)),
+			renderField("优选时均边际", renderPctValue(fundingSpreadHourly(carrySource), 5)),
 			renderField("基差", renderBasisValue(item.BasisBps, item.MaxAllowedBasisBps)),
 		}, "  "),
 		strings.Join([]string{
 			renderField("状态", renderStatusValue(item.Status)),
 			renderField("可执行", renderBoolValue(item.EligibleForExecution, false)),
 			renderField("计划", toneStyle(opportunityPlanTone(planLabel)).Render(planLabel)),
-			renderField("建议持有", toneStyle("accent").Render(holdingDurationText(item))),
+			renderField("结算前持有", toneStyle("accent").Render(holdingDurationText(item))),
 		}, "  "),
 		strings.Join([]string{
 			renderField("多头结算倒计时", renderDurationValue(time.Until(time.UnixMilli(item.LongFundingTimeMs)))),
 			renderField("空头结算倒计时", renderDurationValue(time.Until(time.UnixMilli(item.ShortFundingTimeMs)))),
-			renderField("预计兑现时间", renderTimeValue(item.ProjectedFundingTimeMs, "accent")),
+			renderField("预计 funding 兑现", renderTimeValue(item.ProjectedFundingTimeMs, "accent")),
+		}, "  "),
+		strings.Join([]string{
+			renderField("持有模式", toneStyle("accent").Render(holdSelectionModeText(m.data.System.Strategy.HoldSelectionMode))),
+			renderField("持有上限", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(m.data.System.Strategy.HoldHours, 1)))),
+			renderField("预计平仓", renderTimeValue(expectedCloseMs, "accent")),
+			renderField("预计总持有", toneStyle("accent").Render(opportunityExpectedHoldText(carrySource, m.data.System.Execution))),
+			renderField("结算后缓冲", toneStyle("accent").Render(orDefault(m.data.System.Execution.CloseGracePeriod, "--"))),
 		}, "  "),
 		strings.Join([]string{
 			renderField("产生时间", renderTimeValue(opportunityProducedTime(item).UnixMilli(), "subtle")),
 			renderField("批次", toneStyle("accent").Render(orDefault(item.BatchID, "--"))),
 			renderField("结算窗口", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(item.FundingWindowHours, 2)))),
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(mode))),
 			renderField("资金费模式", toneStyle("accent").Render(orDefault(item.FundingComputationMode, "--"))),
 		}, "  "),
+	}
+	if isRollingStrategyMode(mode) {
+		lines = append(lines, strings.Join([]string{
+			renderField("下次 Review", renderTimeValue(opportunityNextReviewTimeMs(carrySource), "accent")),
+			renderField("共享 Boundary", renderTimeValue(opportunitySyncBoundaryTimeMs(carrySource), "accent")),
+			renderField("Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段", opportunityEntryPathSegmentCount(carrySource)))),
+			renderField("停止原因", toneStyle("accent").Render(entryPathStopReasonText(opportunityEntryPathStopReason(carrySource)))),
+		}, "  "))
+	}
+	lines = append(lines,
 		"",
 		ui.panelTitle.Render("市场快照"),
 		renderMarketSummary(m.data.Market, width),
@@ -665,7 +717,7 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 		"",
 		ui.panelTitle.Render("计划信息"),
 		m.renderPlanDetail(item, plan, hasPlan, rec, hasRec, width),
-	}
+	)
 	return strings.Join(lines, "\n")
 }
 
@@ -682,7 +734,7 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 	lines := []string{
 		clip(strings.Join([]string{
 			renderField("估算名义", renderUSDTValue(notional, 2)),
-			renderField("Funding carry", renderPctValue(carryRate, 5)),
+			renderField("累计 Carry率", renderPctValue(carryRate, 5)),
 			renderField("时均 edge", renderPctValue(hourlyEdge, 5)),
 			renderField("事件数", toneStyle("accent").Render(fmt.Sprintf("多头 %d / 空头 %d", item.LongFundingEventCount, item.ShortFundingEventCount))),
 		}, "  "), width),
@@ -726,7 +778,7 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 			renderField("安全缓冲", renderCostSignedValue(item.SafetyBufferPNL, 3)),
 			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
 		}, "  "), width),
-		clip(toneStyle("subtle").Render("说明: 资金收益按当前最佳持有窗口估算；若会跨多轮 funding，后续事件会结合近期历史做平滑预测。"), width),
+		clip(toneStyle("subtle").Render("说明: 资金收益按当前策略选中的持有窗口估算；若会跨多轮 funding，后续事件会结合近期历史做平滑预测。"), width),
 	}
 	return strings.Join(lines, "\n")
 }
@@ -803,6 +855,12 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 			renderField("评分", toneStyle("accent").Render(fmtNumber(plan.Score, 2))),
 		}, "  "),
 		strings.Join([]string{
+			renderField("持有模式", toneStyle("accent").Render(holdSelectionModeText(m.data.System.Strategy.HoldSelectionMode))),
+			renderField("持有上限", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(m.data.System.Strategy.HoldHours, 1)))),
+			renderField("计划持仓", toneStyle("accent").Render(planExpectedHoldText(plan))),
+			renderField("结算后缓冲", toneStyle("accent").Render(orDefault(m.data.System.Execution.CloseGracePeriod, "--"))),
+		}, "  "),
+		strings.Join([]string{
 			renderField("分配资金", renderMoneyValue(plan.CapitalAllocatedUSDT, 2)),
 			renderField("目标名义", renderMoneyValue(plan.TargetNotionalUSDT, 2)),
 			renderField("取整名义", renderMoneyValue(plan.RoundedNotionalUSDT, 2)),
@@ -817,10 +875,19 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 		strings.Join([]string{
 			renderField("基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
 			renderField("仓位偏斜", renderBpsValue(planPositionSkewBps(plan), 2)),
+			renderField("预计 funding 兑现", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
 			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 			renderField("入场开始", renderTimeValue(plan.EntryWindowOpenMs, "accent")),
 			renderField("入场截止", renderTimeValue(plan.EntryWindowCloseMs, "accent")),
 		}, "  "),
+	}
+	if isRollingStrategyMode(plan.StrategyMode) {
+		lines = append(lines, strings.Join([]string{
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(plan.StrategyMode))),
+			renderField("下次 Review", renderTimeValue(plan.NextReviewTimeMs, "accent")),
+			renderField("共享 Boundary", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
+			renderField("Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
+		}, "  "))
 	}
 	if hasRec {
 		lines = append(lines,
@@ -832,6 +899,21 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 				renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
 			}, "  "),
 		)
+		if isRollingStrategyMode(rec.StrategyMode) || isRollingStrategyMode(plan.StrategyMode) {
+			lines = append(lines, strings.Join([]string{
+				renderField("Review 次数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.ReviewCount))),
+				renderField("最近 Review", renderTimeValue(rec.LastReviewAtMs, "accent")),
+				renderField("下次 Review", renderTimeValue(rec.NextReviewTimeMs, "accent")),
+				renderField("当前 Boundary", renderTimeValue(rec.CurrentSyncBoundaryMs, "accent")),
+			}, "  "))
+			lines = append(lines, strings.Join([]string{
+				renderField("前驱计划", toneStyle("accent").Render(orDefault(rec.PredecessorPlanKey, "--"))),
+				renderField("后继计划", toneStyle("accent").Render(orDefault(rec.SuccessorPlanKey, "--"))),
+			}, "  "))
+			if strings.TrimSpace(rec.LastReviewReason) != "" {
+				lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
+			}
+		}
 		if strings.TrimSpace(rec.LastError) != "" {
 			lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
 		}
@@ -849,19 +931,30 @@ func (m Model) renderProjectionDetail(_ OpportunityListItem, detail *entity.Oppo
 	if len(detail.ProjectionDetails) == 0 {
 		return ui.subtle.Render("当前机会没有可展示的预测详情。")
 	}
-	lines := []string{ui.accent.Render("序号  兑现时间             窗口     多头  空头  收益        时均        预期收益")}
+	lines := []string{ui.accent.Render("标记  兑现时间             窗口     多头  空头  Carry率     时均        资金收益     净收益")}
 	for _, row := range detail.ProjectionDetails {
-		line := fmt.Sprintf("%-5d %-20s %-8s %-5d %-5d %-11s %-11s %-10s",
-			row.ProjectionRank,
+		marker := fmt.Sprintf("%d", row.ProjectionRank)
+		if row.IsBestProjection {
+			marker = "优选"
+		}
+		line := fmt.Sprintf("%-5s %-20s %-8s %-5d %-5d %-11s %-11s %-12s %-10s",
+			marker,
 			clip(fmtTime(row.ProjectedFundingTimeMs), 20),
 			clip(fmt.Sprintf("%sh", fmtNumber(row.FundingWindowHours, 2)), 8),
 			row.LongFundingEventCount,
 			row.ShortFundingEventCount,
 			fmtPctRatio(row.CarryRate, 5),
 			fmtPctRatio(row.CarryRateHourlyEquivalent, 5),
+			fmtMoney(row.GrossFundingPNL, 3),
 			fmtMoney(row.NetExpectedPNL, 3),
 		)
 		lines = append(lines, toneStyle(signedNumberTone(row.NetExpectedPNL)).Render(line))
+	}
+	if len(detail.EntryPathSegments) > 0 {
+		lines = append(lines, "", renderFundingSegmentsSection("Entry Path Settlement 段", detail.EntryPathSegments, width))
+	}
+	if len(detail.FundingSegments) > 0 {
+		lines = append(lines, "", renderFundingSegmentsSection("完整 Settlement 段", detail.FundingSegments, width))
 	}
 	return clip(strings.Join(lines, "\n"), width*maxInt(1, len(lines)))
 }
@@ -898,6 +991,10 @@ func (m Model) renderOrdersDetail(planKey string, width int) string {
 }
 
 func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
+	targetCloseMs := plan.TargetCloseTimeMs
+	if hasRec && rec.TargetCloseTimeMs > 0 {
+		targetCloseMs = rec.TargetCloseTimeMs
+	}
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(plan.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: plan.LongExchange, ShortExchange: plan.ShortExchange}))),
 		strings.Join([]string{
@@ -910,7 +1007,14 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 			renderField("名义", renderMoneyValue(targetNotional(plan), 2)),
 			renderField("杠杆", toneStyle("accent").Render(fmt.Sprintf("%sx", fmtNumber(plan.TargetLeverage, 2)))),
 			renderField("基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
-			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+			renderField("预计 funding 兑现", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
+			renderField("目标平仓", renderTimeValue(targetCloseMs, "accent")),
+		}, "  "),
+		strings.Join([]string{
+			renderField("持有模式", toneStyle("accent").Render(holdSelectionModeText(m.data.System.Strategy.HoldSelectionMode))),
+			renderField("持有上限", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(m.data.System.Strategy.HoldHours, 1)))),
+			renderField("计划持仓", toneStyle("accent").Render(planExpectedHoldText(plan))),
+			renderField("距计划平仓", renderRemainingTimeValue(targetCloseMs)),
 		}, "  "),
 		strings.Join([]string{
 			renderField("多头", toneStyle("accent").Render(plan.LongVenueSymbol)),
@@ -923,11 +1027,19 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 			renderField("价格", toneStyle("accent").Render(priceText(plan.ShortEntryPrice))),
 		}, "  "),
 	}
+	if isRollingStrategyMode(plan.StrategyMode) {
+		lines = append(lines, strings.Join([]string{
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(plan.StrategyMode))),
+			renderField("下次 Review", renderTimeValue(plan.NextReviewTimeMs, "accent")),
+			renderField("共享 Boundary", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
+			renderField("Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
+		}, "  "))
+	}
 	if opp, ok := m.matchingOpportunityForPlan(plan); ok {
 		lines = append(lines, strings.Join([]string{
 			renderField("关联机会", toneStyle("accent").Render(opportunityKey(opp))),
 			renderField("机会状态", renderStatusValue(opp.Status)),
-			renderField("建议持有", toneStyle("accent").Render(holdingDurationText(opp))),
+			renderField("结算前持有", toneStyle("accent").Render(holdingDurationText(opp))),
 		}, "  "))
 	}
 	if hasRec {
@@ -938,7 +1050,23 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 			renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
 			renderField("开仓时间", renderTimeValue(rec.OpenedAtMs, "accent")),
 			renderField("平仓时间", renderTimeValue(rec.ClosedAtMs, "accent")),
+			renderField("预计总持有", toneStyle("accent").Render(executionPlannedHoldText(rec, plan, true))),
 		}, "  "))
+		if isRollingStrategyMode(rec.StrategyMode) || isRollingStrategyMode(plan.StrategyMode) {
+			lines = append(lines, strings.Join([]string{
+				renderField("Review 次数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.ReviewCount))),
+				renderField("最近 Review", renderTimeValue(rec.LastReviewAtMs, "accent")),
+				renderField("下次 Review", renderTimeValue(rec.NextReviewTimeMs, "accent")),
+				renderField("当前 Boundary", renderTimeValue(rec.CurrentSyncBoundaryMs, "accent")),
+			}, "  "))
+			lines = append(lines, strings.Join([]string{
+				renderField("前驱计划", toneStyle("accent").Render(orDefault(rec.PredecessorPlanKey, "--"))),
+				renderField("后继计划", toneStyle("accent").Render(orDefault(rec.SuccessorPlanKey, "--"))),
+			}, "  "))
+			if strings.TrimSpace(rec.LastReviewReason) != "" {
+				lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
+			}
+		}
 		if strings.TrimSpace(rec.StatusReason) != "" {
 			lines = append(lines, renderField("原因", toneStyle("warn").Render(clip(rec.StatusReason, width))))
 		}
@@ -954,6 +1082,10 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 }
 
 func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool, width int) string {
+	targetCloseMs := rec.TargetCloseTimeMs
+	if targetCloseMs <= 0 && hasPlan {
+		targetCloseMs = plan.TargetCloseTimeMs
+	}
 	lines := []string{
 		fmt.Sprintf("%s  %s", ui.accent.Render(rec.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: rec.LongExchange, ShortExchange: rec.ShortExchange}))),
 		strings.Join([]string{
@@ -973,6 +1105,29 @@ func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan enti
 			renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
 			renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
 		}, "  "),
+		strings.Join([]string{
+			renderField("持有模式", toneStyle("accent").Render(holdSelectionModeText(m.data.System.Strategy.HoldSelectionMode))),
+			renderField("持有上限", toneStyle("accent").Render(fmt.Sprintf("%sh", fmtNumber(m.data.System.Strategy.HoldHours, 1)))),
+			renderField("计划持仓", toneStyle("accent").Render(executionPlannedHoldText(rec, plan, hasPlan))),
+			renderField("目标平仓", renderTimeValue(targetCloseMs, "accent")),
+			renderField("距计划平仓", renderRemainingTimeValue(targetCloseMs)),
+		}, "  "),
+	}
+	if isRollingStrategyMode(rec.StrategyMode) || (hasPlan && isRollingStrategyMode(plan.StrategyMode)) {
+		lines = append(lines, strings.Join([]string{
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(orDefault(rec.StrategyMode, plan.StrategyMode)))),
+			renderField("Review 次数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.ReviewCount))),
+			renderField("下次 Review", renderTimeValue(rec.NextReviewTimeMs, "accent")),
+			renderField("当前 Boundary", renderTimeValue(rec.CurrentSyncBoundaryMs, "accent")),
+			renderField("最近 Review", renderTimeValue(rec.LastReviewAtMs, "accent")),
+		}, "  "))
+		lines = append(lines, strings.Join([]string{
+			renderField("前驱计划", toneStyle("accent").Render(orDefault(rec.PredecessorPlanKey, "--"))),
+			renderField("后继计划", toneStyle("accent").Render(orDefault(rec.SuccessorPlanKey, "--"))),
+		}, "  "))
+		if strings.TrimSpace(rec.LastReviewReason) != "" {
+			lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
+		}
 	}
 	if strings.TrimSpace(rec.StatusReason) != "" {
 		lines = append(lines, renderField("原因", toneStyle("warn").Render(clip(rec.StatusReason, width))))
@@ -984,6 +1139,7 @@ func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan enti
 		lines = append(lines, strings.Join([]string{
 			renderField("计划状态", renderStatusValue(plan.Status)),
 			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("预计 funding 兑现", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
 			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 		}, "  "))
 	}
@@ -1347,6 +1503,56 @@ func boolWord(v bool) string {
 	return "否"
 }
 
+func holdSelectionModeText(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "latest_profitable":
+		return "最晚盈利窗口"
+	case "strict_target":
+		return "严格目标窗口"
+	case "best_net":
+		return "净收益优先"
+	default:
+		if strings.TrimSpace(mode) == "" {
+			return "--"
+		}
+		return mode
+	}
+}
+
+func strategyModeText(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case strings.ToLower(service.StrategyModeRollingCycleAligned):
+		return "按结算段滚动"
+	case strings.ToLower(service.StrategyModeLegacyProjection):
+		return "累计窗口投影"
+	default:
+		if strings.TrimSpace(mode) == "" {
+			return "--"
+		}
+		return mode
+	}
+}
+
+func isRollingStrategyMode(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), service.StrategyModeRollingCycleAligned)
+}
+
+func entryPathStopReasonText(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "sync_boundary":
+		return "到共享结算点"
+	case "direction_flip":
+		return "到方向翻转"
+	case "hold_horizon":
+		return "到持有上限"
+	default:
+		if strings.TrimSpace(reason) == "" {
+			return "--"
+		}
+		return reason
+	}
+}
+
 func boolTone(v bool, warnWhenTrue bool) string {
 	if v && warnWhenTrue {
 		return "warn"
@@ -1652,6 +1858,13 @@ func renderTimeValue(ms int64, tone string) string {
 	return toneStyle(tone).Render(fmtTime(ms))
 }
 
+func renderRemainingTimeValue(ms int64) string {
+	if ms <= 0 {
+		return toneStyle("subtle").Render("--")
+	}
+	return renderDurationValue(time.Until(time.UnixMilli(ms)))
+}
+
 func renderCostSignedValue(value float64, digits int) string {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return toneStyle("subtle").Render("--")
@@ -1873,6 +2086,81 @@ func feeBreakdownText(item OpportunityListItem, strategy StrategyStatus, mode st
 		return "--"
 	}
 	return strings.Join(parts, " + ")
+}
+
+func renderFundingSegmentsSection(title string, segments []entity.OpportunityFundingSegment, width int) string {
+	if len(segments) == 0 {
+		return ui.subtle.Render(title + ": --")
+	}
+	lines := []string{
+		ui.panelTitle.Render(title),
+		ui.subtle.Render("序 结算时间             类型         方向                     Carry率      结算腿        标记"),
+	}
+	for _, segment := range segments {
+		flag := "真实"
+		if segment.UsesForecast {
+			flag = "预测"
+		}
+		if !segment.DirectionMatchesHeld {
+			flag += "/反向"
+		}
+		line := fmt.Sprintf("%-2d %-20s %-12s %-24s %-11s %-12s %-8s",
+			segment.SegmentRank,
+			clip(fmtTime(segment.SettlementTimeMs), 20),
+			clip(fundingSegmentTypeText(segment), 12),
+			clip(fundingSegmentDirectionText(segment), 24),
+			fmtPctRatio(segment.CarryRate, 5),
+			clip(fundingSegmentSettlementText(segment), 12),
+			clip(flag, 8),
+		)
+		lines = append(lines, clip(line, width))
+	}
+	lines = append(lines, ui.subtle.Render("说明: “反向”表示该段最优方向已经不同于当前持仓方向，到该点通常应由 rolling monitor 判断是否翻仓。"))
+	return strings.Join(lines, "\n")
+}
+
+func fundingSegmentTypeText(segment entity.OpportunityFundingSegment) string {
+	switch strings.ToLower(strings.TrimSpace(segment.SegmentType)) {
+	case "single_real":
+		return "单腿真实"
+	case "single_forecast":
+		return "单腿预测"
+	case "shared_real":
+		return "双腿真实"
+	default:
+		if strings.TrimSpace(segment.SegmentType) == "" {
+			return "--"
+		}
+		return segment.SegmentType
+	}
+}
+
+func fundingSegmentDirectionText(segment entity.OpportunityFundingSegment) string {
+	longExchange := orDefault(segment.OptimalLongExchange, segment.HeldLongExchange)
+	shortExchange := orDefault(segment.OptimalShortExchange, segment.HeldShortExchange)
+	if strings.TrimSpace(longExchange) == "" && strings.TrimSpace(shortExchange) == "" {
+		return "--"
+	}
+	return fmt.Sprintf("%s 多 / %s 空", orDefault(longExchange, "--"), orDefault(shortExchange, "--"))
+}
+
+func fundingSegmentSettlementText(segment entity.OpportunityFundingSegment) string {
+	if segment.SharedSettlement {
+		return "双边"
+	}
+	parts := make([]string, 0, 2)
+	longExchange := orDefault(segment.HeldLongExchange, segment.OptimalLongExchange)
+	shortExchange := orDefault(segment.HeldShortExchange, segment.OptimalShortExchange)
+	if segment.LongLegSettles && strings.TrimSpace(longExchange) != "" {
+		parts = append(parts, longExchange)
+	}
+	if segment.ShortLegSettles && strings.TrimSpace(shortExchange) != "" {
+		parts = append(parts, shortExchange)
+	}
+	if len(parts) == 0 {
+		return "--"
+	}
+	return strings.Join(parts, "+")
 }
 
 func feeRateBps(strategy StrategyStatus, exchangeName string, mode string) (float64, bool) {

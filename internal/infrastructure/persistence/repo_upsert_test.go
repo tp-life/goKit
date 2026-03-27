@@ -35,17 +35,22 @@ func TestExecutionRepo_UpsertPersistsTransitionMetadata(t *testing.T) {
 	repo := &ExecutionRepo{client: newTestDBClient(t)}
 
 	item := &entity.ExecutionRecord{
-		PlanKey:             "plan-1",
-		Status:              "pending_open",
-		LastTransitionAtMs:  111,
-		LastTransitionEvent: "open_requested",
-		StatusReason:        "waiting for legs",
+		PlanKey:               "plan-1",
+		RollingGroupKey:       "BTC|aster|binance",
+		StrategyMode:          "rolling_cycle_aligned",
+		Status:                "pending_open",
+		NextReviewTimeMs:      555,
+		CurrentSyncBoundaryMs: 777,
+		LastTransitionAtMs:    111,
+		LastTransitionEvent:   "open_requested",
+		StatusReason:          "waiting for legs",
 	}
 	if err := repo.Upsert(ctx, item); err != nil {
 		t.Fatalf("expected initial upsert to succeed, got %v", err)
 	}
 
 	item.Status = "opened"
+	item.NextReviewTimeMs = 888
 	item.LastTransitionAtMs = 222
 	item.LastTransitionEvent = "open_results_applied"
 	item.StatusReason = "both legs filled"
@@ -62,6 +67,12 @@ func TestExecutionRepo_UpsertPersistsTransitionMetadata(t *testing.T) {
 	}
 	if got.LastTransitionAtMs != 222 {
 		t.Fatalf("expected last_transition_at_ms to persist, got %d", got.LastTransitionAtMs)
+	}
+	if got.RollingGroupKey != "BTC|aster|binance" || got.StrategyMode != "rolling_cycle_aligned" {
+		t.Fatalf("expected rolling metadata to persist, got group=%s mode=%s", got.RollingGroupKey, got.StrategyMode)
+	}
+	if got.NextReviewTimeMs != 888 || got.CurrentSyncBoundaryMs != 777 {
+		t.Fatalf("expected rolling review fields to persist, got next_review=%d sync_boundary=%d", got.NextReviewTimeMs, got.CurrentSyncBoundaryMs)
 	}
 	if got.LastTransitionEvent != "open_results_applied" {
 		t.Fatalf("expected last_transition_event to persist, got %s", got.LastTransitionEvent)
@@ -166,12 +177,18 @@ func TestExecutionPlanRepo_SaveBatchUpsertsPenaltyFields(t *testing.T) {
 		PlanKey:                "plan-penalty",
 		Symbol:                 "BTC",
 		Status:                 "ready",
+		RollingGroupKey:        "BTC|aster|binance",
 		EntryPenaltyBps:        1.1,
 		ExitPenaltyBps:         1.2,
 		HedgePenaltyBps:        0.3,
 		ExecutionPenaltyBps:    2.6,
 		ExecutionPenaltyModel:  "model-v1",
 		ExecutionPenaltyBucket: "normal",
+		StrategyMode:           "rolling_cycle_aligned",
+		NextReviewTimeMs:       1111,
+		SyncBoundaryTimeMs:     2222,
+		EntryPathSegmentCount:  2,
+		EntryPathStopReason:    "sync_boundary",
 	}
 	if err := repo.SaveBatch(ctx, "batch-1", "opp-1", []entity.ExecutionPlan{item}); err != nil {
 		t.Fatalf("expected initial save batch to succeed, got %v", err)
@@ -183,6 +200,10 @@ func TestExecutionPlanRepo_SaveBatchUpsertsPenaltyFields(t *testing.T) {
 	item.ExecutionPenaltyBps = 7.1
 	item.ExecutionPenaltyModel = "model-v2"
 	item.ExecutionPenaltyBucket = "hot"
+	item.NextReviewTimeMs = 3333
+	item.SyncBoundaryTimeMs = 4444
+	item.EntryPathSegmentCount = 3
+	item.EntryPathStopReason = "direction_flip"
 	if err := repo.SaveBatch(ctx, "batch-2", "opp-2", []entity.ExecutionPlan{item}); err != nil {
 		t.Fatalf("expected second save batch to succeed, got %v", err)
 	}
@@ -202,5 +223,14 @@ func TestExecutionPlanRepo_SaveBatchUpsertsPenaltyFields(t *testing.T) {
 	}
 	if got.ExecutionPenaltyModel != "model-v2" || got.ExecutionPenaltyBucket != "hot" {
 		t.Fatalf("expected execution penalty metadata to upsert, got model=%s bucket=%s", got.ExecutionPenaltyModel, got.ExecutionPenaltyBucket)
+	}
+	if got.RollingGroupKey != "BTC|aster|binance" || got.StrategyMode != "rolling_cycle_aligned" {
+		t.Fatalf("expected rolling plan metadata to upsert, got group=%s mode=%s", got.RollingGroupKey, got.StrategyMode)
+	}
+	if got.NextReviewTimeMs != 3333 || got.SyncBoundaryTimeMs != 4444 {
+		t.Fatalf("expected rolling review times to upsert, got next_review=%d sync_boundary=%d", got.NextReviewTimeMs, got.SyncBoundaryTimeMs)
+	}
+	if got.EntryPathSegmentCount != 3 || got.EntryPathStopReason != "direction_flip" {
+		t.Fatalf("expected entry path metadata to upsert, got count=%d reason=%s", got.EntryPathSegmentCount, got.EntryPathStopReason)
 	}
 }

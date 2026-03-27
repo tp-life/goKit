@@ -1,5 +1,10 @@
 package entity
 
+import (
+	"encoding/json"
+	"strings"
+)
+
 type Symbol struct {
 	ID uint `gorm:"primaryKey" json:"id"`
 
@@ -35,3 +40,50 @@ type Symbol struct {
 }
 
 func (Symbol) TableName() string { return "symbols" }
+
+// SymbolExecutionMeta 保存执行阶段会用到、但不适合展开成顶层列的交易所细粒度约束。
+//
+// 当前主要用于解决：
+// - 某些 venue 的 LIMIT / MARKET 单，单笔允许的 maxQty 并不相同；
+// - 策略层如果不知道这个上限，就可能一次下出“总仓位数量”，直接被交易所拒绝。
+type SymbolExecutionMeta struct {
+	LimitMaxQty  float64 `json:"limit_max_qty,omitempty"`
+	MarketMaxQty float64 `json:"market_max_qty,omitempty"`
+}
+
+func (s Symbol) ExecutionMeta() SymbolExecutionMeta {
+	if strings.TrimSpace(s.ExtraMetaJSON) == "" {
+		return SymbolExecutionMeta{}
+	}
+	var meta SymbolExecutionMeta
+	if err := json.Unmarshal([]byte(s.ExtraMetaJSON), &meta); err != nil {
+		return SymbolExecutionMeta{}
+	}
+	return meta
+}
+
+func (s *Symbol) SetExecutionMeta(meta SymbolExecutionMeta) error {
+	if s == nil {
+		return nil
+	}
+	if meta.LimitMaxQty <= 0 && meta.MarketMaxQty <= 0 {
+		s.ExtraMetaJSON = ""
+		return nil
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	s.ExtraMetaJSON = string(raw)
+	return nil
+}
+
+func (m SymbolExecutionMeta) MaxQtyForOrderType(orderType string) float64 {
+	if strings.EqualFold(strings.TrimSpace(orderType), "MARKET") && m.MarketMaxQty > 0 {
+		return m.MarketMaxQty
+	}
+	if m.LimitMaxQty > 0 {
+		return m.LimitMaxQty
+	}
+	return m.MarketMaxQty
+}

@@ -1739,7 +1739,12 @@ func opportunityIdentity(item any) (symbol, longExchange, shortExchange, longVen
 func fundingSpread(item any) float64 {
 	switch v := item.(type) {
 	case entity.Opportunity:
-		if len(v.ProjectionDetails) > 0 && v.ProjectionDetails[0].CarryRate != 0 {
+		for _, row := range v.ProjectionDetails {
+			if row.IsBestProjection {
+				return row.CarryRate
+			}
+		}
+		if len(v.ProjectionDetails) > 0 {
 			return v.ProjectionDetails[0].CarryRate
 		}
 		return v.ShortFundingRate - v.LongFundingRate
@@ -1753,6 +1758,14 @@ func fundingSpread(item any) float64 {
 func fundingSpreadHourly(item any) float64 {
 	switch v := item.(type) {
 	case entity.Opportunity:
+		for _, row := range v.ProjectionDetails {
+			if row.IsBestProjection {
+				return row.CarryRateHourlyEquivalent
+			}
+		}
+		if len(v.ProjectionDetails) > 0 {
+			return v.ProjectionDetails[0].CarryRateHourlyEquivalent
+		}
 		return v.GrossEdgeHourly
 	case OpportunityListItem:
 		return v.GrossEdgeHourly
@@ -1779,6 +1792,172 @@ func holdingDurationText(item any) string {
 		}
 	}
 	return "--"
+}
+
+func projectedFundingTimeMs(item any) int64 {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.ProjectedFundingTimeMs
+	case OpportunityListItem:
+		return v.ProjectedFundingTimeMs
+	default:
+		return 0
+	}
+}
+
+func opportunityStrategyMode(item any) string {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.StrategyMode
+	case OpportunityListItem:
+		return v.StrategyMode
+	default:
+		return ""
+	}
+}
+
+func opportunityNextReviewTimeMs(item any) int64 {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.NextReviewTimeMs
+	case OpportunityListItem:
+		return v.NextReviewTimeMs
+	default:
+		return 0
+	}
+}
+
+func opportunitySyncBoundaryTimeMs(item any) int64 {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.SyncBoundaryTimeMs
+	case OpportunityListItem:
+		return v.SyncBoundaryTimeMs
+	default:
+		return 0
+	}
+}
+
+func opportunityEntryPathSegmentCount(item any) int {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.EntryPathSegmentCount
+	case OpportunityListItem:
+		return v.EntryPathSegmentCount
+	default:
+		return 0
+	}
+}
+
+func opportunityEntryPathStopReason(item any) string {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.EntryPathStopReason
+	case OpportunityListItem:
+		return v.EntryPathStopReason
+	default:
+		return ""
+	}
+}
+
+func closeGraceDuration(exec ExecutionStatus) time.Duration {
+	value := strings.TrimSpace(exec.CloseGracePeriod)
+	if value == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// opportunityExpectedCloseTimeMs estimates when the strategy plans to exit the
+// currently selected opportunity path.
+//
+// 两类模式的“预计平仓点”含义并不一样：
+// - legacy: 直接看 projected funding realization time；
+// - rolling: 首次持仓目标其实是 next review time，而不是 entry path 的最终投影终点。
+//
+// 因此这里优先按 strategy mode 选择合适的锚点，再统一加上 close grace。
+func opportunityExpectedCloseTimeMs(item any, exec ExecutionStatus) int64 {
+	if strings.EqualFold(opportunityStrategyMode(item), service.StrategyModeRollingCycleAligned) {
+		reviewMs := opportunityNextReviewTimeMs(item)
+		if reviewMs > 0 {
+			return reviewMs + closeGraceDuration(exec).Milliseconds()
+		}
+	}
+	projectedMs := projectedFundingTimeMs(item)
+	if projectedMs <= 0 {
+		return 0
+	}
+	return projectedMs + closeGraceDuration(exec).Milliseconds()
+}
+
+func opportunityExpectedHoldText(item any, exec ExecutionStatus) string {
+	targetCloseMs := opportunityExpectedCloseTimeMs(item, exec)
+	if targetCloseMs > 0 {
+		return fmtDuration(time.Until(time.UnixMilli(targetCloseMs)))
+	}
+	return holdingDurationText(item)
+}
+
+// planExpectedHoldText explains the total planned holding duration implied by
+// the entry window and the target close time. Because actual entry may happen
+// anywhere inside the allowed window, we show a range when needed.
+func planExpectedHoldText(plan entity.ExecutionPlan) string {
+	targetCloseMs := plan.TargetCloseTimeMs
+	entryOpenMs := plan.EntryWindowOpenMs
+	entryCloseMs := plan.EntryWindowCloseMs
+	if targetCloseMs <= 0 {
+		return "--"
+	}
+
+	shortestHoldMs := int64(0)
+	if entryCloseMs > 0 {
+		shortestHoldMs = targetCloseMs - entryCloseMs
+	}
+	longestHoldMs := int64(0)
+	if entryOpenMs > 0 {
+		longestHoldMs = targetCloseMs - entryOpenMs
+	}
+
+	switch {
+	case shortestHoldMs > 0 && longestHoldMs > 0:
+		if absInt64(longestHoldMs-shortestHoldMs) < int64(time.Second/time.Millisecond) {
+			return fmtDuration(time.Duration(longestHoldMs) * time.Millisecond)
+		}
+		return fmt.Sprintf("%s - %s",
+			fmtDuration(time.Duration(shortestHoldMs)*time.Millisecond),
+			fmtDuration(time.Duration(longestHoldMs)*time.Millisecond),
+		)
+	case shortestHoldMs > 0:
+		return fmtDuration(time.Duration(shortestHoldMs) * time.Millisecond)
+	case longestHoldMs > 0:
+		return fmtDuration(time.Duration(longestHoldMs) * time.Millisecond)
+	default:
+		return "--"
+	}
+}
+
+// executionPlannedHoldText prefers the realized open time once a live execution
+// exists. This gives the user the real end-to-end holding duration instead of
+// the pre-open estimate range from the plan.
+func executionPlannedHoldText(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool) string {
+	if rec.OpenedAtMs > 0 && rec.TargetCloseTimeMs > rec.OpenedAtMs {
+		return fmtDuration(time.Duration(rec.TargetCloseTimeMs-rec.OpenedAtMs) * time.Millisecond)
+	}
+	if hasPlan {
+		return planExpectedHoldText(plan)
+	}
+	return "--"
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func opportunityProducedTime(item any) time.Time {

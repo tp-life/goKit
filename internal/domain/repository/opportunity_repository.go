@@ -66,7 +66,12 @@ type OpportunitySummary struct {
 	LongFundingEventCount        int     `json:"long_funding_event_count"`
 	ShortFundingEventCount       int     `json:"short_funding_event_count"`
 	FundingWindowHours           float64 `json:"funding_window_hours"`
+	StrategyMode                 string  `json:"strategy_mode"`
 	FundingComputationMode       string  `json:"funding_computation_mode"`
+	NextReviewTimeMs             int64   `json:"next_review_time_ms"`
+	SyncBoundaryTimeMs           int64   `json:"sync_boundary_time_ms"`
+	EntryPathSegmentCount        int     `json:"entry_path_segment_count"`
+	EntryPathStopReason          string  `json:"entry_path_stop_reason"`
 
 	Status               string    `json:"status"`
 	RejectReason         string    `json:"reject_reason"`
