@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,30 +25,34 @@ func TestAsterLegacyHMACTradePlaceOrder_UsesLegacySignedEndpoint(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("unexpected method %s", r.Method)
-		}
-		if r.URL.Path != "/fapi/v1/order" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
 		if got := r.Header.Get("X-MBX-APIKEY"); got != "aster-key" {
 			t.Fatalf("unexpected api key header %q", got)
 		}
 		assertLegacyAsterSignature(t, r, "aster-secret")
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body error = %v", err)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fapi/v2/positionRisk":
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/fapi/v1/order":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read body error = %v", err)
+			}
+			if len(body) != 0 {
+				t.Fatalf("expected legacy signed order to send query params only, got body %q", string(body))
+			}
+			_, _ = io.WriteString(w, `{
+				"orderId":"order-1",
+				"clientOrderId":"cli-1",
+				"status":"FILLED",
+				"executedQty":"0.01",
+				"avgPrice":"60000"
+			}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
 		}
-		if len(body) != 0 {
-			t.Fatalf("expected legacy signed order to send query params only, got body %q", string(body))
-		}
-		_, _ = io.WriteString(w, `{
-			"orderId":"order-1",
-			"clientOrderId":"cli-1",
-			"status":"FILLED",
-			"executedQty":"0.01",
-			"avgPrice":"60000"
-		}`)
 	}))
 	defer server.Close()
 
@@ -148,55 +153,66 @@ func TestAsterV3TradePlaceOrder_UsesSignerAuth(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	var client *CEXTradeClient
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("unexpected method %s", r.Method)
-		}
-		if r.URL.Path != "/fapi/v3/order" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		if got := r.Header.Get("X-MBX-APIKEY"); got != "" {
-			t.Fatalf("expected no MBX api key header for v3 signer auth, got %q", got)
-		}
-		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/x-www-form-urlencoded") {
-			t.Fatalf("unexpected content type %q", got)
-		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fapi/v3/positionRisk":
+			if got := r.Header.Get("X-MBX-APIKEY"); got != "" {
+				t.Fatalf("expected no MBX api key header for v3 signer auth, got %q", got)
+			}
+			values := r.URL.Query()
+			if got := values.Get("user"); got != accountAddress {
+				t.Fatalf("unexpected user %q", got)
+			}
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/fapi/v3/order":
+			if got := r.Header.Get("X-MBX-APIKEY"); got != "" {
+				t.Fatalf("expected no MBX api key header for v3 signer auth, got %q", got)
+			}
+			if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/x-www-form-urlencoded") {
+				t.Fatalf("unexpected content type %q", got)
+			}
 
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body error = %v", err)
-		}
-		values, err := url.ParseQuery(string(body))
-		if err != nil {
-			t.Fatalf("parse body error = %v", err)
-		}
-		if got := values.Get("user"); got != accountAddress {
-			t.Fatalf("unexpected user %q", got)
-		}
-		if values.Get("signer") == "" {
-			t.Fatal("expected signer address in request body")
-		}
-		if values.Get("nonce") == "" {
-			t.Fatal("expected nonce in request body")
-		}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read body error = %v", err)
+			}
+			values, err := url.ParseQuery(string(body))
+			if err != nil {
+				t.Fatalf("parse body error = %v", err)
+			}
+			if got := values.Get("user"); got != accountAddress {
+				t.Fatalf("unexpected user %q", got)
+			}
+			if values.Get("signer") == "" {
+				t.Fatal("expected signer address in request body")
+			}
+			if values.Get("nonce") == "" {
+				t.Fatal("expected nonce in request body")
+			}
 
-		signature := values.Get("signature")
-		if signature == "" {
-			t.Fatal("expected signature in request body")
-		}
-		values.Del("signature")
-		expectedSignature, err := client.signAsterV3Payload(values.Encode())
-		if err != nil {
-			t.Fatalf("signAsterV3Payload error = %v", err)
-		}
-		if signature != expectedSignature {
-			t.Fatalf("unexpected signature %q, expected %q", signature, expectedSignature)
-		}
+			signature := values.Get("signature")
+			if signature == "" {
+				t.Fatal("expected signature in request body")
+			}
+			values.Del("signature")
+			expectedSignature, err := client.signAsterV3Payload(values.Encode())
+			if err != nil {
+				t.Fatalf("signAsterV3Payload error = %v", err)
+			}
+			if signature != expectedSignature {
+				t.Fatalf("unexpected signature %q, expected %q", signature, expectedSignature)
+			}
 
-		_, _ = io.WriteString(w, `{
-			"orderId":"order-v3",
-			"clientOrderId":"cli-v3",
-			"status":"NEW"
-		}`)
+			_, _ = io.WriteString(w, `{
+				"orderId":"order-v3",
+				"clientOrderId":"cli-v3",
+				"status":"NEW"
+			}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer server.Close()
 
@@ -251,30 +267,34 @@ func TestBinanceRSATradePlaceOrder_UsesRSASignedEndpoint(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("unexpected method %s", r.Method)
-		}
-		if r.URL.Path != "/fapi/v1/order" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
 		if got := r.Header.Get("X-MBX-APIKEY"); got != "binance-rsa-key" {
 			t.Fatalf("unexpected api key header %q", got)
 		}
 		assertRSASignature(t, r, &privateKey.PublicKey)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body error = %v", err)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fapi/v3/positionRisk":
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/fapi/v1/order":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read body error = %v", err)
+			}
+			if len(body) != 0 {
+				t.Fatalf("expected rsa signed order to send query params only, got body %q", string(body))
+			}
+			_, _ = io.WriteString(w, `{
+				"orderId":"order-rsa",
+				"clientOrderId":"cli-rsa",
+				"status":"FILLED",
+				"executedQty":"0.01",
+				"avgPrice":"60000"
+			}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
 		}
-		if len(body) != 0 {
-			t.Fatalf("expected rsa signed order to send query params only, got body %q", string(body))
-		}
-		_, _ = io.WriteString(w, `{
-			"orderId":"order-rsa",
-			"clientOrderId":"cli-rsa",
-			"status":"FILLED",
-			"executedQty":"0.01",
-			"avgPrice":"60000"
-		}`)
 	}))
 	defer server.Close()
 
@@ -308,6 +328,120 @@ func TestBinanceRSATradePlaceOrder_UsesRSASignedEndpoint(t *testing.T) {
 	}
 	if result.VenueOrderID != "order-rsa" || result.ClientOrderID != "cli-rsa" || result.Status != "FILLED" {
 		t.Fatalf("unexpected order result %#v", result)
+	}
+}
+
+func TestBinanceLikeTradePlaceOrder_503ReturnsUnknownExecutionOutcome(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "binance-key")
+	t.Setenv("BINANCE_API_SECRET", "binance-secret")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fapi/v3/positionRisk":
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/fapi/v1/order":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"code":-1007,"msg":"execution status unknown"}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewBinanceTradeClient(ConfigSet{
+		Binance: ExchangeConfig{
+			Enabled:     true,
+			RestBaseURL: server.URL,
+			Auth: AuthConfig{
+				APIKeyEnv:    "BINANCE_API_KEY",
+				APISecretEnv: "BINANCE_API_SECRET",
+			},
+		},
+	}, logger).(*CEXTradeClient)
+
+	_, err := client.PlaceOrder(context.Background(), TradeOrderRequest{
+		CanonicalSymbol: "BTC",
+		VenueSymbol:     "BTCUSDT",
+		Side:            "BUY",
+		OrderType:       "MARKET",
+		Quantity:        0.01,
+		ClientOrderID:   "cli-503",
+	})
+	if err == nil {
+		t.Fatal("expected unknown execution outcome error")
+	}
+	var unknownErr *UnknownExecutionOutcomeError
+	if !errors.As(err, &unknownErr) {
+		t.Fatalf("expected UnknownExecutionOutcomeError, got %T: %v", err, err)
+	}
+	if unknownErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %#v", unknownErr)
+	}
+}
+
+func TestBinanceTradePlaceOrder_RejectsHedgeModeAccounts(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "binance-key")
+	t.Setenv("BINANCE_API_SECRET", "binance-secret")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	orderCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-MBX-APIKEY"); got != "binance-key" {
+			t.Fatalf("unexpected api key header %q", got)
+		}
+		assertLegacyAsterSignature(t, r, "binance-secret")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fapi/v3/positionRisk":
+			// 使用 LONG/SHORT 双记录模拟官方文档里的 hedge mode 返回形状。
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"LONG",
+				"positionAmt":"0"
+			},{
+				"symbol":"BTCUSDT",
+				"positionSide":"SHORT",
+				"positionAmt":"0"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/fapi/v1/order":
+			orderCalled = true
+			t.Fatalf("order endpoint should not be called after hedge mode is detected")
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewBinanceTradeClient(ConfigSet{
+		Binance: ExchangeConfig{
+			Enabled:     true,
+			RestBaseURL: server.URL,
+			Auth: AuthConfig{
+				APIKeyEnv:    "BINANCE_API_KEY",
+				APISecretEnv: "BINANCE_API_SECRET",
+			},
+		},
+	}, logger).(*CEXTradeClient)
+
+	_, err := client.PlaceOrder(context.Background(), TradeOrderRequest{
+		CanonicalSymbol: "BTC",
+		VenueSymbol:     "BTCUSDT",
+		Side:            "BUY",
+		OrderType:       "MARKET",
+		Quantity:        0.01,
+		ClientOrderID:   "cli-hedge",
+	})
+	if err == nil {
+		t.Fatal("expected hedge mode guard to reject the order")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "hedge mode") {
+		t.Fatalf("expected hedge mode error, got %v", err)
+	}
+	if orderCalled {
+		t.Fatal("expected order endpoint to remain untouched")
 	}
 }
 

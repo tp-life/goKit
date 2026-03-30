@@ -12,8 +12,10 @@ const (
 	// fundingSegmentTypeSingleReal 表示“只有一腿真实结算”的当前可见结算点。
 	// 例如 Aster 14:00 / Binance 16:00 时，14:00 就属于这一类。
 	fundingSegmentTypeSingleReal = "single_real"
-	// fundingSegmentTypeSingleForecast 表示“只有早结算腿发生 funding，且该点位于当前 sync boundary 之前”的预测段。
-	// 这类段只允许使用早结算腿的预测费率，不能跨到最晚 boundary。
+	// fundingSegmentTypeSingleForecast 是早期设计里保留下来的“中间预测段”类型。
+	//
+	// 当前 rolling 机会识别已经切成 real-only，不再主动生成这类 segment；
+	// 这里保留常量，主要是为了兼容历史数据和旧字段含义，避免序列化值突变。
 	fundingSegmentTypeSingleForecast = "single_forecast"
 	// fundingSegmentTypeSharedReal 表示双方当前 next funding time 已经对齐，因此该结算点可以直接比较真实 funding 差异。
 	fundingSegmentTypeSharedReal = "shared_real"
@@ -240,11 +242,13 @@ func buildRollingDirectionalFundingPlan(
 //
 // 规则严格对应之前确认的设计：
 // 1. 当前双方 next funding time 一致 => 只生成 shared_real；
-// 2. 当前不一致 => 只生成早结算腿的：
-//   - 第一段真实 settlement；
-//   - boundary 之前的中间 forecast settlement；
+// 2. 当前不一致 => 只生成早结算腿的第一段真实 settlement；
+// 3. 不再把 boundary 之前的中间预测段直接算进机会收益。
 //
-// 3. 不允许把 forecast 延伸到 sync boundary 本身。
+// 这里的 real-only 约束是刻意收紧后的策略语义：
+// - rolling 结构仍然保留：先吃最近一个真实结算点，再到下一个 review 重新判断；
+// - 但机会识别不再因为历史拟合把 18:00 / 19:00 这类未来单边段提前累计进 headline carry；
+// - 也就是说，rolling 保留“按结算段滚动”的执行方式，但去掉“跨未来段猜收益”的机会放大。
 func buildRollingFundingSegments(
 	cfg Config,
 	now time.Time,
@@ -272,6 +276,10 @@ func buildRollingFundingSegments(
 	if pathLimit <= nowMs {
 		return nil, nextReview, syncBoundary
 	}
+
+	// forecast 参数仍然保留在签名里，是为了让 rolling / legacy 两套 plan builder
+	// 维持一致的调用方式。当前 real-only rolling 不再消费它们。
+	_, _ = longForecast, shortForecast
 
 	segments := make([]fundingSegment, 0, 8)
 	appendSegment := func(segment fundingSegment) {
@@ -301,10 +309,8 @@ func buildRollingFundingSegments(
 	}
 
 	early := legDescriptor{exchange: longExchange, funding: longFunding, forecast: longForecast, isLong: true}
-	late := legDescriptor{exchange: shortExchange, funding: shortFunding, forecast: shortForecast, isLong: false}
 	if shortFunding.FundingTimeMs < longFunding.FundingTimeMs {
 		early = legDescriptor{exchange: shortExchange, funding: shortFunding, forecast: shortForecast, isLong: false}
-		late = legDescriptor{exchange: longExchange, funding: longFunding, forecast: longForecast, isLong: true}
 	}
 
 	if early.funding.FundingTimeMs <= pathLimit {
@@ -317,45 +323,6 @@ func buildRollingFundingSegments(
 			false,
 			early.isLong,
 		))
-	}
-
-	if !cfg.RollingAllowIntermediateForecastBeforeBoundary {
-		sortFundingSegments(segments)
-		return segments, nextReview, syncBoundary
-	}
-
-	intervalMs := int64(maxInt(early.funding.FundingIntervalHours, 0)) * int64(time.Hour/time.Millisecond)
-	if intervalMs <= 0 {
-		sortFundingSegments(segments)
-		return segments, nextReview, syncBoundary
-	}
-
-	maxForecastSegments := cfg.RollingMaxSingleExchangeForecastSegments
-	forecastCount := 0
-	for eventIdx := 2; ; eventIdx++ {
-		settlementTimeMs := early.funding.FundingTimeMs + int64(eventIdx-1)*intervalMs
-		if settlementTimeMs <= nowMs || settlementTimeMs > pathLimit {
-			break
-		}
-		if cfg.RollingForbidBoundaryForecast && settlementTimeMs >= late.funding.FundingTimeMs {
-			break
-		}
-		if settlementTimeMs >= late.funding.FundingTimeMs {
-			break
-		}
-		if maxForecastSegments > 0 && forecastCount >= maxForecastSegments {
-			break
-		}
-		appendSegment(buildSingleFundingSegment(
-			longExchange,
-			shortExchange,
-			early.forecast.PredictedRateForEvent(eventIdx),
-			settlementTimeMs,
-			eventIdx,
-			true,
-			early.isLong,
-		))
-		forecastCount++
 	}
 
 	sortFundingSegments(segments)

@@ -2,10 +2,14 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +34,13 @@ const (
 	executionStateCloseHedging = "close_hedging"
 	executionStateRiskBlocked  = "risk_blocked"
 	executionStateCircuitOpen  = "api_circuit_open"
+
+	// Aster 官方文档里把 -4015 明确写成 “Client order id length should not be more than 36 chars”。
+	// 这里把 36 作为 Binance-like venue 的统一硬限制，避免执行层分别维护多套几乎相同的约束。
+	maxClientOrderIDLen = 36
+	// 拆单子单会在基础 id 后追加 `-pN`，因此基础 id 需要预留一小段长度空间。
+	// 这里保守预留 6 个字符，足够覆盖 `-p9999` 这类常见拆单后缀。
+	maxClientOrderIDBaseLen = 30
 )
 
 type exchangeFailureState struct {
@@ -869,11 +880,14 @@ func (s *ExecutionService) placePlanOrders(ctx context.Context, plan *entity.Exe
 				}
 				cancel()
 				if err != nil {
-					if s.isPrimaryLegTimeout(err) {
-						// 子单超时并不一定代表这笔子单真的没成交，所以仍然要立即 reconcile。
+					if s.isPrimaryLegUncertain(err) {
+						// 子单超时、或者交易所明确告诉我们“执行结果未知”，都属于同一类高风险边界：
+						// 本地现在不能确认这笔单到底有没有落到交易所。
+						//
+						// 这时直接当纯失败会非常危险，所以仍然要立刻走一次 reconcile。
 						orderRecord.Status = "TIMEOUT"
 						orderRecord.ErrorMessage = err.Error()
-						orderRecord = s.reconcileTimedOutPrimaryLeg(ctx, adapter, orderRecord, childReq)
+						orderRecord = s.reconcileUncertainPrimaryLeg(ctx, adapter, orderRecord, childReq)
 						if phase == "open" && !isOrderFullySatisfied(orderRecord) {
 							orderRecord = s.bestEffortCancelOpenOrder(ctx, adapter, orderRecord, childReq)
 						}
@@ -1143,8 +1157,16 @@ func (s *ExecutionService) isPrimaryLegTimeout(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
-// reconcileTimedOutPrimaryLeg 处理一种很常见但也很危险的边界：
-// “请求方看来超时了，但交易所不一定真的没接到单。”
+func (s *ExecutionService) isPrimaryLegUncertain(err error) bool {
+	if s.isPrimaryLegTimeout(err) {
+		return true
+	}
+	var unknown *exchange.UnknownExecutionOutcomeError
+	return errors.As(err, &unknown)
+}
+
+// reconcileUncertainPrimaryLeg 处理一种很常见但也很危险的边界：
+// “请求方看来失败了，但交易所不一定真的没接到单。”
 //
 // 对套利腿来说，直接把这种超时当纯失败会有两个问题：
 // 1. 可能误触发 hedge，而实际上这条腿已经成交；
@@ -1156,7 +1178,7 @@ func (s *ExecutionService) isPrimaryLegTimeout(err error) bool {
 //
 // 如果 reconcile 证明这笔单其实已经成功，ErrorMessage 会被清空，
 // 这样它就能重新回到正常的 execution 汇总路径。
-func (s *ExecutionService) reconcileTimedOutPrimaryLeg(ctx context.Context, adapter exchange.TradeAdapter, rec entity.OrderRecord, req exchange.TradeOrderRequest) entity.OrderRecord {
+func (s *ExecutionService) reconcileUncertainPrimaryLeg(ctx context.Context, adapter exchange.TradeAdapter, rec entity.OrderRecord, req exchange.TradeOrderRequest) entity.OrderRecord {
 	rec = s.reconcileOrder(ctx, adapter, rec, req)
 	if isOrderFullySatisfied(rec) {
 		rec.ErrorMessage = ""
@@ -1329,7 +1351,7 @@ func (s *ExecutionService) buildTradeRequest(plan *entity.ExecutionPlan, phase, 
 		Quantity:        round8(qty),
 		Price:           round8(price),
 		ReduceOnly:      phase == "close",
-		ClientOrderID:   buildClientOrderID(plan, phase, legRole),
+		ClientOrderID:   buildClientOrderIDForExchange(meta.Exchange, plan, phase, legRole),
 		Reason:          phase,
 	}
 }
@@ -1353,17 +1375,26 @@ func (s *ExecutionService) buildRecoveryCloseRequest(plan *entity.ExecutionPlan,
 		Quantity:        round8(qty),
 		Price:           round8(price),
 		ReduceOnly:      true,
-		ClientOrderID:   buildClientOrderID(plan, "hedge", legRole),
+		ClientOrderID:   buildClientOrderIDForExchange(meta.Exchange, plan, "hedge", legRole),
 		Reason:          "open_leg_failed_hedge",
 	}
 }
 
 func splitClientOrderID(base string, part int) string {
-	base = strings.TrimSpace(base)
+	// 拆单后的子单 id 必须继续满足交易所长度限制。
+	// 因此不能直接在原字符串末尾无脑拼接 `-pN`，而是要先为后缀留足空间。
+	base = clampClientOrderID(base, maxClientOrderIDLen)
 	if base == "" || part <= 1 {
 		return base
 	}
-	return fmt.Sprintf("%s-p%d", base, part)
+	return appendClientOrderIDSuffix(base, fmt.Sprintf("-p%d", part))
+}
+
+func splitClientOrderIDForExchange(exchangeName, base string, part int) string {
+	if strings.EqualFold(strings.TrimSpace(exchangeName), "hyperliquid") {
+		return splitHyperliquidClientOrderID(base, part)
+	}
+	return splitClientOrderID(base, part)
 }
 
 // splitTradeRequestsByVenueLimit 会在交易所声明了单笔 maxQty 时，自动把一笔大单拆成多笔子单。
@@ -1404,7 +1435,7 @@ func splitTradeRequestsByVenueLimit(meta entity.Symbol, req exchange.TradeOrderR
 
 		chunkReq := req
 		chunkReq.Quantity = round8(chunkQty)
-		chunkReq.ClientOrderID = splitClientOrderID(req.ClientOrderID, part)
+		chunkReq.ClientOrderID = splitClientOrderIDForExchange(meta.Exchange, req.ClientOrderID, part)
 		out = append(out, chunkReq)
 		remaining = nextRemaining
 	}
@@ -1466,15 +1497,153 @@ func referencePriceForLeg(plan *entity.ExecutionPlan, legRole string) float64 {
 }
 
 func buildClientOrderID(plan *entity.ExecutionPlan, phase, legRole string) string {
-	prefix := plan.PlanKey
-	if len(prefix) > 10 {
-		prefix = prefix[:10]
+	// buildClientOrderID 既要保留最基本的可读性，又必须满足 Binance-like venue
+	// 对 `newClientOrderId` 的长度限制，尤其是 Aster 的 36 字符上限。
+	//
+	// 旧实现的问题有两个：
+	// 1. `open/close/hedge + long_leg/short_leg + planKey` 组合后，基础 id 常常已经被截到 36；
+	// 2. 拆单再追加 `-p2/-p3` 时会进一步越界，最终触发 Aster -4015。
+	//
+	// 新实现采用“短标签 + 时间 nonce + 短哈希”的结构：
+	// - symbol/phase/leg 仍然保留少量可读信息，方便排查；
+	// - 哈希承载大部分唯一性，避免继续把 planKey 整段塞进来；
+	// - 基础 id 主动控制在 30 字符以内，为拆单后缀预留空间。
+	now := time.Now()
+	symbolTag := sanitizeClientOrderIDToken(plan.Symbol, 8)
+	if symbolTag == "" {
+		symbolTag = "ord"
 	}
-	raw := fmt.Sprintf("%s-%s-%s-%s-%d", strings.ToLower(plan.Symbol), phase, legRole, prefix, time.Now().UnixMilli()%1_000_000)
-	if len(raw) > 36 {
-		return raw[:36]
+	phaseTag := abbreviateClientOrderPhase(phase)
+	legTag := abbreviateClientOrderLeg(legRole)
+	nonceTag := strconv.FormatInt(now.UnixMilli()%2_176_782_336, 36)
+	hashTag := shortClientOrderHash(fmt.Sprintf("%s|%s|%s|%s|%d", plan.PlanKey, plan.Symbol, phase, legRole, now.UnixNano()))
+	raw := fmt.Sprintf("%s-%s-%s-%s-%s", symbolTag, phaseTag, legTag, nonceTag, hashTag)
+	return clampClientOrderID(raw, maxClientOrderIDBaseLen)
+}
+
+func buildClientOrderIDForExchange(exchangeName string, plan *entity.ExecutionPlan, phase, legRole string) string {
+	// 不同交易所对 client order id 的约束差异很大：
+	// - Binance / Aster / Bybit 基本都接受 36 字符以内的人类可读 token；
+	// - Hyperliquid 则要求 `cloid` 是 16-byte hex，并带 `0x` 前缀。
+	//
+	// 因此这里不能继续用“一套字符串打天下”的做法，而是按交易所协议族生成。
+	if strings.EqualFold(strings.TrimSpace(exchangeName), "hyperliquid") {
+		return buildHyperliquidClientOrderID(plan, phase, legRole)
 	}
-	return raw
+	return buildClientOrderID(plan, phase, legRole)
+}
+
+func appendClientOrderIDSuffix(base, suffix string) string {
+	base = strings.TrimSpace(base)
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return clampClientOrderID(base, maxClientOrderIDLen)
+	}
+	if len(suffix) >= maxClientOrderIDLen {
+		return suffix[len(suffix)-maxClientOrderIDLen:]
+	}
+	maxBaseLen := maxClientOrderIDLen - len(suffix)
+	if len(base) > maxBaseLen {
+		base = base[:maxBaseLen]
+	}
+	return base + suffix
+}
+
+func buildHyperliquidClientOrderID(plan *entity.ExecutionPlan, phase, legRole string) string {
+	// Hyperliquid 官方文档要求 `cloid` 为 128-bit hex string，并带 `0x` 前缀。
+	//
+	// 这里用 sha256 的前 16 个字节构造稳定长度的 hex id：
+	// 1. 满足交易所格式约束；
+	// 2. 避免把 Binance-like 的短字符串格式误发到 Hyperliquid；
+	// 3. 即使后续继续拆单，也可以基于这个 hex cloid 再派生出新的合法 cloid。
+	now := time.Now()
+	return hyperliquidClientOrderIDFromSeed(
+		fmt.Sprintf("%s|%s|%s|%s|%d", plan.PlanKey, plan.Symbol, phase, legRole, now.UnixNano()),
+	)
+}
+
+func splitHyperliquidClientOrderID(base string, part int) string {
+	base = strings.TrimSpace(base)
+	if base == "" || part <= 1 {
+		return base
+	}
+	// Hyperliquid 的 cloid 不能像 Binance-like 一样直接拼 `-pN`。
+	// 因此拆单时改成“基于原 cloid + part 再派生一个新的 16-byte hex cloid”。
+	return hyperliquidClientOrderIDFromSeed(fmt.Sprintf("%s|part|%d", base, part))
+}
+
+func hyperliquidClientOrderIDFromSeed(seed string) string {
+	digest := sha256.Sum256([]byte(seed))
+	return "0x" + hex.EncodeToString(digest[:16])
+}
+
+func clampClientOrderID(raw string, maxLen int) string {
+	raw = strings.TrimSpace(raw)
+	if maxLen <= 0 || len(raw) <= maxLen {
+		return raw
+	}
+	return raw[:maxLen]
+}
+
+func sanitizeClientOrderIDToken(raw string, maxLen int) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" || maxLen <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(minInt(len(raw), maxLen))
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			if b.Len() >= maxLen {
+				break
+			}
+		}
+	}
+	return b.String()
+}
+
+func abbreviateClientOrderPhase(phase string) string {
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "open":
+		return "op"
+	case "close":
+		return "cl"
+	case "hedge":
+		return "hg"
+	default:
+		token := sanitizeClientOrderIDToken(phase, 2)
+		if token == "" {
+			return "na"
+		}
+		return token
+	}
+}
+
+func abbreviateClientOrderLeg(legRole string) string {
+	role := strings.ToLower(strings.TrimSpace(legRole))
+	switch {
+	case strings.Contains(role, "short"):
+		return "s"
+	case strings.Contains(role, "long"):
+		return "l"
+	default:
+		token := sanitizeClientOrderIDToken(role, 1)
+		if token == "" {
+			return "x"
+		}
+		return token
+	}
+}
+
+func shortClientOrderHash(raw string) string {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(raw))
+	encoded := strings.ToLower(strconv.FormatUint(hasher.Sum64(), 36))
+	if len(encoded) > 8 {
+		return encoded[:8]
+	}
+	return encoded
 }
 
 func ternarySide(cond bool, a, b string) string {

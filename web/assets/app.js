@@ -314,7 +314,52 @@ function bestProjection(item) {
   return rows.find((row) => row?.is_best_projection) || rows[0] || null;
 }
 
+function isRollingOpportunity(item) {
+  return String(item?.strategy_mode || "").toLowerCase() === "rolling_cycle_aligned";
+}
+
+function currentCarrySegment(item) {
+  if (!isRollingOpportunity(item)) return null;
+
+  // 展示层先解释“当前真实首段”：
+  // - 单腿先结算 => 只看先结算那一腿的真实 funding；
+  // - 双腿同结算 => 看当前真实 funding 差；
+  // 这样可以避免把 forecast 累加值误读成“马上这一轮就能拿到的 carry”。
+  const longFundingTimeMs = Number(item?.long_funding_time_ms || 0);
+  const shortFundingTimeMs = Number(item?.short_funding_time_ms || 0);
+  const longFundingRate = Number(item?.long_funding_rate || 0);
+  const shortFundingRate = Number(item?.short_funding_rate || 0);
+  if (longFundingTimeMs <= 0 && shortFundingTimeMs <= 0) return null;
+
+  if (longFundingTimeMs > 0 && (shortFundingTimeMs <= 0 || longFundingTimeMs < shortFundingTimeMs)) {
+    return {
+      carryRate: -longFundingRate,
+      settlementTimeMs: longFundingTimeMs,
+      longEvents: 1,
+      shortEvents: 0,
+    };
+  }
+  if (shortFundingTimeMs > 0 && (longFundingTimeMs <= 0 || shortFundingTimeMs < longFundingTimeMs)) {
+    return {
+      carryRate: shortFundingRate,
+      settlementTimeMs: shortFundingTimeMs,
+      longEvents: 0,
+      shortEvents: 1,
+    };
+  }
+  return {
+    carryRate: shortFundingRate - longFundingRate,
+    settlementTimeMs: Math.max(longFundingTimeMs, shortFundingTimeMs),
+    longEvents: 1,
+    shortEvents: 1,
+  };
+}
+
 function fundingSpread(item) {
+  const currentCarry = Number(currentCarrySegment(item)?.carryRate);
+  if (Number.isFinite(currentCarry)) {
+    return currentCarry;
+  }
   const bestProjectionCarry = Number(bestProjection(item)?.carry_rate);
   if (Number.isFinite(bestProjectionCarry)) {
     return bestProjectionCarry;
@@ -329,6 +374,14 @@ function fundingSpread(item) {
 }
 
 function fundingSpreadHourly(item) {
+  const current = currentCarrySegment(item);
+  if (current && Number.isFinite(Number(current.carryRate))) {
+    const windowHours = Math.max(
+      (Number(current.settlementTimeMs || 0) - Date.now()) / 3600000,
+      1 / 60,
+    );
+    return Number(current.carryRate) / windowHours;
+  }
   return Number(item.gross_edge_hourly || 0);
 }
 
@@ -1555,7 +1608,7 @@ function renderOpportunitySummary(items) {
       <div class="summary-metric-grid">
         ${summaryMetric("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl))}
         ${summaryMetric("净收益率", fmtSignedBps(item.net_expected_bps, 2), classForNumber(item.net_expected_bps))}
-        ${summaryMetric("事件化时均 edge", fmtPctRatio(fundingSpreadHourly(item), 5), classForNumber(fundingSpreadHourly(item)))}
+        ${summaryMetric("当前 Carry率", fmtPctRatio(fundingSpread(item), 5), classForNumber(fundingSpread(item)))}
         ${summaryMetric("最早结算倒计时", fmtDuration(earliestDelta))}
         ${summaryMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${summaryMetric("进入计划说明", planStatus.reason || "--")}
@@ -1587,7 +1640,7 @@ function renderOpportunityList(items) {
           <div class="opportunity-mini-grid">
             <div><span>组合</span><strong>${opportunityPair(item)}</strong></div>
             <div><span>Basis</span><strong>${fmtSignedBps(item.basis_bps, 2)}</strong></div>
-            <div><span>事件化时均 edge</span><strong>${fmtPctRatio(fundingSpreadHourly(item), 5)}</strong></div>
+            <div><span>当前 Carry率</span><strong>${fmtPctRatio(fundingSpread(item), 5)}</strong></div>
             <div><span>最早结算</span><strong>${fmtDuration(earliestDelta)}</strong></div>
             <div><span>预计持有</span><strong>${opportunityExpectedHoldText(item)}</strong></div>
             <div><span>产生时间</span><strong>${fmtTime(opportunityProducedTimeMs(item))}</strong></div>
@@ -1634,10 +1687,10 @@ function legCard(
       </div>
       <div class="detail-list compact-list">
         <div class="detail-item"><span class="detail-k">交易对</span><span class="detail-v">${venueSymbol || "--"}</span></div>
-        <div class="detail-item"><span class="detail-k">资金费率</span><span class="detail-v ${classForNumber(fundingRate)}">${fmtPctRatio(fundingRate, 5)}</span></div>
-        <div class="detail-item"><span class="detail-k">平滑后后续费率</span><span class="detail-v ${classForNumber(futureFundingRate)}">${fmtPctRatio(futureFundingRate, 5)}</span></div>
+        <div class="detail-item"><span class="detail-k">当前 next funding费率</span><span class="detail-v ${classForNumber(fundingRate)}">${fmtPctRatio(fundingRate, 5)}</span></div>
+        <div class="detail-item"><span class="detail-k">下一事件预测费率</span><span class="detail-v ${classForNumber(futureFundingRate)}">${fmtPctRatio(futureFundingRate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">小时费率</span><span class="detail-v ${classForNumber(hourlyRate)}">${fmtPctRatio(hourlyRate, 5)}</span></div>
-        <div class="detail-item"><span class="detail-k">下次结算</span><span class="detail-v">${fmtTime(fundingTimeMs)}</span></div>
+        <div class="detail-item"><span class="detail-k">当前 next funding</span><span class="detail-v">${fmtTime(fundingTimeMs)}</span></div>
         <div class="detail-item"><span class="detail-k">结算周期</span><span class="detail-v">${fundingIntervalText(fundingIntervalHours)}</span></div>
         <div class="detail-item"><span class="detail-k">盘口买一 / 卖一</span><span class="detail-v">${priceText(bidPrice)} / ${priceText(askPrice)}</span></div>
         <div class="detail-item"><span class="detail-k">盘口中间价</span><span class="detail-v">${priceText(mid)}</span></div>
@@ -1665,8 +1718,8 @@ function fundingRuleSummaryCard(title, rule, eventCount) {
       <div class="detail-list compact-list">
         <div class="detail-item"><span class="detail-k">交易所 / 合约</span><span class="detail-v">${rule.exchange || "--"} / ${rule.venue_symbol || "--"}</span></div>
         <div class="detail-item"><span class="detail-k">结算周期</span><span class="detail-v">${fundingIntervalText(rule.funding_interval_hours)}</span></div>
-        <div class="detail-item"><span class="detail-k">下一次结算</span><span class="detail-v">${fmtTime(rule.next_funding_time_ms)}</span></div>
-        <div class="detail-item"><span class="detail-k">当前 funding</span><span class="detail-v ${classForNumber(rule.current_funding_rate)}">${fmtPctRatio(rule.current_funding_rate, 5)}</span></div>
+        <div class="detail-item"><span class="detail-k">当前 next funding</span><span class="detail-v">${fmtTime(rule.next_funding_time_ms)}</span></div>
+        <div class="detail-item"><span class="detail-k">当前 next funding费率</span><span class="detail-v ${classForNumber(rule.current_funding_rate)}">${fmtPctRatio(rule.current_funding_rate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">Clamp 来源</span><span class="detail-v">${rule.clamp_source || "--"}</span></div>
         <div class="detail-item"><span class="detail-k">有效区间</span><span class="detail-v">${fmtPctRatio(rule.effective_floor_rate, 5)} ~ ${fmtPctRatio(rule.effective_cap_rate, 5)}</span></div>
         <div class="detail-item"><span class="detail-k">Regime / 置信度</span><span class="detail-v">${rule.forecast_regime || "--"} / ${rule.forecast_confidence || "--"}</span></div>
@@ -1731,27 +1784,34 @@ function renderOpportunityDetail(items) {
   }
 
   const selectedProjection = bestProjection(item);
+  const currentSegment = currentCarrySegment(item);
   const fundingDelta = Number.isFinite(Number(selectedProjection?.carry_rate))
     ? Number(selectedProjection.carry_rate)
     : fundingSpread(item);
+  const displayedCarry = Number.isFinite(Number(currentSegment?.carryRate))
+    ? Number(currentSegment.carryRate)
+    : fundingDelta;
   const hourlyDelta = Number.isFinite(
     Number(selectedProjection?.carry_rate_hourly_equivalent),
   )
     ? Number(selectedProjection.carry_rate_hourly_equivalent)
     : fundingSpreadHourly(item);
+  const displayedHourly = Number.isFinite(Number(currentSegment?.carryRate))
+    ? fundingSpreadHourly(item)
+    : hourlyDelta;
   const grossFundingPNL = Number.isFinite(Number(selectedProjection?.gross_funding_pnl))
     ? Number(selectedProjection.gross_funding_pnl)
     : Number(item.gross_funding_pnl || 0);
-  const selectedLongEvents = Number.isFinite(
-    Number(selectedProjection?.long_funding_event_count),
-  )
-    ? Number(selectedProjection.long_funding_event_count)
-    : Number(item.long_funding_event_count || 0);
-  const selectedShortEvents = Number.isFinite(
-    Number(selectedProjection?.short_funding_event_count),
-  )
-    ? Number(selectedProjection.short_funding_event_count)
-    : Number(item.short_funding_event_count || 0);
+  const selectedLongEvents = Number.isFinite(Number(currentSegment?.longEvents))
+    ? Number(currentSegment.longEvents)
+    : Number.isFinite(Number(selectedProjection?.long_funding_event_count))
+      ? Number(selectedProjection.long_funding_event_count)
+      : Number(item.long_funding_event_count || 0);
+  const selectedShortEvents = Number.isFinite(Number(currentSegment?.shortEvents))
+    ? Number(currentSegment.shortEvents)
+    : Number.isFinite(Number(selectedProjection?.short_funding_event_count))
+      ? Number(selectedProjection.short_funding_event_count)
+      : Number(item.short_funding_event_count || 0);
   const selectedProjectedFundingTimeMs = Number.isFinite(
     Number(selectedProjection?.projected_funding_time_ms),
   )
@@ -1788,11 +1848,11 @@ function renderOpportunityDetail(items) {
       <div class="detail-metric-grid">
         ${detailMetric("净收益", fmtMoney(item.net_expected_pnl), classForNumber(item.net_expected_pnl))}
         ${detailMetric("净收益率", fmtSignedBps(item.net_expected_bps, 2), classForNumber(item.net_expected_bps))}
-        ${detailMetric("优选窗口 Carry率", fmtPctRatio(fundingDelta, 5), classForNumber(fundingDelta))}
-        ${detailMetric("优选窗口时均 edge", fmtPctRatio(hourlyDelta, 5), classForNumber(hourlyDelta))}
+        ${detailMetric("当前 Carry率", fmtPctRatio(displayedCarry, 5), classForNumber(displayedCarry))}
+        ${detailMetric("当前时均边际", fmtPctRatio(displayedHourly, 5), classForNumber(displayedHourly))}
         ${detailMetric("Basis", fmtSignedBps(item.basis_bps, 2))}
         ${detailMetric("动态价差阈值", fmtSignedBps(maxAllowedBasisForItem(item), 2))}
-        ${detailMetric("优选窗口资金收益", fmtMoney(grossFundingPNL), classForNumber(grossFundingPNL))}
+        ${detailMetric("当前 Entry Path 资金收益", fmtMoney(grossFundingPNL), classForNumber(grossFundingPNL))}
         ${detailMetric("计划状态", planStatus.text, planStatus.cls === "good" ? "positive" : planStatus.cls === "bad" ? "negative" : "muted-text")}
         ${detailMetric("预计投入资金", displayPlan ? fmtMoney(planCapitalAllocated(displayPlan), 2) : "--")}
         ${detailMetric("目标杠杆", displayPlan ? `${fmtNumber(planTargetLeverage(displayPlan), 2)}x` : "--")}
@@ -1804,19 +1864,19 @@ function renderOpportunityDetail(items) {
         ${detailMetric("持有上限", holdLimitText())}
         ${detailMetric("结算后缓冲", closeGraceText())}
         ${detailMetric("下次 Review", fmtTime(item.next_review_time_ms))}
-        ${detailMetric("共享 Boundary", fmtTime(item.sync_boundary_time_ms))}
-        ${detailMetric("Entry Path", `${Number(item.entry_path_segment_count || 0)} 段`)}
-        ${detailMetric("停止原因", item.entry_path_stop_reason || "--")}
+        ${detailMetric("当前共享结算边界", fmtTime(item.sync_boundary_time_ms))}
+        ${detailMetric("当前 Entry Path 段数", `${Number(item.entry_path_segment_count || 0)} 段`)}
+        ${detailMetric("Entry Path 截止原因", item.entry_path_stop_reason || "--")}
         ${detailMetric("Long 结算倒计时", fmtDuration(nextLongMs))}
         ${detailMetric("Short 结算倒计时", fmtDuration(nextShortMs))}
-        ${detailMetric("预计 funding 兑现", fmtTime(selectedProjectedFundingTimeMs))}
+        ${detailMetric("当前 Entry Path 终点", fmtTime(selectedProjectedFundingTimeMs))}
         ${detailMetric("预计持有到", opportunityExpectedCloseText(item))}
         ${detailMetric("最晚入场时间", fmtTime(item.required_entry_by_funding_time_ms || item.earliest_funding_time_ms))}
         ${detailMetric("Funding 事件窗口", `${fmtNumber(selectedFundingWindowHours, 2)} h`)}
         ${detailMetric("结算前持有", holdingDurationText(item))}
         ${detailMetric("预计总持有", opportunityExpectedHoldText(item))}
         ${detailMetric("产生时间", fmtTime(opportunityProducedTimeMs(item)))}
-        ${detailMetric("Funding 事件次数", `Long ${selectedLongEvents} 次 / Short ${selectedShortEvents} 次`)}
+        ${detailMetric("当前事件数", `Long ${selectedLongEvents} 次 / Short ${selectedShortEvents} 次`)}
         ${detailMetric("估算模式", fundingEstimateModeText(item))}
         ${detailMetric("估算置信度", fundingEstimateConfidenceText(item))}
         ${detailMetric("平滑回看窗口", fundingSmoothingLookbackText())}
@@ -1907,7 +1967,7 @@ function renderOpportunityDetail(items) {
             <div class="detail-item"><span class="detail-k">是否可执行</span><span class="detail-v">${item.eligible_for_execution ? "是" : "否"}</span></div>
             <div class="detail-item"><span class="detail-k">最早结算时间</span><span class="detail-v">${fmtTime(item.earliest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">最晚结算时间</span><span class="detail-v">${fmtTime(item.latest_funding_time_ms)}</span></div>
-            <div class="detail-item"><span class="detail-k">预计 funding 兑现点</span><span class="detail-v">${fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)}</span></div>
+            <div class="detail-item"><span class="detail-k">当前 Entry Path 终点</span><span class="detail-v">${fmtTime(item.projected_funding_time_ms || item.latest_funding_time_ms)}</span></div>
             <div class="detail-item"><span class="detail-k">预计持有到</span><span class="detail-v">${opportunityExpectedCloseText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">结算前持有</span><span class="detail-v">${holdingDurationText(item)}</span></div>
             <div class="detail-item"><span class="detail-k">预计总持有</span><span class="detail-v">${opportunityExpectedHoldText(item)}</span></div>

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
@@ -779,7 +780,7 @@ func TestFundingRegimeProfile(t *testing.T) {
 	}
 }
 
-func TestBuildRollingDirectionalFundingPlan_BuildsSingleRealAndForecastBeforeBoundary(t *testing.T) {
+func TestBuildRollingDirectionalFundingPlan_UsesOnlyFirstRealSegmentBeforeBoundary(t *testing.T) {
 	cfg := Config{
 		StrategyMode: StrategyModeRollingCycleAligned,
 		HoldHours:    4,
@@ -813,36 +814,36 @@ func TestBuildRollingDirectionalFundingPlan_BuildsSingleRealAndForecastBeforeBou
 		spotForecast(shortFunding.FundingRate, 1),
 	)
 
-	if len(plan.Segments) != 2 {
-		t.Fatalf("expected 2 rolling segments before sync boundary, got %d", len(plan.Segments))
+	if len(plan.Segments) != 1 {
+		t.Fatalf("expected only the first real rolling segment before sync boundary, got %d", len(plan.Segments))
 	}
-	if plan.Segments[0].SegmentType != fundingSegmentTypeSingleReal || plan.Segments[1].SegmentType != fundingSegmentTypeSingleForecast {
-		t.Fatalf("expected [single_real, single_forecast], got [%s, %s]", plan.Segments[0].SegmentType, plan.Segments[1].SegmentType)
+	if plan.Segments[0].SegmentType != fundingSegmentTypeSingleReal {
+		t.Fatalf("expected single_real segment, got %s", plan.Segments[0].SegmentType)
 	}
-	if len(plan.Projections) != 2 {
-		t.Fatalf("expected 2 entry-path projections, got %d", len(plan.Projections))
+	if len(plan.Projections) != 1 {
+		t.Fatalf("expected only one current entry-path projection, got %d", len(plan.Projections))
 	}
-	if want := time.Date(2026, 1, 1, 15, 0, 0, 0, time.UTC).UnixMilli(); plan.Projections[1].ProjectedFundingTimeMs != want {
-		t.Fatalf("expected latest profitable rolling projection at 15:00, got %d", plan.Projections[1].ProjectedFundingTimeMs)
+	if want := time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(); plan.Projections[0].ProjectedFundingTimeMs != want {
+		t.Fatalf("expected current real rolling projection at 14:00, got %d", plan.Projections[0].ProjectedFundingTimeMs)
 	}
-	if want := 0.00712; math.Abs(plan.Projections[1].CarryRate-want) > 1e-9 {
-		t.Fatalf("expected cumulative carry %.8f, got %.8f", want, plan.Projections[1].CarryRate)
+	if want := 0.00356; math.Abs(plan.Projections[0].CarryRate-want) > 1e-9 {
+		t.Fatalf("expected current real carry %.8f, got %.8f", want, plan.Projections[0].CarryRate)
 	}
-	if plan.Projections[1].StrategyMode != StrategyModeRollingCycleAligned {
-		t.Fatalf("expected rolling projection mode, got %s", plan.Projections[1].StrategyMode)
+	if plan.Projections[0].StrategyMode != StrategyModeRollingCycleAligned {
+		t.Fatalf("expected rolling projection mode, got %s", plan.Projections[0].StrategyMode)
 	}
-	if plan.Projections[1].NextReviewTimeMs != longFunding.FundingTimeMs {
-		t.Fatalf("expected next review at first settlement %d, got %d", longFunding.FundingTimeMs, plan.Projections[1].NextReviewTimeMs)
+	if plan.Projections[0].NextReviewTimeMs != longFunding.FundingTimeMs {
+		t.Fatalf("expected next review at first settlement %d, got %d", longFunding.FundingTimeMs, plan.Projections[0].NextReviewTimeMs)
 	}
-	if plan.Projections[1].SyncBoundaryTimeMs != shortFunding.FundingTimeMs {
-		t.Fatalf("expected sync boundary %d, got %d", shortFunding.FundingTimeMs, plan.Projections[1].SyncBoundaryTimeMs)
+	if plan.Projections[0].SyncBoundaryTimeMs != shortFunding.FundingTimeMs {
+		t.Fatalf("expected sync boundary %d, got %d", shortFunding.FundingTimeMs, plan.Projections[0].SyncBoundaryTimeMs)
 	}
-	if plan.Projections[1].PathEndReason != fundingProjectionPathEndBoundary {
-		t.Fatalf("expected path to stop at sync boundary, got %s", plan.Projections[1].PathEndReason)
+	if plan.Projections[0].PathEndReason != fundingProjectionPathEndBoundary {
+		t.Fatalf("expected path to stop at sync boundary, got %s", plan.Projections[0].PathEndReason)
 	}
 }
 
-func TestBuildRollingDirectionalFundingPlan_StopsAtDirectionFlip(t *testing.T) {
+func TestBuildRollingDirectionalFundingPlan_NoLongerBuildsForecastFlipSegment(t *testing.T) {
 	cfg := Config{
 		StrategyMode: StrategyModeRollingCycleAligned,
 		HoldHours:    4,
@@ -888,17 +889,17 @@ func TestBuildRollingDirectionalFundingPlan_StopsAtDirectionFlip(t *testing.T) {
 		spotForecast(shortFunding.FundingRate, 1),
 	)
 
-	if len(plan.Segments) != 2 {
-		t.Fatalf("expected both segments to be available for inspection, got %d", len(plan.Segments))
+	if len(plan.Segments) != 1 {
+		t.Fatalf("expected only the first real segment to remain, got %d", len(plan.Segments))
 	}
 	if len(plan.Projections) != 1 {
-		t.Fatalf("expected entry path to stop before flipped forecast segment, got %d projections", len(plan.Projections))
+		t.Fatalf("expected a single real-only entry path projection, got %d projections", len(plan.Projections))
 	}
 	if want := time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(); plan.Projections[0].ProjectedFundingTimeMs != want {
 		t.Fatalf("expected entry path to stop at first real segment, got %d", plan.Projections[0].ProjectedFundingTimeMs)
 	}
-	if plan.Projections[0].PathEndReason != fundingProjectionPathEndDirectionFlip {
-		t.Fatalf("expected path end reason %s, got %s", fundingProjectionPathEndDirectionFlip, plan.Projections[0].PathEndReason)
+	if plan.Projections[0].PathEndReason != fundingProjectionPathEndBoundary {
+		t.Fatalf("expected path end reason %s, got %s", fundingProjectionPathEndBoundary, plan.Projections[0].PathEndReason)
 	}
 }
 
@@ -932,11 +933,40 @@ func TestBestFundingDirection_RollingModeChoosesCurrentEntryDirection(t *testing
 	if longEx != "aster" || shortEx != "binance" {
 		t.Fatalf("expected rolling direction long aster / short binance, got long=%s short=%s", longEx, shortEx)
 	}
-	if want := time.Date(2026, 1, 1, 15, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs != want {
-		t.Fatalf("expected latest profitable entry path at 15:00, got %d", projection.ProjectedFundingTimeMs)
+	if want := time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs != want {
+		t.Fatalf("expected current real entry path at 14:00, got %d", projection.ProjectedFundingTimeMs)
 	}
-	if projection.LongFundingEventCount != 2 || projection.ShortFundingEventCount != 0 {
-		t.Fatalf("expected path counts long=2 short=0, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+	if projection.LongFundingEventCount != 1 || projection.ShortFundingEventCount != 0 {
+		t.Fatalf("expected path counts long=1 short=0, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
+	}
+}
+
+func TestStrategyRunnerForecastFunding_RollingModeFallsBackToSpotOnly(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		StrategyMode:                  StrategyModeRollingCycleAligned,
+		FundingRateContinuationDecay:  0.3,
+		FundingSmoothingCurrentWeight: 0.1,
+		FundingHistoryLookback:        12 * time.Hour,
+	}}
+
+	now := time.Date(2026, 1, 1, 13, 48, 0, 0, time.UTC)
+	item := entity.FundingSnapshot{
+		Exchange:             "aster",
+		Symbol:               "KATUSDT",
+		FundingRate:          -0.00356,
+		FundingTimeMs:        time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	forecast := r.forecastFunding(context.Background(), now, item)
+	if forecast.Regime != "spot_only" {
+		t.Fatalf("expected rolling mode to use spot_only regime, got %s", forecast.Regime)
+	}
+	if forecast.CurrentRate != item.FundingRate || forecast.BaselineRate != item.FundingRate || forecast.HistoryMean != item.FundingRate {
+		t.Fatalf("expected rolling forecast rates to stay on current spot %.8f, got current=%.8f baseline=%.8f mean=%.8f", item.FundingRate, forecast.CurrentRate, forecast.BaselineRate, forecast.HistoryMean)
+	}
+	if got := forecast.PredictedRateForEvent(2); got != item.FundingRate {
+		t.Fatalf("expected later rolling event to stay on current spot %.8f, got %.8f", item.FundingRate, got)
 	}
 }
 

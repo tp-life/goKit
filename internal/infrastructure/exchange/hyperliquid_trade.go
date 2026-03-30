@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -80,6 +81,9 @@ func (c *HyperliquidTradeClient) PlaceOrder(ctx context.Context, req TradeOrderR
 	if !c.Enabled() {
 		return TradeOrderResult{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
+	if strings.TrimSpace(req.ClientOrderID) != "" && !isHyperliquidCloid(req.ClientOrderID) {
+		return TradeOrderResult{}, fmt.Errorf("%s invalid cloid %q: expected 0x-prefixed 16-byte hex string", c.name, req.ClientOrderID)
+	}
 	asset, err := strconv.Atoi(req.AssetID)
 	if err != nil {
 		return TradeOrderResult{}, fmt.Errorf("invalid hyperliquid asset id: %w", err)
@@ -114,24 +118,19 @@ func (c *HyperliquidTradeClient) PlaceOrder(ctx context.Context, req TradeOrderR
 	if err != nil {
 		return TradeOrderResult{}, err
 	}
-	status := asString(resp["status"])
-	venueOrderID := ""
-	if data, ok := resp["response"].(map[string]any); ok {
-		if inner, ok := data["data"].(map[string]any); ok {
-			venueOrderID = firstNonEmpty(asString(inner["oid"]), asString(inner["orderId"]))
-		} else {
-			venueOrderID = firstNonEmpty(asString(data["oid"]), asString(data["orderId"]))
-		}
+	outcome, err := parseHyperliquidPlaceOrderResponse(resp)
+	if err != nil {
+		return TradeOrderResult{}, fmt.Errorf("%s order rejected: %w", c.name, err)
 	}
 	return TradeOrderResult{
 		Exchange:        c.name,
 		CanonicalSymbol: req.CanonicalSymbol,
 		VenueSymbol:     req.VenueSymbol,
 		ClientOrderID:   req.ClientOrderID,
-		VenueOrderID:    venueOrderID,
-		Status:          firstNonEmpty(status, "submitted"),
-		ExecutedQty:     0,
-		AveragePrice:    req.Price,
+		VenueOrderID:    outcome.VenueOrderID,
+		Status:          outcome.Status,
+		ExecutedQty:     outcome.ExecutedQty,
+		AveragePrice:    firstPositive(outcome.AveragePrice, req.Price),
 		RawResponse:     raw,
 	}, nil
 }
@@ -179,11 +178,13 @@ func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLo
 	if !c.Enabled() {
 		return OrderStatus{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
-	payload := map[string]any{"type": "orderStatus", "user": c.accountAddress}
+	payload := map[string]any{"type": "orderStatus", "user": c.infoUserAddress()}
 	if req.VenueOrderID != "" {
 		payload["oid"] = req.VenueOrderID
 	} else if req.ClientOrderID != "" {
-		payload["cloid"] = req.ClientOrderID
+		// Hyperliquid 的 orderStatus 查询把真实 oid 和 client oid 都统一放在 `oid` 字段里。
+		// 文档说明这里既可以传数值 oid，也可以传 16-byte hex client order id。
+		payload["oid"] = req.ClientOrderID
 	} else {
 		return OrderStatus{}, fmt.Errorf("missing order lookup id")
 	}
@@ -192,11 +193,14 @@ func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLo
 	if err != nil {
 		return OrderStatus{}, err
 	}
-	status := strings.ToUpper(firstNonEmpty(asString(resp["status"]), asString(resp["state"])))
+	status, canceled, terminal := normalizeHyperliquidOrderStatus(firstNonEmpty(asString(resp["status"]), asString(resp["state"])))
 	filled := parseNullableFloat(resp["filled"])
 	avg := parseNullableFloat(resp["avgPx"])
 	if data, ok := resp["order"].(map[string]any); ok {
-		status = strings.ToUpper(firstNonEmpty(status, asString(data["status"]), asString(data["state"])))
+		normalized, dataCanceled, dataTerminal := normalizeHyperliquidOrderStatus(firstNonEmpty(asString(data["status"]), asString(data["state"])))
+		status = firstNonEmpty(normalized, status)
+		canceled = canceled || dataCanceled
+		terminal = terminal || dataTerminal
 		filled = firstPositive(filled, parseNullableFloat(data["filled"]), parseNullableFloat(data["sz"])-parseNullableFloat(data["remainingSz"]))
 		avg = firstPositive(avg, parseNullableFloat(data["avgPx"]))
 	}
@@ -205,10 +209,10 @@ func (c *HyperliquidTradeClient) GetOrderStatus(ctx context.Context, req OrderLo
 		Status:        firstNonEmpty(status, "SUBMITTED"),
 		ExecutedQty:   filled,
 		AveragePrice:  avg,
-		VenueOrderID:  firstNonEmpty(req.VenueOrderID, asString(resp["oid"])),
+		VenueOrderID:  firstNonEmpty(req.VenueOrderID, asString(resp["oid"]), hyperliquidResponseVenueOrderID(resp)),
 		ClientOrderID: req.ClientOrderID,
-		Terminal:      isTerminalOrderStatus(status),
-		Canceled:      status == "CANCELED" || status == "CANCELLED" || status == "EXPIRED",
+		Terminal:      terminal,
+		Canceled:      canceled,
 		RawResponse:   raw,
 	}, nil
 }
@@ -217,7 +221,7 @@ func (c *HyperliquidTradeClient) GetAccountSnapshot(ctx context.Context) (Accoun
 	if !c.Enabled() {
 		return AccountSnapshot{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
-	payload := map[string]any{"type": "userState", "user": c.accountAddress}
+	payload := map[string]any{"type": "userState", "user": c.infoUserAddress()}
 	var resp map[string]any
 	raw, err := c.postInfo(ctx, payload, &resp)
 	if err != nil {
@@ -250,7 +254,7 @@ func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbo
 	if !c.Enabled() {
 		return Position{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
 	}
-	payload := map[string]any{"type": "clearinghouseState", "user": c.accountAddress}
+	payload := map[string]any{"type": "clearinghouseState", "user": c.infoUserAddress()}
 	var resp map[string]any
 	_, err := c.postInfo(ctx, payload, &resp)
 	if err != nil {
@@ -283,6 +287,68 @@ func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbo
 	return Position{Exchange: c.name, Symbol: canonicalSymbol, VenueSymbol: venueSymbol}, nil
 }
 
+func (c *HyperliquidTradeClient) CancelOrder(ctx context.Context, req OrderLookupRequest) error {
+	if !c.Enabled() {
+		return fmt.Errorf("%s trade client disabled or missing credentials", c.name)
+	}
+	asset, err := strconv.Atoi(req.AssetID)
+	if err != nil {
+		return fmt.Errorf("invalid hyperliquid asset id: %w", err)
+	}
+
+	var action any
+	switch {
+	case strings.TrimSpace(req.VenueOrderID) != "":
+		oid, err := strconv.ParseUint(strings.TrimSpace(req.VenueOrderID), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid hyperliquid venue order id %q: %w", req.VenueOrderID, err)
+		}
+		action = hlCancelAction{
+			Type: "cancel",
+			Cancels: []hlCancelWire{{
+				A: asset,
+				O: oid,
+			}},
+		}
+	case strings.TrimSpace(req.ClientOrderID) != "":
+		if !isHyperliquidCloid(req.ClientOrderID) {
+			return fmt.Errorf("invalid hyperliquid cloid %q", req.ClientOrderID)
+		}
+		action = hlCancelByCloidAction{
+			Type: "cancelByCloid",
+			Cancels: []hlCancelByCloidWire{{
+				Asset: asset,
+				Cloid: req.ClientOrderID,
+			}},
+		}
+	default:
+		return fmt.Errorf("missing order cancel id")
+	}
+
+	nonce := time.Now().UnixMilli()
+	sig, err := c.signL1Action(action, nonce)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"action":    action,
+		"nonce":     nonce,
+		"signature": sig,
+	}
+	if c.vaultAddress != "" {
+		payload["vaultAddress"] = c.vaultAddress
+	}
+	var resp map[string]any
+	raw, err := c.postExchange(ctx, payload, &resp)
+	if err != nil {
+		return err
+	}
+	if errText := hyperliquidResponseError(resp); errText != "" {
+		return fmt.Errorf("%s cancel rejected: %s body=%s", c.name, errText, raw)
+	}
+	return nil
+}
+
 type hlLimitOrderType struct {
 	Tif string `json:"tif" msgpack:"tif"`
 }
@@ -307,6 +373,26 @@ type hlOrderAction struct {
 	Grouping string        `json:"grouping" msgpack:"grouping"`
 }
 
+type hlCancelWire struct {
+	A int    `json:"a" msgpack:"a"`
+	O uint64 `json:"o" msgpack:"o"`
+}
+
+type hlCancelAction struct {
+	Type    string         `json:"type" msgpack:"type"`
+	Cancels []hlCancelWire `json:"cancels" msgpack:"cancels"`
+}
+
+type hlCancelByCloidWire struct {
+	Asset int    `json:"asset" msgpack:"asset"`
+	Cloid string `json:"cloid" msgpack:"cloid"`
+}
+
+type hlCancelByCloidAction struct {
+	Type    string                `json:"type" msgpack:"type"`
+	Cancels []hlCancelByCloidWire `json:"cancels" msgpack:"cancels"`
+}
+
 type hlSignature struct {
 	R string `json:"r"`
 	S string `json:"s"`
@@ -318,6 +404,142 @@ func hyperliquidEquity(resp map[string]any) float64 {
 		return firstPositive(parseNullableFloat(summary["accountValue"]), parseNullableFloat(summary["marginUsed"]))
 	}
 	return firstPositive(parseNullableFloat(resp["accountValue"]), parseNullableFloat(resp["withdrawable"]))
+}
+
+type hyperliquidPlaceOrderOutcome struct {
+	VenueOrderID string
+	Status       string
+	ExecutedQty  float64
+	AveragePrice float64
+}
+
+func parseHyperliquidPlaceOrderResponse(resp map[string]any) (hyperliquidPlaceOrderOutcome, error) {
+	if errText := hyperliquidResponseError(resp); errText != "" {
+		return hyperliquidPlaceOrderOutcome{}, errors.New(errText)
+	}
+	response, _ := resp["response"].(map[string]any)
+	data := response
+	if inner, ok := response["data"].(map[string]any); ok {
+		data = inner
+	}
+	if statuses, ok := data["statuses"].([]any); ok && len(statuses) > 0 {
+		item, _ := statuses[0].(map[string]any)
+		if errText := strings.TrimSpace(asString(item["error"])); errText != "" {
+			return hyperliquidPlaceOrderOutcome{}, errors.New(errText)
+		}
+		if resting, ok := item["resting"].(map[string]any); ok {
+			return hyperliquidPlaceOrderOutcome{
+				VenueOrderID: firstNonEmpty(asString(resting["oid"]), hyperliquidResponseVenueOrderID(resp)),
+				Status:       "NEW",
+			}, nil
+		}
+		if filled, ok := item["filled"].(map[string]any); ok {
+			return hyperliquidPlaceOrderOutcome{
+				VenueOrderID: firstNonEmpty(asString(filled["oid"]), hyperliquidResponseVenueOrderID(resp)),
+				Status:       "FILLED",
+				ExecutedQty:  firstPositive(parseNullableFloat(filled["totalSz"]), parseNullableFloat(filled["sz"])),
+				AveragePrice: parseNullableFloat(filled["avgPx"]),
+			}, nil
+		}
+	}
+	return hyperliquidPlaceOrderOutcome{
+		VenueOrderID: hyperliquidResponseVenueOrderID(resp),
+		Status:       "SUBMITTED",
+	}, nil
+}
+
+func hyperliquidResponseVenueOrderID(resp map[string]any) string {
+	if response, ok := resp["response"].(map[string]any); ok {
+		if inner, ok := response["data"].(map[string]any); ok {
+			if oid := firstNonEmpty(asString(inner["oid"]), asString(inner["orderId"])); oid != "" {
+				return oid
+			}
+		}
+		if oid := firstNonEmpty(asString(response["oid"]), asString(response["orderId"])); oid != "" {
+			return oid
+		}
+	}
+	return firstNonEmpty(asString(resp["oid"]), asString(resp["orderId"]))
+}
+
+func hyperliquidResponseError(resp map[string]any) string {
+	status := strings.ToLower(strings.TrimSpace(asString(resp["status"])))
+	if status != "" && status != "ok" {
+		return firstNonEmpty(strings.TrimSpace(asString(resp["error"])), strings.TrimSpace(asString(resp["message"])), status)
+	}
+	if errText := strings.TrimSpace(asString(resp["error"])); errText != "" {
+		return errText
+	}
+	response, _ := resp["response"].(map[string]any)
+	if errText := strings.TrimSpace(asString(response["error"])); errText != "" {
+		return errText
+	}
+	data := response
+	if inner, ok := response["data"].(map[string]any); ok {
+		data = inner
+	}
+	if errText := strings.TrimSpace(asString(data["error"])); errText != "" {
+		return errText
+	}
+	if statuses, ok := data["statuses"].([]any); ok {
+		for _, rawItem := range statuses {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			if errText := strings.TrimSpace(asString(item["error"])); errText != "" {
+				return errText
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeHyperliquidOrderStatus(status string) (normalized string, canceled bool, terminal bool) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "":
+		return "", false, false
+	case "open", "triggered":
+		return "NEW", false, false
+	case "filled":
+		return "FILLED", false, true
+	case "canceled", "margincanceled", "vaultwithdrawalcanceled", "openinterestcapcanceled", "selftradecanceled", "reduceonlycanceled", "siblingfilledcanceled", "delistedcanceled", "liquidatedcanceled", "scheduledcancel":
+		return "CANCELED", true, true
+	case "rejected", "tickrejected", "mintradentlrejected", "perpmarginrejected", "reduceonlyrejected", "badalopxrejected", "ioccancelrejected", "badtriggerpxrejected":
+		return "REJECTED", false, true
+	default:
+		normalized = strings.ToUpper(strings.TrimSpace(status))
+		return normalized, isTerminalOrderStatus(normalized) && (normalized == "CANCELED" || normalized == "CANCELLED"), isTerminalOrderStatus(normalized)
+	}
+}
+
+func isHyperliquidCloid(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 34 || !strings.HasPrefix(value, "0x") {
+		return false
+	}
+	for _, r := range value[2:] {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (c *HyperliquidTradeClient) infoUserAddress() string {
+	// Hyperliquid 文档特别提醒：查询账户状态时要传“真实账户地址”，
+	// 如果在 vault / subaccount 模式下误传 agent wallet 地址，会得到空结果。
+	//
+	// 在本项目的配置语义里：
+	// - `accountAddress` 是主账户签名身份；
+	// - `vaultAddress` 表示我们正在代其交易的真实 vault/subaccount。
+	//
+	// 因此读取 account / position / orderStatus 时，优先使用 vaultAddress。
+	if strings.TrimSpace(c.vaultAddress) != "" {
+		return c.vaultAddress
+	}
+	return c.accountAddress
 }
 
 func hlTIF(v string) string {
@@ -340,7 +562,7 @@ func hlFloatToWire(x float64) string {
 	return text
 }
 
-func (c *HyperliquidTradeClient) signL1Action(action hlOrderAction, nonce int64) (hlSignature, error) {
+func (c *HyperliquidTradeClient) signL1Action(action any, nonce int64) (hlSignature, error) {
 	packed, err := msgpack.Marshal(action)
 	if err != nil {
 		return hlSignature{}, err

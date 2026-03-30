@@ -129,23 +129,26 @@ strategy:
 
   prediction:
     # funding 平滑估算的历史回看窗口。
+    # 当前主要给 legacy_projection 使用；rolling_cycle_aligned 的机会识别已改成 real-only。
     funding_history_lookback: 6h
     # 当前 funding 快照在平滑估算中的权重（0~1）。
+    # rolling real-only 模式下，这个参数不会再影响“当前是否是机会”的主 carry。
     funding_smoothing_current_weight: 0.7
     # 对同一腿未来第2次及以后 funding 的费率衰减系数。
+    # 当前 rolling 机会识别不再使用这类未来外推，只保留给 legacy_projection 或兼容链路。
     funding_rate_continuation_decay: 0.6
-    # 允许在 sync boundary 之前，对 early venue 的中间单边结算点做预测。
+    # 兼容开关：rolling real-only 机会识别当前忽略这个设置，不再把中间预测段算进收益。
     allow_intermediate_forecast_before_boundary: true
-    # 禁止在 sync boundary 时使用预测值替代 shared real funding。
+    # 兼容开关：rolling real-only 机会识别当前天然满足这个约束。
     forbid_boundary_forecast: true
 
   rolling:
     # EntryPath 是否只保留“方向连续一致”的 segment 前缀。
     entry_path_require_consistent_direction: true
-    # 允许 single_forecast_segment 最多延伸多少个中间周期。
-    # =0 表示只要还没到 boundary，就不做额外数量限制。
+    # 兼容字段：rolling 机会识别现在是 real-only，不再生成 single_forecast segment。
+    # 暂时保留这个字段，主要是为了兼容旧配置和历史文档。
     max_single_exchange_forecast_segments: 0
-    # rolling 层的预测护栏；通常建议与 prediction 段保持一致。
+    # 兼容字段：当前 rolling 机会识别忽略这些预测护栏；review/结构仍保留 rolling 语义。
     allow_intermediate_forecast_before_boundary: true
     forbid_boundary_forecast: true
     review:

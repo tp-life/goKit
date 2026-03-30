@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,38 @@ func TestFeeBreakdownText_UsesConfiguredModePerExchange(t *testing.T) {
 	got := feeBreakdownText(item, strategy, "maker")
 	if got != "binance maker 1.00 bps + hyperliquid maker 1.50 bps" {
 		t.Fatalf("unexpected fee breakdown: %q", got)
+	}
+}
+
+func TestFeeBreakdownText_UsesTakerFeesAfterJSONDecode(t *testing.T) {
+	// 这个用例覆盖真实链路里最容易被忽略的一步：
+	// system status API 会把 fees_by_exchange 以 snake_case JSON 返回给 TUI，
+	// TUI 再把它解到 StrategyStatus.FeesByExchange。若 FeeConfig 缺少 json tag，
+	// maker_bps / taker_bps 会静默变成 0，最终让“收益构成”里的手续费说明失真。
+	raw := []byte(`{
+		"strategy": {
+			"fees_by_exchange": {
+				"binance": {"maker_bps": 1.00, "taker_bps": 4.00},
+				"aster": {"maker_bps": 1.20, "taker_bps": 4.20}
+			}
+		}
+	}`)
+
+	var payload struct {
+		Strategy StrategyStatus `json:"strategy"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal strategy status: %v", err)
+	}
+
+	item := OpportunityListItem{
+		LongExchange:  "binance",
+		ShortExchange: "aster",
+	}
+	got := feeBreakdownText(item, payload.Strategy, "taker")
+	want := "binance taker 4.00 bps + aster taker 4.20 bps"
+	if got != want {
+		t.Fatalf("unexpected taker fee breakdown: got %q want %q", got, want)
 	}
 }
 
@@ -194,7 +227,7 @@ func TestRenderOverviewDetail_ShowsLegsBeforePnLBreakdown(t *testing.T) {
 		"持有上限=4.0h",
 		"策略模式=按结算段滚动",
 		"下次 Review=",
-		"共享 Boundary=",
+		"当前共享结算边界=",
 		"预计平仓=",
 		"预计总持有=",
 		"结算后缓冲=15s",
@@ -238,12 +271,60 @@ func TestRenderOverviewDetail_PrefersDetailedBestProjectionCarry(t *testing.T) {
 
 	got := m.renderOverviewDetail(item, detail, true, false, entity.ExecutionPlan{}, false, entity.ExecutionRecord{}, false, 180)
 	for _, needle := range []string{
-		"优选 Carry率=0.61409%",
-		"优选时均边际=1.33977%",
+		"当前 Carry率=0.61409%",
+		"当前时均边际=1.33977%",
 	} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("expected overview detail to contain %q, got %q", needle, got)
 		}
+	}
+}
+
+func TestRenderOverviewDetail_RollingPrefersCurrentRealCarry(t *testing.T) {
+	m := NewModel(nil, 0)
+	m.data.System.Strategy = StrategyStatus{
+		Mode:              service.StrategyModeRollingCycleAligned,
+		HoldHours:         4,
+		HoldSelectionMode: "latest_profitable",
+	}
+	m.data.System.Execution = ExecutionStatus{
+		CloseGracePeriod: "15s",
+	}
+
+	item := OpportunityListItem{
+		Symbol:                 "DOOD",
+		LongExchange:           "aster",
+		ShortExchange:          "binance",
+		NetExpectedPNL:         3.1,
+		NetExpectedBps:         10,
+		LongFundingRate:        -0.00062908,
+		ShortFundingRate:       -0.01031913,
+		LongFundingTimeMs:      time.Now().Add(time.Hour).UnixMilli(),
+		ShortFundingTimeMs:     time.Now().Add(4 * time.Hour).UnixMilli(),
+		GrossEdgeHourly:        0.00212,
+		ProjectedFundingTimeMs: time.Now().Add(3 * time.Hour).UnixMilli(),
+	}
+	detail := &entity.Opportunity{
+		StrategyMode:       service.StrategyModeRollingCycleAligned,
+		LongFundingRate:    -0.00062908,
+		ShortFundingRate:   -0.01031913,
+		LongFundingTimeMs:  time.Now().Add(time.Hour).UnixMilli(),
+		ShortFundingTimeMs: time.Now().Add(4 * time.Hour).UnixMilli(),
+		ProjectionDetails: []entity.OpportunityProjection{
+			{
+				IsBestProjection:          true,
+				CarryRate:                 0.0047769,
+				CarryRateHourlyEquivalent: 0.0021222,
+			},
+		},
+	}
+
+	got := m.renderOverviewDetail(item, detail, true, false, entity.ExecutionPlan{}, false, entity.ExecutionRecord{}, false, 180)
+	if !strings.Contains(got, "当前 Carry率=0.06291%") {
+		t.Fatalf("expected rolling overview to explain current real carry, got %q", got)
+	}
+	if strings.Contains(got, "当前 Carry率=0.47769%") {
+		t.Fatalf("expected rolling overview not to headline forecast carry, got %q", got)
 	}
 }
 
@@ -281,9 +362,9 @@ func TestRenderPlanDetail_ShowsHoldModeAndTiming(t *testing.T) {
 		"持有上限=4.0h",
 		"策略模式=按结算段滚动",
 		"下次 Review=",
-		"共享 Boundary=",
+		"当前共享结算边界=",
 		"计划持仓=",
-		"预计 funding 兑现=",
+		"当前 Entry Path 终点=",
 		"目标平仓=",
 		"结算后缓冲=15s",
 	} {
@@ -309,11 +390,42 @@ func TestRenderLegsDetail_RendersComparisonTable(t *testing.T) {
 		ShortFundingTimeMs:     time.Now().Add(2 * time.Hour).UnixMilli(),
 	}
 
-	got := NewModel(nil, 0).renderLegsDetail(item, nil, false, false, 180)
-	for _, needle := range []string{"指标", "做多腿", "做空腿", "交易所", "当前费率", "标记价"} {
+	got := NewModel(nil, 0).renderLegsDetail(item, nil, false, false, 260)
+	for _, needle := range []string{"指标", "做多腿", "做空腿", "交易所", "当前 next", "下一事件预", "标记价"} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("expected legs detail table to contain %q, got %q", needle, got)
 		}
+	}
+}
+
+func TestRenderOpportunityList_UsesCarryRateInsteadOfHourlyEdge(t *testing.T) {
+	m := NewModel(nil, 0)
+	m.data.System.Strategy = StrategyStatus{
+		EffectiveNotional: 1600,
+	}
+	m.data.Opportunities = []OpportunityListItem{
+		{
+			Symbol:                 "KAT",
+			LongExchange:           "aster",
+			ShortExchange:          "binance",
+			LongVenueSymbol:        "KATUSDT",
+			ShortVenueSymbol:       "KATUSDT",
+			NetExpectedPNL:         6.6,
+			GrossFundingPNL:        8.0,
+			GrossEdgeHourly:        0.0133977,
+			BasisBps:               1.9,
+			ProjectedFundingTimeMs: time.Now().Add(time.Hour).UnixMilli(),
+			Status:                 "eligible",
+		},
+	}
+	m.normalizeSelections()
+
+	got := m.renderOpportunityList(180, 18)
+	if !strings.Contains(got, "carry") {
+		t.Fatalf("expected opportunity list to show carry label, got %q", got)
+	}
+	if !strings.Contains(got, "0.50000%") {
+		t.Fatalf("expected opportunity list to show carry derived from gross funding pnl, got %q", got)
 	}
 }
 
@@ -356,8 +468,8 @@ func TestRenderProjectionDetail_IncludesFundingSegmentSections(t *testing.T) {
 
 	got := m.renderProjectionDetail(OpportunityListItem{}, detail, true, false, 180)
 	for _, needle := range []string{
-		"Entry Path Settlement 段",
-		"完整 Settlement 段",
+		"当前 Entry Path 段",
+		"当前 Boundary 内全部结算段",
 		"说明: “反向”表示该段最优方向已经不同于当前持仓方向",
 	} {
 		if !strings.Contains(got, needle) {

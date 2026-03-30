@@ -41,19 +41,32 @@ type cexUserDataOrder struct {
 	OrderID       any    `json:"i"`
 }
 
-// supportsOrderEventStream 明确声明“当前这份 CEX 交易适配器是否真的具备私有订单流实现”。
+// supportsOrderEventStream 明确声明“当前这份 Binance-like 适配器是否真的具备用户订单流能力”。
 //
-// 虽然 Binance 和 Aster 在仓库里都复用了 CEXTradeClient，但当前真实落地的私有流实现
-// 只针对 Binance 官方 USD-M Futures 文档验证过。
-// 因此这里先保守限制在 Binance，避免把“看起来像 Binance-like”但细节不完全一致的交易所
-// 误接进来后产生静默错单风险。
+// 现在这里同时放开 Binance 与 Aster，原因是两边的官方文档都明确给出了同族的用户流协议：
+// - REST 侧通过 `POST /fapi/v1/listenKey` 创建 listenKey；
+// - websocket 侧订阅 `/ws/<listenKey>`；
+// - 订单更新使用 `ORDER_TRADE_UPDATE`；
+// - listenKey 过期会收到 `listenKeyExpired`。
+//
+// 不过用户流接口仍然要求 API key，所以这里不能只看 `Enabled()`：
+// - Aster v3 signer 只配 signer key、没配 API key 的场景，交易接口可以工作；
+// - 但用户流仍然无法创建 listenKey，此时必须把能力保持为关闭。
 func (c *CEXTradeClient) supportsOrderEventStream() bool {
-	return c != nil && c.Enabled() && strings.EqualFold(c.name, "binance")
+	if c == nil || !c.cfg.Enabled || strings.TrimSpace(c.apiKey) == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(c.name)) {
+	case "binance", "aster":
+		return true
+	default:
+		return false
+	}
 }
 
-// StartOrderEventStream 负责启动 Binance Futures 用户订单事件流。
+// StartOrderEventStream 负责启动 Binance-like 用户订单事件流。
 //
-// 当前实现遵循 Binance 官方用户流流程：
+// 当前实现遵循 Binance / Aster 这一族文档中一致的用户流流程：
 // 1. 先通过 REST 创建 listenKey；
 // 2. 再连接 `wss://.../ws/<listenKey>`；
 // 3. 后台定期对 listenKey 做 keepalive；
@@ -213,7 +226,9 @@ func (c *CEXTradeClient) parseUserDataOrderEvent(payload []byte) (OrderEvent, bo
 	case "ORDER_TRADE_UPDATE":
 		orderStatus := strings.ToUpper(strings.TrimSpace(event.Order.OrderStatus))
 		return OrderEvent{
-			Source:        "binance_user_stream",
+			// source 带上交易所名，是为了让执行层日志、排障和回放时能清楚看出事件来源。
+			// 这里仍然保持统一的 `_user_stream` 后缀，方便上层把 Binance / Aster 归为同一类恢复事实来源。
+			Source:        strings.ToLower(strings.TrimSpace(c.name)) + "_user_stream",
 			Exchange:      c.name,
 			ClientOrderID: strings.TrimSpace(event.Order.ClientOrderID),
 			VenueOrderID:  normalizeVenueOrderID(event.Order.OrderID),

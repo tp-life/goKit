@@ -1325,18 +1325,17 @@ func buildFundingCandidateTimes(nowMs int64, longFunding, shortFunding entity.Fu
 }
 
 func (r *StrategyRunner) forecastFunding(ctx context.Context, now time.Time, item entity.FundingSnapshot) fundingForecast {
+	// rolling 模式下，机会识别与开仓复核已经切成 real-only：
+	// - 只根据当前真实首段 settlement 计算收益；
+	// - 不再把历史拟合得到的未来 funding 直接抬成机会。
+	//
+	// 因此这里也同步退化成 spot-only forecast，避免展示层和元数据里继续出现
+	// “下一事件预测费率远大于当前费率”的误导性数字。
+	if r.cfg.normalize().StrategyMode == StrategyModeRollingCycleAligned {
+		return rollingSpotForecast(r.cfg, item)
+	}
 	if r.forecaster == nil {
-		return fundingForecast{
-			CurrentRate:        item.FundingRate,
-			BaselineRate:       item.FundingRate,
-			HistoryMean:        item.FundingRate,
-			Regime:             "spot_only",
-			Confidence:         "low",
-			MeanReversion:      0.2,
-			ContinuationDecay:  normalizedContinuationDecay(r.cfg.FundingRateContinuationDecay),
-			EffectiveFloorRate: item.FundingRate,
-			EffectiveCapRate:   item.FundingRate,
-		}
+		return rollingSpotForecast(r.cfg, item)
 	}
 	return r.forecaster.Forecast(ctx, now, item)
 }

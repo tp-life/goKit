@@ -15,6 +15,12 @@
 3. 持仓后新增持续监控状态机，在每个 review 点做 `continue / close / flip` 决策；
 4. 配置层重构为“分层设计配置 + 当前运行时兼容桥”。
 
+2026-03-30 更新：
+
+- rolling 结构保留，但机会识别已从“real + forecast entry path”收紧为“real-only entry path”；
+- 当前是否值得开仓，只看当前真实可结算的第一段；
+- 未来段收益不再因为历史拟合被提前累计到 headline carry。
+
 ---
 
 ## 2. 当前实现的关键限制
@@ -69,12 +75,7 @@
    - funding 已是真实快照
    - 例：`14:00`
 
-2. `single_forecast_segment`
-   - 只有 early venue 发生 funding
-   - 但该 funding 属于 boundary 之前的后续轮次，只允许用 early venue 的预测值
-   - 例：`15:00`
-
-3. `shared_real_segment`
+2. `shared_real_segment`
    - 两边同一时刻 funding
    - 必须使用双方真实 next funding 快照
    - 例：`16:00`
@@ -84,13 +85,14 @@
 `EntryPath` 定义为：
 
 - 从当前时刻开始，
-- 只保留“方向连续一致”的 segment 前缀，
+- 只保留“当前真实可见”的 segment 前缀，
 - 用该前缀累计收益，得到首次开仓的主决策路径。
 
 这意味着：
 
-- `14:00` 和 `15:00` 如果方向一致，可以作为同一条 entry path；
-- `16:00` 如果 shared segment 方向切换，则不再属于这条 entry path，而成为下一次 review 的决策点。
+- `14:00` 会成为当前 entry path；
+- `15:00` 不再提前累计，而是等 `14:00` 之后拿到新快照，再作为下一次 review 的输入；
+- `16:00` 如果 shared segment 方向切换，也是在后续 review 时重新判断。
 
 ---
 
@@ -134,14 +136,14 @@ lower funding rate venue => long
 higher funding rate venue => short
 ```
 
-### 4.3 预测护栏
+### 4.3 Real-Only 约束
 
-预测只允许用于 `single_forecast_segment`，并遵守：
+当前 rolling 机会识别遵守下面的 real-only 约束：
 
-1. 只允许预测 early venue；
-2. 只允许预测 `segment_time < sync_boundary`；
-3. 一旦 `segment_time == sync_boundary`，必须双方都是真实 funding；
-4. 禁止使用 early venue 的预测值跨过 boundary 与 late venue 的真实值做差。
+1. 只用当前真实 `next funding` 快照生成机会；
+2. 当前不同步时，只计算 early venue 的第一段真实 settlement；
+3. 当前同步时，只计算这一档 shared real settlement；
+4. 未来段不再通过历史均值、延续衰减或回归模型提前纳入当前开仓收益。
 
 ---
 
@@ -183,19 +185,19 @@ entry_path_net =
    - direction = `long Aster / short Binance`
 
 2. `15:00`
-   - `single_forecast_segment`
-   - 若预测 Aster 仍为负，且方向与 `14:00` 一致，则可累加到 entry path
+   - 不再提前计入当前 entry path
+   - 需要等 `14:00` 过后，用新的真实快照重新判断
 
 3. `16:00`
    - `shared_real_segment`
    - carry = `1600 * abs(-1.2% - (-0.356%)) = 13.504`
    - direction = `long Binance / short Aster`
-   - 与前缀方向不同，不属于首次 entry path
+   - 是否进入持仓路径，要等后续 review 再判断
 
 因此：
 
-- `14:00` 与 `15:00` 属于同一条 entry path；
-- `16:00` 是下一次 review 的候选翻仓点。
+- 当前 entry path 只包含 `14:00`；
+- `15:00` 与 `16:00` 都属于后续 review 的候选时点。
 
 ---
 
@@ -373,7 +375,6 @@ flowchart TD
 职责：
 
 - 构建 `single_real_segment`
-- 构建 `single_forecast_segment`
 - 构建 `shared_real_segment`
 - 输出 segment 列表与 `EntryPath`
 
@@ -512,6 +513,12 @@ strategy:
 3. 为 rolling 设计生成一组运行时归一化字段；
 4. 在 rolling 模式完全落地前，让旧执行主链仍有合理 fallback。
 
+### 11.2 当前实现说明
+
+- `prediction.*` 相关参数目前主要仍服务于 `legacy_projection`；
+- `rolling_cycle_aligned` 的机会识别、开仓前复核和 review 决策，当前都已改成 real-only；
+- `rolling.*` 里与 forecast 相关的字段暂时保留，是为了兼容旧配置和历史文档，不再直接抬高当前机会收益。
+
 ---
 
 ## 12. 测试计划
@@ -569,3 +576,338 @@ strategy:
 - legacy plan 的固定 `target_close_time` 自动平仓语义不变
 - rolling successor 优先复用最新 plan batch；找不到时再即时构建 successor plan
 - rolling monitor 目前使用 spot forecast 复核，不直接复用 StrategyRunner 的历史 funding forecaster 缓存
+
+---
+
+## 15. 多机会仓位分配与重启恢复
+
+这一节描述的是“当前代码已经实现的行为”，不是理想化目标行为。
+
+相关代码主入口：
+
+- `planning.go`
+- `execution_service.go`
+- `execution_risk_guards.go`
+- `execution_live_positions.go`
+- `execution_rolling_monitor.go`
+
+### 15.1 多个机会同时存在时，系统如何决定开哪些仓
+
+当前实现分成两层：
+
+1. 机会层
+   - 所有 `eligible` 的机会都会先生成 `execution_plan`
+   - 这一步不会因为“当前已经有别的仓位”而少生成 plan
+
+2. 执行层
+   - `ExecutionService.runAutoOpen()` 在每轮 loop 里只从最新 plan batch 里挑可以开的 plan
+   - 真正决定“本轮到底开几条”的，是执行层的 slot / 预算 / rolling group / 风控
+
+### 15.2 初始 plan 的默认仓位
+
+`StrategyRunner.buildExecutionPlans()` 生成 plan 时，会先给每条 plan 写一套“默认目标仓位”：
+
+- `CapitalAllocatedUSDT = total_capital_usdt * capital_utilization`
+- `TargetNotionalUSDT = EffectiveNotional()`
+
+这意味着：
+
+- 计划层默认认为“每条机会都值得一套完整目标名义”
+- 真正到自动开仓时，才会根据现有持仓和剩余预算做二次缩放
+
+### 15.3 自动开仓时的候选过滤顺序
+
+`runAutoOpen()` 当前的过滤顺序是：
+
+1. 只看最新 plan batch
+2. 只保留 `ReadyNow=true` 且 `status=ready`
+3. 已经存在同 `plan_key` 的 `execution_record`，则跳过
+4. rolling 模式下，若同一 `RollingGroupKey` 已有 active live record，则跳过
+5. 若已达到 `max_live_plans`，停止继续开新仓
+6. 若已达到 `max_auto_open_per_loop`，停止本轮继续开仓
+
+### 15.4 rolling group 如何避免同组双持仓
+
+`RollingGroupKey` 只编码：
+
+- `symbol`
+- 排序后的两个交易所名
+
+它故意不编码方向。
+
+因此：
+
+- `Long A / Short B`
+- `Long B / Short A`
+
+属于同一个 rolling group。
+
+这样执行层就能保证：
+
+- 同一币种、同一交易所对，在同一时刻最多只保留一条 active rolling 仓位
+- 到 review 点发生翻仓时，不会因为 successor plan 的 `plan_key` 不同而提前双开
+
+### 15.5 多机会并发时的预算如何分配
+
+如果 `execution.auto_allocate_capital=true`，自动开仓不会让第一条候选独占全部剩余预算。
+
+当前逻辑：
+
+1. 先统计当前 active live records 的已占用名义
+2. `remainingBudget = EffectiveNotional() - activeAllocatedNotional`
+3. 再估算“本轮剩余还可能开几条”
+4. 用 `remainingBudget / remainingTargets` 作为每条候选的目标名义
+5. 通过 `scalePlanForAutoBudget()` 把 plan 缩成较小仓位
+
+这样做的结果是：
+
+- 本轮里多个同时 ready 的机会，能尽量平均分到一份预算
+- 预算不够时，后面的机会可能直接因为剩余预算耗尽而不再尝试
+
+### 15.6 自动缩仓后，系统会不会重新复核利润
+
+会。
+
+而且是两次：
+
+1. 缩仓时重算一遍计划收益
+   - `scalePlanForAutoBudget()` 会按新的目标名义重新计算：
+   - `FundingCarryPNL`
+   - `EntryFeePNL`
+   - `ExitFeePNL`
+   - `SlippagePNL`
+   - `SafetyBufferPNL`
+   - `NetExpectedPNL`
+
+2. 真正发单前再按当前市场快照做一次 revalidation
+   - `openPlan()` 调用 `revalidatePlanBeforeOpen()`
+   - 这里会重新读取当前 funding / book
+   - 按当前缩仓后的 `plan.LongQty / ShortQty` 重新算当前名义
+   - 再用当前 projection carry 计算：
+
+```text
+currentGrossFundingPNL = currentNotional * currentProjection.CarryRate
+currentNetExpectedPNL =
+  currentGrossFundingPNL
+  - plan.EntryFeePNL
+  - plan.ExitFeePNL
+  - plan.SlippagePNL
+  - plan.SafetyBufferPNL
+```
+
+最后它会再次校验：
+
+```text
+currentNetExpectedPNL >= cfg.MinNetPNL
+```
+
+所以，对你这个问题的明确答案是：
+
+- 持续开仓时，如果因为已有仓位占用了预算，导致新机会只能缩小仓位
+- 系统会按缩小后的仓位重新计算利润
+- 如果缩小后利润跌破 `min_net_pnl`，这条单在发单前会被挡掉
+
+### 15.7 这层复核的边界
+
+当前实现虽然会复核利润，但它不是“重新回到机会层重新挑全局最优窗口”，而是：
+
+- 尽量沿用这条 plan 当时已经选中的 funding 路径
+- 用最新快照重算这条路径的当前 carry 和净收益
+
+这意味着：
+
+- 它回答的是“这条原计划现在还值不值得开”
+- 不是“在预算变小后，市场上是否出现了另一条更值得开的机会”
+
+### 15.8 开仓前还会过哪些风控
+
+即使利润还够，真正发单前还要过 `enforceRiskControls()`：
+
+- 交易所 adapter 是否可用
+- 账户权益是否低于最低要求
+- 可用余额是否足以覆盖保证金
+- 单币总暴露是否超过 `max_single_symbol_exposure_usdt`
+- 单交易所总暴露是否超过 `max_single_exchange_exposure_usdt`
+
+所以多个机会并发时，一条机会最终能不能开，取决于：
+
+- slot
+- 剩余预算
+- 缩仓后利润
+- 账户余额
+- 暴露上限
+
+### 15.9 多机会自动开仓流程图
+
+```mermaid
+flowchart TD
+    A[读取最新 plan batch] --> B[过滤 ready 且无 execution_record 的 plan]
+    B --> C[读取 active live records]
+    C --> D[计算 active live slots / active allocated notional]
+    D --> E[rolling group 去重]
+    E --> F{auto_allocate_capital?}
+    F -- 否 --> G[按原 plan 尝试 open]
+    F -- 是 --> H[按剩余预算 / 剩余目标数 缩放 plan]
+    H --> I[重算缩仓后 NetExpectedPNL]
+    I --> G
+    G --> J[revalidatePlanBeforeOpen]
+    J --> K{利润/Basis/时间窗仍通过?}
+    K -- 否 --> L[拒绝开仓]
+    K -- 是 --> M[enforceRiskControls]
+    M --> N{余额/暴露通过?}
+    N -- 否 --> L
+    N -- 是 --> O[发单并写 execution_record]
+    O --> P[回写 active slots / allocated notional / rolling group]
+```
+
+### 15.10 程序重启后，仓位是如何接管的
+
+当前重启恢复不是靠内存，而是靠数据库中的 `execution_record`。
+
+只要某条 live 仓位对应的 `execution_record` 还在，并且状态属于 active live 集合，它在重启后就会：
+
+- 继续占用 live slot
+- 继续占用 allocated notional 预算
+- 继续参与 rolling review / auto close / live position reconcile
+
+### 15.11 重启后的 loop 顺序
+
+执行引擎每一轮 loop 的顺序是：
+
+1. `ReconcileLivePositions()`
+2. `runAutoOpen()`
+3. `runRollingMonitor()`
+4. `runAutoClose()`
+
+这个顺序有两个直接后果：
+
+1. 旧仓位会先参与对账，再决定是否还能继续被视作 active
+2. auto-open 在同一轮里会先看到“数据库认为当前还活着的仓位”，因此不会把重启瞬间错误地当成空仓
+
+### 15.12 重启后为什么不会立刻消费旧 plan
+
+`runAutoOpen()` 在服务启动后的最初几轮，不会马上消费数据库里残留的旧 ready plan。
+
+它会等到：
+
+- 最新 plan batch 的 `AsOfTimeMs`
+- 已经晚于这次进程的启动时间
+
+才把 auto-open 解锁。
+
+这样可以避免：
+
+- 进程刚起来
+- 新一轮机会和 plan 还没生成
+- 却把重启前旧配置/旧模式留下的 ready plan 直接开掉
+
+### 15.13 重启后，哪些 live 仓位会被继续视作“活跃”
+
+当前 `ListActiveLive()` 把下面这些状态都视作 active live：
+
+- `pending_open`
+- `opened`
+- `open_partial_failed`
+- `open_hedging`
+- `pending_close`
+- `close_partial_failed`
+- `close_failed`
+- `close_hedging`
+
+这意味着：
+
+- 它们都会继续占用 live slot
+- 也都会继续占用预算
+
+### 15.14 重启后，系统会不会重新核对交易所真实仓位
+
+会，但当前是“以数据库记录为起点”的对账，不是“先扫交易所全仓位再回填本地”。
+
+具体行为：
+
+1. 先从数据库拿 active live records
+2. 对每条 record 去交易所查询 long/short 两腿当前仓位
+3. 生成同步状态：
+   - `in_sync`
+   - `awaiting_fill`
+   - `single_leg`
+   - `flat`
+   - `side_mismatch`
+   - `error`
+
+### 15.15 当前自动修复能力
+
+当前自动 reconcile 只会自动处理一种明确情况：
+
+- 数据库里还认为 live
+- 但交易所两腿都已经 flat
+
+这时系统会把 `execution_record` 自动推进到 `closed`。
+
+下面这些情况当前只会被识别，不会自动“认领/修复”成完整新状态：
+
+- 交易所上有单腿残仓
+- 双腿方向不匹配
+- 交易所上有真实仓位，但本地完全没有对应 `execution_record`
+
+### 15.16 rolling 仓位在重启后如何继续监控
+
+只要满足：
+
+- `live_trading=true`
+- `auto_close=true`
+- `strategy_mode=rolling_cycle_aligned`
+- `status=opened`
+
+这条仓位在重启后仍会继续进入 `runRollingMonitor()`。
+
+也就是说，`NextReviewTimeMs`、`CurrentSyncBoundaryMs`、`ReviewCount` 这类状态不是临时内存，而是可恢复的。
+
+### 15.17 当前实现的一个重要注意事项
+
+自动预算模式下，`scalePlanForAutoBudget()` 生成的是“本轮打开时使用的缩仓版 plan”。
+
+当前实现里：
+
+- 这份缩仓版 plan 会直接传给 `openPlan()` 用来发单
+- `ExecutionRecord.AllocatedNotionalUSDT` 也会按缩仓后的值写入数据库
+
+但它不会把缩仓后的整份 plan 再回写到 `execution_plans` 表。
+
+因此当前代码的实际含义是：
+
+- 预算统计以 `execution_record.allocated_notional_usdt` 为准，能够在重启后正确延续
+- 但 `execution_plans` 里保留的仍是原始批次 plan 尺寸
+
+这会带来一个当前已知的工程边界：
+
+- “实际开出去的尺寸”
+- 和“按 `plan_key` 重新查回来的 execution plan 尺寸”
+
+在 auto-allocation 开启时，可能并不完全一致。
+
+当前实现之所以还能工作，主要依赖：
+
+- 预算统计优先读 `execution_record`
+- 平仓走 reduce-only 语义时，即使计划数量偏大，也会尽量避免把仓位反向打穿
+
+但从设计完整性上看，这仍然是一个后续值得收口的点。
+
+### 15.18 重启恢复流程图
+
+```mermaid
+flowchart TD
+    A[进程启动] --> B[记录 startedAt]
+    B --> C[loop tick]
+    C --> D[从 execution_records 读取 active live]
+    D --> E[ReconcileLivePositions]
+    E --> F{交易所双腿都 flat?}
+    F -- 是 --> G[将 record 标记 closed]
+    F -- 否 --> H[保留 active live 状态]
+    H --> I[runAutoOpen]
+    I --> J{最新 plan batch 是否晚于 startedAt?}
+    J -- 否 --> K[等待新 batch 不开新仓]
+    J -- 是 --> L[按 active live 的 slot/预算/rolling group 继续开新仓]
+    L --> M[runRollingMonitor]
+    M --> N[runAutoClose]
+```

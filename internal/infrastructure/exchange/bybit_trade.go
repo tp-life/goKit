@@ -197,6 +197,28 @@ func (c *BybitV5TradeClient) ClosePosition(ctx context.Context, req TradeOrderRe
 	})
 }
 
+func (c *BybitV5TradeClient) CancelOrder(ctx context.Context, req OrderLookupRequest) error {
+	if !c.Enabled() {
+		return fmt.Errorf("%s trade client disabled or missing credentials", c.name)
+	}
+
+	payload := map[string]any{
+		"category": c.category,
+		"symbol":   req.VenueSymbol,
+	}
+	if strings.TrimSpace(req.VenueOrderID) != "" {
+		payload["orderId"] = req.VenueOrderID
+	} else if strings.TrimSpace(req.ClientOrderID) != "" {
+		payload["orderLinkId"] = req.ClientOrderID
+	} else {
+		return fmt.Errorf("missing order cancel id")
+	}
+
+	var result bybitOrderResult
+	_, _, err := c.signedPOST(ctx, "/v5/order/cancel", payload, &result)
+	return err
+}
+
 func (c *BybitV5TradeClient) GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error) {
 	if !c.Enabled() {
 		return OrderStatus{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)

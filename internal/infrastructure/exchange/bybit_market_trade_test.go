@@ -585,6 +585,55 @@ func TestBybitV5TradeParsesOrderPositionAndAccountResponses(t *testing.T) {
 	}
 }
 
+func TestBybitV5TradeCancelOrder_UsesOrderLinkID(t *testing.T) {
+	t.Setenv("BYBIT_API_KEY", "key-cancel")
+	t.Setenv("BYBIT_API_SECRET", "secret-cancel")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v5/order/cancel" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body error = %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal body error = %v", err)
+		}
+		if payload["orderLinkId"] != "cli-cancel" {
+			t.Fatalf("expected orderLinkId=cli-cancel, got %#v", payload["orderLinkId"])
+		}
+		if payload["symbol"] != "BTCUSDT" {
+			t.Fatalf("expected symbol BTCUSDT, got %#v", payload["symbol"])
+		}
+		_, _ = io.WriteString(w, `{
+			"retCode":0,
+			"retMsg":"OK",
+			"result":{"orderId":"order-cancel","orderLinkId":"cli-cancel"},
+			"time":1710000007000
+		}`)
+	}))
+	defer server.Close()
+
+	client := NewBybitV5TradeAdapter("bybit", ExchangeConfig{
+		Enabled:     true,
+		RestBaseURL: server.URL,
+		Auth: AuthConfig{
+			APIKeyEnv:    "BYBIT_API_KEY",
+			APISecretEnv: "BYBIT_API_SECRET",
+		},
+	}, logger).(*BybitV5TradeClient)
+
+	if err := client.CancelOrder(context.Background(), OrderLookupRequest{
+		VenueSymbol:   "BTCUSDT",
+		ClientOrderID: "cli-cancel",
+	}); err != nil {
+		t.Fatalf("CancelOrder error = %v", err)
+	}
+}
+
 func hmacHex(secret, payload string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(payload))

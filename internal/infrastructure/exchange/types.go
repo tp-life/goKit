@@ -34,8 +34,12 @@ const (
 )
 
 type FeeConfig struct {
-	MakerBps float64 `mapstructure:"maker_bps"`
-	TakerBps float64 `mapstructure:"taker_bps"`
+	// 这里同时保留 mapstructure/json 标签。
+	// 原因是同一份结构既会从 YAML 配置反序列化，也会经由 system status API
+	// 发给 TUI / Web；如果缺少 json 标签，snake_case 的 maker_bps/taker_bps
+	// 在 TUI 侧解码时会落成 0，导致“收益构成”里手续费明细显示错误。
+	MakerBps float64 `mapstructure:"maker_bps" json:"maker_bps"`
+	TakerBps float64 `mapstructure:"taker_bps" json:"taker_bps"`
 }
 
 type ProxyConfig struct {

@@ -33,6 +33,18 @@ const (
 	binanceLikeTradeAuthLegacyHMAC = "legacy_hmac"
 	binanceLikeTradeAuthRSA        = "rsa"
 	asterTradeAuthV3Signer         = "v3_signer"
+
+	// binanceLikePositionModeCacheTTL 控制“账户当前是否处于 one-way mode”的缓存时长。
+	//
+	// 这里不选择“每一笔订单都重新查一次”，主要是因为：
+	// 1. Binance / Aster 的 position-mode 查询或 positionRisk 查询都属于私有接口；
+	// 2. 同一轮执行里两条腿、拆单、恢复单很可能在几百毫秒内连续触发；
+	// 3. 仓位模式本身又是低频变更配置，不需要为每条单都付出一次额外私有请求。
+	//
+	// 因此这里采用一个很短的 TTL：
+	// - 足够覆盖同一轮执行的重复下单；
+	// - 也不会把“用户刚手动切到 hedge mode”缓存太久。
+	binanceLikePositionModeCacheTTL = 30 * time.Second
 )
 
 // CEXTradeClient 是保留了历史命名的实现类型。
@@ -43,23 +55,28 @@ const (
 // 这层纠偏非常重要，因为后续如果继续接入 OKX / Bybit / Bitget，
 // 我们应该先判断它们是否真的属于同一协议族，而不是被 `CEX` 这个宽泛名字误导。
 type CEXTradeClient struct {
-	name          string
-	cfg           ExchangeConfig
-	logger        *slog.Logger
-	httpClient    *http.Client
-	wsDialer      *websocket.Dialer
-	apiKey        string
-	apiSecret     string
-	rsaPrivateKey *rsa.PrivateKey
-	privateKey    *ecdsa.PrivateKey
-	accountAddr   string
-	signerAddr    string
-	authMode      string
-	orderPath     string
-	positionPath  string
-	accountPath   string
-	nonceMu       sync.Mutex
-	lastNonce     int64
+	name                  string
+	cfg                   ExchangeConfig
+	logger                *slog.Logger
+	httpClient            *http.Client
+	wsDialer              *websocket.Dialer
+	apiKey                string
+	apiSecret             string
+	rsaPrivateKey         *rsa.PrivateKey
+	privateKey            *ecdsa.PrivateKey
+	accountAddr           string
+	signerAddr            string
+	authMode              string
+	orderPath             string
+	positionPath          string
+	accountPath           string
+	nonceMu               sync.Mutex
+	lastNonce             int64
+	positionModeMu        sync.Mutex
+	positionModeCheckedAt time.Time
+	positionModeKnown     bool
+	positionModeOneWay    bool
+	positionModeSource    string
 }
 
 func NewBinanceTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
@@ -172,6 +189,19 @@ func (c *CEXTradeClient) Capabilities() TradeCapabilities {
 func (c *CEXTradeClient) PlaceOrder(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error) {
 	if !c.Enabled() {
 		return TradeOrderResult{}, fmt.Errorf("%s trade client disabled or missing credentials", c.name)
+	}
+	// 这条 guard 的目标不是“支持 hedge mode”，而是明确拒绝它。
+	//
+	// 当前 shared Binance-like 适配器的执行语义从上到下都建立在 one-way mode 之上：
+	// - 开仓时不发送 positionSide；
+	// - 平仓/恢复时会发送 reduceOnly；
+	// - GetPosition / 对账逻辑也默认同一 symbol 只有一条净仓位。
+	//
+	// 官方文档里，hedge mode 下这些假设都不成立；继续带着旧假设发单，
+	// 最好的结果是被交易所拒掉，最坏的结果是恢复路径、仓位识别和对冲都走偏。
+	// 所以这里先把风险显式挡住，只允许 one-way mode 账户继续走这套适配器。
+	if err := c.ensureOneWayPositionMode(ctx, req.VenueSymbol); err != nil {
+		return TradeOrderResult{}, err
 	}
 	params := url.Values{}
 	params.Set("symbol", req.VenueSymbol)
@@ -360,12 +390,173 @@ func (c *CEXTradeClient) CancelOrder(ctx context.Context, req OrderLookupRequest
 	return err
 }
 
+// ensureOneWayPositionMode 在真正发单前校验当前账户仍处于 one-way mode。
+//
+// 这里刻意把校验放在适配器内部，而不是只放在更上层 preflight，原因有两个：
+// 1. 账户模式是交易所账户级配置，用户可能在程序运行期间手动切换；
+// 2. open / recovery / close 都最终会汇聚到这里，放在适配器层能覆盖所有下单入口。
+//
+// 当前策略和执行引擎都还没有完整的 hedge-mode 语义，因此这里的正确做法不是“勉强兼容”，
+// 而是“在无法安全确认 one-way 的时候直接拒绝发单”。
+func (c *CEXTradeClient) ensureOneWayPositionMode(ctx context.Context, venueSymbol string) error {
+	if c == nil || !c.requiresOneWayPositionModeGuard() {
+		return nil
+	}
+
+	oneWay, source, err := c.currentOneWayPositionMode(ctx, venueSymbol)
+	if err != nil {
+		return err
+	}
+	if oneWay {
+		return nil
+	}
+	return fmt.Errorf("%s account is in hedge mode; the current binance-like adapter only supports one-way mode (detected via %s)", c.name, source)
+}
+
+func (c *CEXTradeClient) requiresOneWayPositionModeGuard() bool {
+	switch strings.ToLower(strings.TrimSpace(c.name)) {
+	case "binance", "aster":
+		return true
+	default:
+		return false
+	}
+}
+
+// currentOneWayPositionMode 先读短 TTL 缓存，再按“positionRisk -> dedicated endpoint”顺序确认账户模式。
+//
+// 这样排序是有意的：
+// 1. positionRisk 权重更低，而且 Aster v3 signer 也能访问；
+// 2. 如果 positionRisk 已经能从返回形状里明确看出 hedge/one-way，就没必要额外打一次 mode endpoint；
+// 3. 只有在结果不明确时，才回退到官方专门的 `/positionSide/dual` 接口。
+func (c *CEXTradeClient) currentOneWayPositionMode(ctx context.Context, venueSymbol string) (bool, string, error) {
+	c.positionModeMu.Lock()
+	if c.positionModeKnown && time.Since(c.positionModeCheckedAt) < binanceLikePositionModeCacheTTL {
+		oneWay := c.positionModeOneWay
+		source := c.positionModeSource
+		c.positionModeMu.Unlock()
+		return oneWay, source, nil
+	}
+	c.positionModeMu.Unlock()
+
+	oneWay, source, err := c.fetchOneWayPositionMode(ctx, venueSymbol)
+	if err != nil {
+		return false, "", err
+	}
+
+	c.positionModeMu.Lock()
+	c.positionModeCheckedAt = time.Now()
+	c.positionModeKnown = true
+	c.positionModeOneWay = oneWay
+	c.positionModeSource = source
+	c.positionModeMu.Unlock()
+	return oneWay, source, nil
+}
+
+func (c *CEXTradeClient) fetchOneWayPositionMode(ctx context.Context, venueSymbol string) (bool, string, error) {
+	if oneWay, ok, err := c.inferOneWayPositionModeFromPositionRisk(ctx, venueSymbol); err != nil {
+		return false, "", err
+	} else if ok {
+		return oneWay, c.positionPath, nil
+	}
+
+	// Aster v3 signer 当前没有文档证明 `/fapi/v1/positionSide/dual` 也支持 signer auth。
+	// 一旦 positionRisk 形状又无法明确区分模式，就不要再“猜一个 one-way”，
+	// 而是直接拒绝继续交易，避免在无法确认账户模式的情况下带着 reduceOnly / 净仓位假设发单。
+	if c.authMode == asterTradeAuthV3Signer {
+		return false, "", fmt.Errorf("%s could not confirm account position mode from %s under v3 signer auth; refusing to trade until one-way mode can be verified", c.name, c.positionPath)
+	}
+
+	var payload struct {
+		DualSidePosition bool `json:"dualSidePosition"`
+	}
+	params := url.Values{}
+	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	if _, err := c.signedGET(ctx, "/fapi/v1/positionSide/dual", params, &payload); err != nil {
+		return false, "", err
+	}
+	return !payload.DualSidePosition, "/fapi/v1/positionSide/dual", nil
+}
+
+// inferOneWayPositionModeFromPositionRisk 借助 positionRisk 的返回形状推断当前账户模式。
+//
+// 这条推断依赖官方文档里的一个稳定语义：
+// - one-way mode 下，symbol 通常表现为单条净仓位（`positionSide=BOTH` 或只有一条记录）；
+// - hedge mode 下，symbol 会分成 LONG / SHORT 两条 side-specific 仓位。
+//
+// 这样做的好处是：
+// - 对 Binance 来说，权重通常比专门的 position-mode 接口更低；
+// - 对 Aster v3 signer 来说，这是当前能走 signer auth 的私有接口之一。
+func (c *CEXTradeClient) inferOneWayPositionModeFromPositionRisk(ctx context.Context, venueSymbol string) (bool, bool, error) {
+	params := url.Values{}
+	if strings.TrimSpace(venueSymbol) != "" {
+		params.Set("symbol", venueSymbol)
+	}
+	if c.authMode != asterTradeAuthV3Signer {
+		params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	}
+	var payload []map[string]any
+	if _, err := c.signedGET(ctx, c.positionPath, params, &payload); err != nil {
+		return false, false, err
+	}
+	return inferOneWayPositionModeFromPositionRiskPayload(payload, venueSymbol)
+}
+
+func inferOneWayPositionModeFromPositionRiskPayload(payload []map[string]any, venueSymbol string) (bool, bool, error) {
+	if len(payload) == 0 {
+		return false, false, nil
+	}
+
+	matched := 0
+	hasExplicitBoth := false
+	hasExplicitHedgeSides := false
+	for _, item := range payload {
+		if !strings.EqualFold(strings.TrimSpace(asString(item["symbol"])), strings.TrimSpace(venueSymbol)) && strings.TrimSpace(venueSymbol) != "" {
+			continue
+		}
+		matched++
+		switch strings.ToUpper(strings.TrimSpace(asString(item["positionSide"]))) {
+		case "LONG", "SHORT":
+			hasExplicitHedgeSides = true
+		case "BOTH":
+			hasExplicitBoth = true
+		}
+	}
+	if matched == 0 {
+		return false, false, nil
+	}
+	if hasExplicitHedgeSides {
+		return false, true, nil
+	}
+
+	// 有些历史 endpoint / 测试桩不会显式返回 `positionSide`，但 one-way mode 仍然只会返回一条净仓位。
+	// 这种情况下我们把“单条记录”视为 one-way 的兼容信号，避免因为字段缺失把正常账户误拦住。
+	if hasExplicitBoth || matched == 1 {
+		return true, true, nil
+	}
+	return false, false, nil
+}
+
 func (c *CEXTradeClient) signedDo(ctx context.Context, method, path string, params url.Values, out any) (string, error) {
 	resp, body, err := c.performSignedRequest(ctx, method, path, params)
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
+		// Aster 文档明确说明：HTTP 503 可能代表“消息已成功发往交易所，但超时未拿到最终响应”，
+		// 这类情况的执行结果是 UNKNOWN，不能直接当作“确定失败”。
+		//
+		// 这里单独把“下单接口的 503”提升成结构化错误，让上层执行引擎继续做：
+		// 1. 订单状态查询；
+		// 2. 仓位侧对账；
+		// 3. 必要时再走补救对冲。
+		if resp.StatusCode == http.StatusServiceUnavailable && strings.EqualFold(method, http.MethodPost) && strings.EqualFold(strings.TrimSpace(path), strings.TrimSpace(c.orderPath)) {
+			return string(body), &UnknownExecutionOutcomeError{
+				Exchange:   c.name,
+				Operation:  method + " " + path,
+				StatusCode: resp.StatusCode,
+				Body:       string(body),
+			}
+		}
 		if c.logger != nil {
 			c.logger.Warn("cex_signed_request_failed",
 				"exchange", c.name,

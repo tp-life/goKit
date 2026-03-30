@@ -255,10 +255,10 @@ func (m Model) renderOpportunityList(width int, height int) string {
 		marker := selectedMarker(active)
 		planText := toneStyle(planTone).Render(clip(planLabel, 18))
 		pnlText := alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 12)
-		edgeText := alignRightValue(renderPctValue(fundingSpreadHourly(item), 5), 10)
+		carryText := alignRightValue(renderPctValue(displayedCarryRate(item, m.data.System.Strategy, entity.ExecutionPlan{}, false), 5), 10)
 		row := []string{
 			fmt.Sprintf("%s %-3d %-7s %-24s %s", marker, i+1, clip(item.Symbol, 7), clip(opportunityDirection(item), 24), pnlText),
-			fmt.Sprintf("     %-18s basis %-9s edge %s", clip(opportunityPair(item), 18), fmtSignedBps(item.BasisBps, 2), edgeText),
+			fmt.Sprintf("     %-18s basis %-9s carry %s", clip(opportunityPair(item), 18), fmtSignedBps(item.BasisBps, 2), carryText),
 			fmt.Sprintf("     %-14s  |  %s  |  %s", clip(holdingDurationText(item), 14), planText, clip(statusText(item.Status), 16)),
 		}
 		block := strings.Join(row, "\n")
@@ -659,6 +659,8 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 	if hasDetail && detail != nil {
 		carrySource = *detail
 	}
+	displayCarryRate := displayedCarryRate(carrySource, m.data.System.Strategy, plan, hasPlan)
+	displayHourlyCarry := fundingSpreadHourly(carrySource)
 	expectedCloseMs := opportunityExpectedCloseTimeMs(carrySource, m.data.System.Execution)
 	mode := opportunityStrategyMode(carrySource)
 	lines := []string{
@@ -666,8 +668,8 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 		strings.Join([]string{
 			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
 			renderField("净收益率", renderBpsValue(item.NetExpectedBps, 2)),
-			renderField("优选 Carry率", renderPctValue(fundingSpread(carrySource), 5)),
-			renderField("优选时均边际", renderPctValue(fundingSpreadHourly(carrySource), 5)),
+			renderField("当前 Carry率", renderPctValue(displayCarryRate, 5)),
+			renderField("当前时均边际", renderPctValue(displayHourlyCarry, 5)),
 			renderField("基差", renderBasisValue(item.BasisBps, item.MaxAllowedBasisBps)),
 		}, "  "),
 		strings.Join([]string{
@@ -679,7 +681,7 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 		strings.Join([]string{
 			renderField("多头结算倒计时", renderDurationValue(time.Until(time.UnixMilli(item.LongFundingTimeMs)))),
 			renderField("空头结算倒计时", renderDurationValue(time.Until(time.UnixMilli(item.ShortFundingTimeMs)))),
-			renderField("预计 funding 兑现", renderTimeValue(item.ProjectedFundingTimeMs, "accent")),
+			renderField("当前 Entry Path 终点", renderTimeValue(item.ProjectedFundingTimeMs, "accent")),
 		}, "  "),
 		strings.Join([]string{
 			renderField("持有模式", toneStyle("accent").Render(holdSelectionModeText(m.data.System.Strategy.HoldSelectionMode))),
@@ -699,9 +701,9 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 	if isRollingStrategyMode(mode) {
 		lines = append(lines, strings.Join([]string{
 			renderField("下次 Review", renderTimeValue(opportunityNextReviewTimeMs(carrySource), "accent")),
-			renderField("共享 Boundary", renderTimeValue(opportunitySyncBoundaryTimeMs(carrySource), "accent")),
-			renderField("Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段", opportunityEntryPathSegmentCount(carrySource)))),
-			renderField("停止原因", toneStyle("accent").Render(entryPathStopReasonText(opportunityEntryPathStopReason(carrySource)))),
+			renderField("当前共享结算边界", renderTimeValue(opportunitySyncBoundaryTimeMs(carrySource), "accent")),
+			renderField("当前 Entry Path 段数", toneStyle("accent").Render(fmt.Sprintf("%d 段", opportunityEntryPathSegmentCount(carrySource)))),
+			renderField("Entry Path 截止原因", toneStyle("accent").Render(entryPathStopReasonText(opportunityEntryPathStopReason(carrySource)))),
 		}, "  "))
 	}
 	lines = append(lines,
@@ -726,17 +728,18 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 	if hasDetail && detail != nil {
 		carrySource = *detail
 	}
-	carryRate := fundingSpread(carrySource)
+	carryRate := displayedCarryRate(carrySource, m.data.System.Strategy, plan, hasPlan)
 	hourlyEdge := fundingSpreadHourly(carrySource)
+	currentLongEvents, currentShortEvents := displayedFundingEventCounts(carrySource)
 	notional := opportunityTargetNotional(carryRate, item.GrossFundingPNL, plan, hasPlan, m.data.System.Strategy)
 	strategy := m.data.System.Strategy
 
 	lines := []string{
 		clip(strings.Join([]string{
 			renderField("估算名义", renderUSDTValue(notional, 2)),
-			renderField("累计 Carry率", renderPctValue(carryRate, 5)),
-			renderField("时均 edge", renderPctValue(hourlyEdge, 5)),
-			renderField("事件数", toneStyle("accent").Render(fmt.Sprintf("多头 %d / 空头 %d", item.LongFundingEventCount, item.ShortFundingEventCount))),
+			renderField("当前 Carry率", renderPctValue(carryRate, 5)),
+			renderField("当前时均边际", renderPctValue(hourlyEdge, 5)),
+			renderField("当前事件数", toneStyle("accent").Render(fmt.Sprintf("多头 %d / 空头 %d", currentLongEvents, currentShortEvents))),
 		}, "  "), width),
 		clip(toneStyle("subtle").Render("公式: 净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲"), width),
 		clip(strings.Join([]string{
@@ -754,7 +757,7 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 			renderCostAbsValue(item.SafetyBufferPNL, 3),
 		}, " "), width),
 		clip(strings.Join([]string{
-			renderField("资金收益", renderMoneyValue(item.GrossFundingPNL, 3)),
+			renderField("当前 Entry Path 资金收益", renderMoneyValue(item.GrossFundingPNL, 3)),
 			renderField("计算", toneStyle("accent").Render(notionalFormulaText(notional, carryRate))),
 		}, "  "), width),
 		clip(strings.Join([]string{
@@ -822,14 +825,14 @@ func renderLegsCompareTable(item OpportunityListItem, width int) string {
 		),
 		renderLegRow("交易所", item.LongExchange, item.ShortExchange, metricWidth, longWidth, shortWidth, "accent", "accent"),
 		renderLegRow("合约", orDefault(item.LongVenueSymbol, "--"), orDefault(item.ShortVenueSymbol, "--"), metricWidth, longWidth, shortWidth, "accent", "accent"),
-		renderLegRow("当前费率", fmtPctRatio(item.LongFundingRate, 5), fmtPctRatio(item.ShortFundingRate, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFundingRate), signedNumberTone(item.ShortFundingRate)),
-		renderLegRow("预测费率", fmtPctRatio(item.LongFutureFundingRate, 5), fmtPctRatio(item.ShortFutureFundingRate, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFutureFundingRate), signedNumberTone(item.ShortFutureFundingRate)),
+		renderLegRow("当前 next funding费率", fmtPctRatio(item.LongFundingRate, 5), fmtPctRatio(item.ShortFundingRate, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFundingRate), signedNumberTone(item.ShortFundingRate)),
+		renderLegRow("下一事件预测费率", fmtPctRatio(item.LongFutureFundingRate, 5), fmtPctRatio(item.ShortFutureFundingRate, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFutureFundingRate), signedNumberTone(item.ShortFutureFundingRate)),
 		renderLegRow("小时化", fmtPctRatio(item.LongFundingHourly, 5), fmtPctRatio(item.ShortFundingHourly, 5), metricWidth, longWidth, shortWidth, signedNumberTone(item.LongFundingHourly), signedNumberTone(item.ShortFundingHourly)),
 		renderLegRow("买一", priceText(item.LongBidPrice), priceText(item.ShortBidPrice), metricWidth, longWidth, shortWidth, "accent", "accent"),
 		renderLegRow("卖一", priceText(item.LongAskPrice), priceText(item.ShortAskPrice), metricWidth, longWidth, shortWidth, "accent", "accent"),
 		renderLegRow("标记价", priceText(item.LongMarkPrice), priceText(item.ShortMarkPrice), metricWidth, longWidth, shortWidth, "accent", "accent"),
-		renderLegRow("下次结算", fmtTime(item.LongFundingTimeMs), fmtTime(item.ShortFundingTimeMs), metricWidth, longWidth, shortWidth, "accent", "accent"),
-		renderLegRow("结算间隔", fmt.Sprintf("%sh", fmtNumber(float64(item.LongFundingIntervalHours), 0)), fmt.Sprintf("%sh", fmtNumber(float64(item.ShortFundingIntervalHours), 0)), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("当前 next funding", fmtTime(item.LongFundingTimeMs), fmtTime(item.ShortFundingTimeMs), metricWidth, longWidth, shortWidth, "accent", "accent"),
+		renderLegRow("funding间隔", fmt.Sprintf("%sh", fmtNumber(float64(item.LongFundingIntervalHours), 0)), fmt.Sprintf("%sh", fmtNumber(float64(item.ShortFundingIntervalHours), 0)), metricWidth, longWidth, shortWidth, "accent", "accent"),
 		renderLegRow("事件数", fmt.Sprintf("%d 次", item.LongFundingEventCount), fmt.Sprintf("%d 次", item.ShortFundingEventCount), metricWidth, longWidth, shortWidth, "accent", "accent"),
 	}
 	return strings.Join(lines, "\n")
@@ -875,7 +878,7 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 		strings.Join([]string{
 			renderField("基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
 			renderField("仓位偏斜", renderBpsValue(planPositionSkewBps(plan), 2)),
-			renderField("预计 funding 兑现", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
+			renderField("当前 Entry Path 终点", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
 			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 			renderField("入场开始", renderTimeValue(plan.EntryWindowOpenMs, "accent")),
 			renderField("入场截止", renderTimeValue(plan.EntryWindowCloseMs, "accent")),
@@ -885,8 +888,8 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 		lines = append(lines, strings.Join([]string{
 			renderField("策略模式", toneStyle("accent").Render(strategyModeText(plan.StrategyMode))),
 			renderField("下次 Review", renderTimeValue(plan.NextReviewTimeMs, "accent")),
-			renderField("共享 Boundary", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
-			renderField("Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
+			renderField("当前共享结算边界", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
+			renderField("当前 Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
 		}, "  "))
 	}
 	if hasRec {
@@ -951,10 +954,10 @@ func (m Model) renderProjectionDetail(_ OpportunityListItem, detail *entity.Oppo
 		lines = append(lines, toneStyle(signedNumberTone(row.NetExpectedPNL)).Render(line))
 	}
 	if len(detail.EntryPathSegments) > 0 {
-		lines = append(lines, "", renderFundingSegmentsSection("Entry Path Settlement 段", detail.EntryPathSegments, width))
+		lines = append(lines, "", renderFundingSegmentsSection("当前 Entry Path 段", detail.EntryPathSegments, width))
 	}
 	if len(detail.FundingSegments) > 0 {
-		lines = append(lines, "", renderFundingSegmentsSection("完整 Settlement 段", detail.FundingSegments, width))
+		lines = append(lines, "", renderFundingSegmentsSection("当前 Boundary 内全部结算段", detail.FundingSegments, width))
 	}
 	return clip(strings.Join(lines, "\n"), width*maxInt(1, len(lines)))
 }
@@ -1007,7 +1010,7 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 			renderField("名义", renderMoneyValue(targetNotional(plan), 2)),
 			renderField("杠杆", toneStyle("accent").Render(fmt.Sprintf("%sx", fmtNumber(plan.TargetLeverage, 2)))),
 			renderField("基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
-			renderField("预计 funding 兑现", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
+			renderField("当前 Entry Path 终点", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
 			renderField("目标平仓", renderTimeValue(targetCloseMs, "accent")),
 		}, "  "),
 		strings.Join([]string{
@@ -1031,8 +1034,8 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 		lines = append(lines, strings.Join([]string{
 			renderField("策略模式", toneStyle("accent").Render(strategyModeText(plan.StrategyMode))),
 			renderField("下次 Review", renderTimeValue(plan.NextReviewTimeMs, "accent")),
-			renderField("共享 Boundary", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
-			renderField("Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
+			renderField("当前共享结算边界", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
+			renderField("当前 Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
 		}, "  "))
 	}
 	if opp, ok := m.matchingOpportunityForPlan(plan); ok {
@@ -1139,7 +1142,7 @@ func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan enti
 		lines = append(lines, strings.Join([]string{
 			renderField("计划状态", renderStatusValue(plan.Status)),
 			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
-			renderField("预计 funding 兑现", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
+			renderField("当前 Entry Path 终点", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
 			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 		}, "  "))
 	}
@@ -2181,6 +2184,43 @@ func feeRateBps(strategy StrategyStatus, exchangeName string, mode string) (floa
 	default:
 		return fees.MakerBps, true
 	}
+}
+
+// displayedCarryRate returns the carry rate we want to explain to the user on
+// the current screen.
+//
+// 这里把“展示口径”和“策略内部 projection 口径”刻意分开：
+//  1. rolling 模式优先解释当前真实首段 carry，不把 forecast 段直接抬成 headline；
+//  2. legacy 或拿不到真实段时，再退回到最佳 projection carry；
+//  3. 如果连 projection 也拿不到，最后才用 `gross_funding_pnl / notional` 或 funding 差值兜底。
+func displayedCarryRate(item any, strategy StrategyStatus, plan entity.ExecutionPlan, hasPlan bool) float64 {
+	if carry, _, _, _, ok := currentCarrySegment(item); ok {
+		return carry
+	}
+	switch v := item.(type) {
+	case entity.Opportunity:
+		for _, row := range v.ProjectionDetails {
+			if row.IsBestProjection {
+				return row.CarryRate
+			}
+		}
+		if len(v.ProjectionDetails) > 0 {
+			return v.ProjectionDetails[0].CarryRate
+		}
+		return impliedCarryRate(v.GrossFundingPNL, v.ShortFundingRate-v.LongFundingRate, plan, hasPlan, strategy)
+	case OpportunityListItem:
+		return impliedCarryRate(v.GrossFundingPNL, v.ShortFundingRate-v.LongFundingRate, plan, hasPlan, strategy)
+	default:
+		return 0
+	}
+}
+
+func impliedCarryRate(grossFundingPNL, fallback float64, plan entity.ExecutionPlan, hasPlan bool, strategy StrategyStatus) float64 {
+	notional := opportunityTargetNotional(0, grossFundingPNL, plan, hasPlan, strategy)
+	if notional > 0 {
+		return grossFundingPNL / notional
+	}
+	return fallback
 }
 
 func opportunityTargetNotional(carryRate float64, grossFundingPNL float64, plan entity.ExecutionPlan, hasPlan bool, strategy StrategyStatus) float64 {

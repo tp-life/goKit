@@ -2,7 +2,7 @@ package exchange
 
 import "testing"
 
-func TestSupportsOrderEventStream_BinanceOnly(t *testing.T) {
+func TestSupportsOrderEventStream_BinanceAndAsterWhenAPIKeyPresent(t *testing.T) {
 	binance := &CEXTradeClient{
 		name:      "binance",
 		cfg:       ExchangeConfig{Enabled: true},
@@ -14,18 +14,25 @@ func TestSupportsOrderEventStream_BinanceOnly(t *testing.T) {
 	}
 
 	aster := &CEXTradeClient{
-		name:      "aster",
-		cfg:       ExchangeConfig{Enabled: true},
-		apiKey:    "key",
-		apiSecret: "secret",
+		name:   "aster",
+		cfg:    ExchangeConfig{Enabled: true},
+		apiKey: "key",
 	}
-	if aster.supportsOrderEventStream() {
-		t.Fatalf("expected aster adapter to keep order event stream capability disabled")
+	if !aster.supportsOrderEventStream() {
+		t.Fatalf("expected aster adapter to expose order event stream capability when api key is present")
+	}
+
+	asterSignerOnly := &CEXTradeClient{
+		name: "aster",
+		cfg:  ExchangeConfig{Enabled: true},
+	}
+	if asterSignerOnly.supportsOrderEventStream() {
+		t.Fatalf("expected aster signer-only adapter to keep order event stream capability disabled without api key")
 	}
 }
 
 func TestParseUserDataOrderEvent_OrderTradeUpdate(t *testing.T) {
-	client := &CEXTradeClient{name: "binance"}
+	client := &CEXTradeClient{name: "aster"}
 
 	event, ok, err := client.parseUserDataOrderEvent([]byte(`{
 		"e":"ORDER_TRADE_UPDATE",
@@ -45,11 +52,11 @@ func TestParseUserDataOrderEvent_OrderTradeUpdate(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected ORDER_TRADE_UPDATE to be published")
 	}
-	if event.Source != "binance_user_stream" {
-		t.Fatalf("expected event source to be binance_user_stream, got %s", event.Source)
+	if event.Source != "aster_user_stream" {
+		t.Fatalf("expected event source to be aster_user_stream, got %s", event.Source)
 	}
-	if event.Exchange != "binance" {
-		t.Fatalf("expected exchange to be binance, got %s", event.Exchange)
+	if event.Exchange != "aster" {
+		t.Fatalf("expected exchange to be aster, got %s", event.Exchange)
 	}
 	if event.ClientOrderID != "cid-1" {
 		t.Fatalf("expected client order id cid-1, got %s", event.ClientOrderID)

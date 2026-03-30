@@ -506,6 +506,9 @@ func TestPlacePlanOrders_SplitsOpenLegByVenueMaxQty(t *testing.T) {
 	if longAdapter.placed[1].ClientOrderID == longAdapter.placed[0].ClientOrderID || longAdapter.placed[2].ClientOrderID == longAdapter.placed[0].ClientOrderID {
 		t.Fatalf("expected split child orders to use distinct client order ids")
 	}
+	for i, req := range longAdapter.placed {
+		assertExchangeSafeClientOrderID(t, fmt.Sprintf("open child %d", i), req.ClientOrderID)
+	}
 }
 
 func TestPlacePlanOrders_SplitsHedgeCloseByVenueMaxQty(t *testing.T) {
@@ -568,6 +571,76 @@ func TestPlacePlanOrders_SplitsHedgeCloseByVenueMaxQty(t *testing.T) {
 	}
 	if len(results) != 7 {
 		t.Fatalf("expected 7 records (3 open split + 1 failed leg + 3 hedge split), got %d", len(results))
+	}
+	for i, req := range longAdapter.closed {
+		assertExchangeSafeClientOrderID(t, fmt.Sprintf("hedge child %d", i), req.ClientOrderID)
+	}
+}
+
+func TestBuildClientOrderID_LeavesRoomForSplitSuffix(t *testing.T) {
+	plan := &entity.ExecutionPlan{
+		PlanKey: "plan-with-a-very-long-key-that-used-to-overflow-split-order-ids",
+		Symbol:  "1000KATUSDT",
+	}
+
+	baseID := buildClientOrderID(plan, "open", "long_leg")
+	if len(baseID) > maxClientOrderIDBaseLen {
+		t.Fatalf("expected base client order id to stay within reserved base limit, got len=%d id=%s", len(baseID), baseID)
+	}
+	assertExchangeSafeClientOrderID(t, "base", baseID)
+
+	splitID := splitClientOrderID(baseID, 128)
+	if len(splitID) > maxClientOrderIDLen {
+		t.Fatalf("expected split client order id to stay within exchange limit, got len=%d id=%s", len(splitID), splitID)
+	}
+	if !strings.HasSuffix(splitID, "-p128") {
+		t.Fatalf("expected split client order id to keep child suffix, got %s", splitID)
+	}
+	assertExchangeSafeClientOrderID(t, "split", splitID)
+}
+
+func TestBuildClientOrderIDForExchange_HyperliquidUsesHexCloid(t *testing.T) {
+	plan := &entity.ExecutionPlan{
+		PlanKey: "plan-hyperliquid-cloid",
+		Symbol:  "BTC",
+	}
+
+	baseID := buildClientOrderIDForExchange("hyperliquid", plan, "open", "long_leg")
+	assertHyperliquidCloid(t, "base", baseID)
+
+	splitID := splitClientOrderIDForExchange("hyperliquid", baseID, 7)
+	assertHyperliquidCloid(t, "split", splitID)
+	if splitID == baseID {
+		t.Fatalf("expected split hyperliquid cloid to differ from base cloid")
+	}
+}
+
+func assertExchangeSafeClientOrderID(t *testing.T, label, id string) {
+	t.Helper()
+	if len(id) == 0 {
+		t.Fatalf("%s: expected non-empty client order id", label)
+	}
+	if len(id) > maxClientOrderIDLen {
+		t.Fatalf("%s: expected client order id len <= %d, got len=%d id=%s", label, maxClientOrderIDLen, len(id), id)
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		t.Fatalf("%s: found unsupported char %q in client order id %s", label, r, id)
+	}
+}
+
+func assertHyperliquidCloid(t *testing.T, label, id string) {
+	t.Helper()
+	if len(id) != 34 || !strings.HasPrefix(id, "0x") {
+		t.Fatalf("%s: expected 0x-prefixed 16-byte hex cloid, got %s", label, id)
+	}
+	for _, r := range id[2:] {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		t.Fatalf("%s: expected lowercase hex cloid, got %s", label, id)
 	}
 }
 
@@ -673,6 +746,73 @@ func TestPlacePlanOrders_TimeoutLegRecoveredByReconcile(t *testing.T) {
 		}
 		if item.ErrorMessage != "" {
 			t.Fatalf("expected reconciled timeout leg to clear error message, got %#v", item)
+		}
+	}
+}
+
+func TestPlacePlanOrders_UnknownExecutionOutcomeRecoveredByReconcile(t *testing.T) {
+	store := NewMarketStore()
+	store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
+	store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTCUSDT", VenueSymbol: "BTCUSDT", StepSize: "0.001"})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTCUSDT", BidPrice: 100, AskPrice: 101})
+	store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTCUSDT", BidPrice: 102, AskPrice: 103})
+
+	longAdapter := &testTradeAdapter{
+		name:    "longex",
+		enabled: true,
+		account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus: exchange.OrderStatus{
+			Status:       "FILLED",
+			ExecutedQty:  1,
+			AveragePrice: 101,
+			Terminal:     true,
+		},
+		placeErr: &exchange.UnknownExecutionOutcomeError{
+			Exchange:   "longex",
+			Operation:  "POST /order",
+			StatusCode: 503,
+			Body:       `{"code":-1007,"msg":"execution status unknown"}`,
+		},
+	}
+	shortAdapter := &testTradeAdapter{
+		name:        "shortex",
+		enabled:     true,
+		account:     exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 600},
+		orderStatus: exchange.OrderStatus{Status: "FILLED", ExecutedQty: 1, AveragePrice: 102, Terminal: true},
+	}
+
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{"longex": longAdapter, "shortex": shortAdapter})
+	svc.store = store
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-unknown-outcome-reconciled",
+		Symbol:           "BTCUSDT",
+		LongExchange:     "longex",
+		ShortExchange:    "shortex",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          1,
+		ShortQty:         1,
+		LongEntryPrice:   101,
+		ShortEntryPrice:  102,
+		EntryMode:        "taker",
+	}
+
+	results, errMsg := svc.placePlanOrders(context.Background(), plan, "open", "manual")
+	if errMsg != "" {
+		t.Fatalf("expected unknown execution outcome leg to be recovered by reconcile, got errMsg=%s", errMsg)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 primary leg records, got %d", len(results))
+	}
+	if got := summarizeExecutionStatus(results, "open"); got != executionStateOpened {
+		t.Fatalf("expected opened status after unknown-outcome reconcile, got %s", got)
+	}
+	for _, item := range results {
+		if item.Status != "FILLED" {
+			t.Fatalf("expected reconciled legs to end as FILLED, got %#v", item)
+		}
+		if item.ErrorMessage != "" {
+			t.Fatalf("expected reconciled unknown-outcome leg to clear error message, got %#v", item)
 		}
 	}
 }

@@ -1737,6 +1737,9 @@ func opportunityIdentity(item any) (symbol, longExchange, shortExchange, longVen
 }
 
 func fundingSpread(item any) float64 {
+	if carry, _, _, _, ok := currentCarrySegment(item); ok {
+		return carry
+	}
 	switch v := item.(type) {
 	case entity.Opportunity:
 		for _, row := range v.ProjectionDetails {
@@ -1756,6 +1759,9 @@ func fundingSpread(item any) float64 {
 }
 
 func fundingSpreadHourly(item any) float64 {
+	if carry, settlementTimeMs, _, _, ok := currentCarrySegment(item); ok {
+		return carry / currentCarryWindowHours(settlementTimeMs)
+	}
 	switch v := item.(type) {
 	case entity.Opportunity:
 		for _, row := range v.ProjectionDetails {
@@ -1772,6 +1778,101 @@ func fundingSpreadHourly(item any) float64 {
 	default:
 		return 0
 	}
+}
+
+// currentCarrySegment 返回“当前这一刻已经真实可见的首个结算段”。
+//
+// 这组值专门服务于展示层，目的不是替代策略内部的完整 entry path 计算，
+// 而是避免用户把“带预测段的累计 carry”误读成“眼前这一轮马上能拿到的真实 carry”。
+//
+// rolling 模式下我们优先解释当前真实段：
+// - 单腿先结算：只看先结算那一腿；
+// - 双腿同结算：看当前真实 funding 差；
+// - 只有拿不到足够信息时，才退回到旧的 projection 展示逻辑。
+func currentCarrySegment(item any) (carryRate float64, settlementTimeMs int64, longEvents int, shortEvents int, ok bool) {
+	if !strings.EqualFold(opportunityStrategyMode(item), service.StrategyModeRollingCycleAligned) {
+		return 0, 0, 0, 0, false
+	}
+
+	switch v := item.(type) {
+	case entity.Opportunity:
+		if carry, ts, longCount, shortCount, found := carrySegmentFromOpportunitySegments(v.EntryPathSegments); found {
+			return carry, ts, longCount, shortCount, true
+		}
+		if carry, ts, longCount, shortCount, found := carrySegmentFromOpportunitySegments(v.FundingSegments); found {
+			return carry, ts, longCount, shortCount, true
+		}
+		return inferCurrentCarrySegment(v.LongFundingRate, v.ShortFundingRate, v.LongFundingTimeMs, v.ShortFundingTimeMs)
+	case OpportunityListItem:
+		return inferCurrentCarrySegment(v.LongFundingRate, v.ShortFundingRate, v.LongFundingTimeMs, v.ShortFundingTimeMs)
+	default:
+		return 0, 0, 0, 0, false
+	}
+}
+
+func carrySegmentFromOpportunitySegments(items []entity.OpportunityFundingSegment) (carryRate float64, settlementTimeMs int64, longEvents int, shortEvents int, ok bool) {
+	for _, item := range items {
+		// 展示层只想解释“当前第一段真实 settlement”。
+		// forecast 段仍然保留在 projection 明细里，但不再作为 headline carry。
+		if item.UsesForecast {
+			continue
+		}
+		return item.HeldDirectionCarryRate, item.SettlementTimeMs, boolCount(item.LongLegSettles), boolCount(item.ShortLegSettles), true
+	}
+	return 0, 0, 0, 0, false
+}
+
+func inferCurrentCarrySegment(longRate, shortRate float64, longFundingTimeMs, shortFundingTimeMs int64) (carryRate float64, settlementTimeMs int64, longEvents int, shortEvents int, ok bool) {
+	if longFundingTimeMs <= 0 && shortFundingTimeMs <= 0 {
+		return 0, 0, 0, 0, false
+	}
+	switch {
+	case longFundingTimeMs > 0 && (shortFundingTimeMs <= 0 || longFundingTimeMs < shortFundingTimeMs):
+		return -longRate, longFundingTimeMs, 1, 0, true
+	case shortFundingTimeMs > 0 && (longFundingTimeMs <= 0 || shortFundingTimeMs < longFundingTimeMs):
+		return shortRate, shortFundingTimeMs, 0, 1, true
+	default:
+		if longFundingTimeMs >= shortFundingTimeMs {
+			settlementTimeMs = longFundingTimeMs
+		} else {
+			settlementTimeMs = shortFundingTimeMs
+		}
+		return shortRate - longRate, settlementTimeMs, 1, 1, true
+	}
+}
+
+func currentCarryWindowHours(settlementTimeMs int64) float64 {
+	windowHours := float64(settlementTimeMs-time.Now().UnixMilli()) / float64(time.Hour/time.Millisecond)
+	if windowHours <= 0 {
+		return 1.0 / 60.0
+	}
+	return windowHours
+}
+
+func displayedFundingEventCounts(item any) (int, int) {
+	if longEvents, shortEvents, ok := currentCarrySegmentCounts(item); ok {
+		return longEvents, shortEvents
+	}
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.LongFundingEventCount, v.ShortFundingEventCount
+	case OpportunityListItem:
+		return v.LongFundingEventCount, v.ShortFundingEventCount
+	default:
+		return 0, 0
+	}
+}
+
+func currentCarrySegmentCounts(item any) (longEvents int, shortEvents int, ok bool) {
+	_, _, longEvents, shortEvents, ok = currentCarrySegment(item)
+	return longEvents, shortEvents, ok
+}
+
+func boolCount(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func holdingDurationText(item any) string {

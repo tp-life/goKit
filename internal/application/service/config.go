@@ -224,6 +224,10 @@ type Config struct {
 	FundingSmoothingCurrentWeight  float64       `mapstructure:"funding_smoothing_current_weight"`
 	// FundingRateContinuationDecay 控制“在同一持仓窗口内，对同一腿未来第2次及以后 funding 事件”的费率衰减。
 	//
+	// 注意：
+	// - legacy_projection 仍会消费这个字段；
+	// - rolling_cycle_aligned 现在已经切成 real-only 机会识别，不再把未来预测段纳入 headline carry。
+	//
 	// 取值建议：
 	//   = 1.0 : 不衰减（线性外推，激进）
 	//   (0,1): 几何衰减（更保守，降低对当前极值费率的过拟合）
@@ -251,7 +255,10 @@ type Config struct {
 	Execution            ExecutionConfig `mapstructure:"execution"`
 
 	// 下面这些字段是 rolling 设计的运行时归一化结果。
-	// 当前策略代码还没全部消费它们，但先统一沉淀在 Config 里，便于后续实现直接接入。
+	//
+	// 其中与 forecast 相关的开关目前主要保留兼容语义：
+	// rolling 结构仍保留 review / continue / flip，但机会识别已经切成 real-only，
+	// 不再把 boundary 之前的预测段直接算进当前开仓收益。
 	RollingEntryPathRequireConsistentDirection     bool          `mapstructure:"-"`
 	RollingMaxSingleExchangeForecastSegments       int           `mapstructure:"-"`
 	RollingAllowIntermediateForecastBeforeBoundary bool          `mapstructure:"-"`
