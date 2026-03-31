@@ -3,8 +3,9 @@ app:
   version: "v1.0.0"
 
 web:
-  port: ":8080"
-  app_name: "MyAPI"
+  enabled: true
+  port: ":5080"
+  app_name: "PolymarketBot"
   prefork: false
 
 rpc:
@@ -12,11 +13,48 @@ rpc:
   max_connection_idle: 300s
   timeout: 5s
 
+log:
+  level: "info"
+  format: "json"
+  # 当 ui.mode=tui 时，建议改成 discard，避免结构化日志打乱终端界面
+  output: "stdout"
+  source: false
+
+ui:
+  mode: "web"
+  refresh_interval_ms: 1000
+
 database:
   driver: "mysql"
-  # 请修改为你的实际数据库地址
+  # 当前 polymarket bot 不依赖数据库；若不启用其他业务模块，这里可以保留示例值
   dsn: "root:root@tcp(127.0.0.1:3306)/my_db?charset=utf8mb4&parseTime=True&loc=Local"
   replicas: []
   max_idle_conns: 10
   max_open_conns: 100
   log_mode: "info"
+
+# Polymarket 交易配置统一读取 configs/polymarket.env
+# 例如:
+# POLYMARKET_PROXY_URL=http://127.0.0.1:7890
+# POLYMARKET_MARKET_SYMBOL=ETH
+# POLYMARKET_MARKET_INTERVAL_SEC=900
+# POLYMARKET_MARKET_SLUG_INTERVAL=15m
+# POLYMARKET_CRYPTO_PRICE_VARIANT=fifteen
+# PRIVATE_KEY=
+# POLYMARKET_API_KEY=
+# POLYMARKET_API_SECRET=
+# POLYMARKET_API_PASSPHRASE=
+# FUNDER_ADDRESS=
+# AUTO_TRADE=true
+# AUTO_REDEEM=true
+# AUTO_REDEEM_HOUR_LOCAL=3
+# AUTO_REDEEM_MAX_RETRY=2
+# AUTO_REDEEM_RETRY_DELAY_SEC=15
+# AUTO_REDEEM_MAX_PER_RUN=5
+# AUTO_REDEEM_RECEIPT_TIMEOUT_SEC=90
+# POLYGON_RPC_URL=
+# CTF_CONTRACT=0x4d97dcd97ec945f40cf65f87097ace5ea0476045
+# USDC_E_CONTRACT=0x2791bca1f2de4661ed88a30c99a7a9449aa84174
+# BINANCE_WS_URL=wss://stream.binance.com:9443/ws/btcusdt@trade
+# BINANCE_PRICE_URL=https://api.binance.com/api/v3/ticker/price
+# TRADE_AMOUNT=5

@@ -2,6 +2,7 @@
 package log
 
 import (
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -32,11 +33,20 @@ func NewLogger(cfg Config) *slog.Logger {
 		Level:     level,
 	}
 
+	// 根据配置选择日志输出目标；纯 TUI 模式下可切到 discard，避免刷花终端界面。
+	output := io.Writer(os.Stdout)
+	switch strings.ToLower(strings.TrimSpace(cfg.Output)) {
+	case "stderr":
+		output = os.Stderr
+	case "discard":
+		output = io.Discard
+	}
+
 	var handler slog.Handler
 	if strings.ToLower(cfg.Format) == "text" {
-		handler = slog.NewTextHandler(os.Stdout, opts)
+		handler = slog.NewTextHandler(output, opts)
 	} else {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
+		handler = slog.NewJSONHandler(output, opts)
 	}
 
 	// 包装 TraceHandler
