@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
@@ -9,10 +10,14 @@ import (
 
 type OpportunityQueryService struct {
 	repo repository.OpportunityRepository
+	cfg  Config
 }
 
-func NewOpportunityQueryService(repo repository.OpportunityRepository) *OpportunityQueryService {
-	return &OpportunityQueryService{repo: repo}
+func NewOpportunityQueryService(repo repository.OpportunityRepository, cfg Config) *OpportunityQueryService {
+	return &OpportunityQueryService{
+		repo: repo,
+		cfg:  cfg.normalize(),
+	}
 }
 
 func (s *OpportunityQueryService) ListLatest(ctx context.Context, limit int) ([]entity.Opportunity, error) {
@@ -31,6 +36,9 @@ func (s *OpportunityQueryService) ListLatest(ctx context.Context, limit int) ([]
 	if err != nil {
 		return nil, err
 	}
+	if batchIsStale(time.Now().UTC(), latestOpportunityBatchAsOf(items), s.cfg) {
+		return []entity.Opportunity{}, nil
+	}
 	return applyOpportunityLimit(items, limit), nil
 }
 
@@ -41,6 +49,9 @@ func (s *OpportunityQueryService) ListLatestSummary(ctx context.Context, limit i
 	items, err := s.repo.ListLatestSummary(ctx, 0)
 	if err != nil {
 		return nil, err
+	}
+	if batchIsStale(time.Now().UTC(), latestOpportunitySummaryBatchAsOf(items), s.cfg) {
+		return []repository.OpportunitySummary{}, nil
 	}
 	return applyOpportunityLimit(items, limit), nil
 }
@@ -57,4 +68,52 @@ func applyOpportunityLimit[T any](items []T, limit int) []T {
 		return items[:limit]
 	}
 	return items
+}
+
+func latestOpportunityBatchAsOf(items []entity.Opportunity) int64 {
+	if len(items) == 0 {
+		return 0
+	}
+	return items[0].AsOfTimeMs
+}
+
+func latestOpportunitySummaryBatchAsOf(items []repository.OpportunitySummary) int64 {
+	if len(items) == 0 {
+		return 0
+	}
+	return items[0].AsOfTimeMs
+}
+
+// batchIsStale 用来避免“当前已经没有新机会，但界面仍然展示上一次非空 batch”。
+//
+// 机会循环现在只有在算出至少一条机会时才会落库，因此一旦市场转为空窗期，
+// DB 里“最新一批机会”就会停留在最后一个非空 batch。这里加一层时间闸门后：
+// - 新 batch 正常滚动时，列表继续展示；
+// - 最新 batch 已经超过合理刷新窗口时，列表直接返回空，而不是继续展示旧机会。
+func batchIsStale(now time.Time, asOfTimeMs int64, cfg Config) bool {
+	if asOfTimeMs <= 0 {
+		return false
+	}
+	age := now.Sub(time.UnixMilli(asOfTimeMs))
+	if age <= 0 {
+		return false
+	}
+	return age > opportunityFreshnessWindow(cfg.normalize())
+}
+
+func opportunityFreshnessWindow(cfg Config) time.Duration {
+	window := 15 * time.Second
+	if cfg.OpportunityCalcInterval > 0 {
+		candidate := cfg.OpportunityCalcInterval * 3
+		if candidate > window {
+			window = candidate
+		}
+	}
+	if cfg.MaxDataAge > 0 {
+		candidate := cfg.MaxDataAge + cfg.OpportunityCalcInterval
+		if candidate > window {
+			window = candidate
+		}
+	}
+	return window
 }

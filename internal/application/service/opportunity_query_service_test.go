@@ -123,7 +123,10 @@ func TestOpportunityQueryService_ListLatestFetchesWholeLatestBatchBeforeLimit(t 
 			},
 		},
 	}
-	svc := NewOpportunityQueryService(repo)
+	svc := NewOpportunityQueryService(repo, Config{
+		OpportunityCalcInterval: 5 * time.Second,
+		MaxDataAge:              15 * time.Second,
+	})
 
 	got, err := svc.ListLatest(context.Background(), 2)
 	if err != nil {
@@ -151,7 +154,10 @@ func TestOpportunityQueryService_ListLatestSummaryFetchesWholeBatchBeforeLimit(t
 			},
 		},
 	}
-	svc := NewOpportunityQueryService(repo)
+	svc := NewOpportunityQueryService(repo, Config{
+		OpportunityCalcInterval: 5 * time.Second,
+		MaxDataAge:              15 * time.Second,
+	})
 
 	got, err := svc.ListLatestSummary(context.Background(), 2)
 	if err != nil {
@@ -165,5 +171,57 @@ func TestOpportunityQueryService_ListLatestSummaryFetchesWholeBatchBeforeLimit(t
 	}
 	if got[0].Symbol != "SOL" || got[1].Symbol != "BTC" {
 		t.Fatalf("expected service to preserve latest batch order before limit, got %#v", got)
+	}
+}
+
+func TestOpportunityQueryService_ListLatestReturnsEmptyWhenBatchIsStale(t *testing.T) {
+	now := time.Now().UTC()
+	repo := stubOpportunityRepo{
+		items: []entity.Opportunity{
+			{
+				ID:         1,
+				BatchID:    "old-batch",
+				AsOfTimeMs: now.Add(-35 * time.Second).UnixMilli(),
+				Symbol:     "BTC",
+			},
+		},
+	}
+	svc := NewOpportunityQueryService(repo, Config{
+		OpportunityCalcInterval: 5 * time.Second,
+		MaxDataAge:              15 * time.Second,
+	})
+
+	got, err := svc.ListLatest(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected stale batch to be suppressed, got %#v", got)
+	}
+}
+
+func TestOpportunityQueryService_ListLatestSummaryReturnsEmptyWhenBatchIsStale(t *testing.T) {
+	now := time.Now().UTC()
+	repo := stubOpportunityRepo{
+		items: []entity.Opportunity{
+			{
+				ID:         1,
+				BatchID:    "old-batch",
+				AsOfTimeMs: now.Add(-35 * time.Second).UnixMilli(),
+				Symbol:     "BTC",
+			},
+		},
+	}
+	svc := NewOpportunityQueryService(repo, Config{
+		OpportunityCalcInterval: 5 * time.Second,
+		MaxDataAge:              15 * time.Second,
+	})
+
+	got, err := svc.ListLatestSummary(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected stale summary batch to be suppressed, got %#v", got)
 	}
 }
