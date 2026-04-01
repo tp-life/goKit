@@ -16,6 +16,13 @@ import (
 	"log/slog"
 )
 
+const (
+	// wsReadTimeout 控制单条 websocket 连接最长允许静默多久；超过后主动断开并触发外层重连。
+	wsReadTimeout = 25 * time.Second
+	// wsPingInterval 周期性发送 ping，尽快发现“连接还在但数据不再流动”的静默卡死。
+	wsPingInterval = 10 * time.Second
+)
+
 // Client 是外部行情基础设施客户端的具体实现。
 type Client struct {
 	cfg    infraPolymarket.Config
@@ -150,6 +157,8 @@ func (c *Client) runBinanceWSLoop(ctx context.Context, endpoint string, onPrice 
 		return err
 	}
 	defer conn.Close()
+	stopKeepalive := c.startWSKeepalive(ctx, conn)
+	defer stopKeepalive()
 
 	for {
 		select {
@@ -157,7 +166,8 @@ func (c *Client) runBinanceWSLoop(ctx context.Context, endpoint string, onPrice 
 			return ctx.Err()
 		default:
 		}
-
+		// 每收到一条消息都刷新读超时，防止长时间静默时连接一直假活着。
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return err
@@ -176,10 +186,8 @@ func (c *Client) runRTDSWSLoop(ctx context.Context, endpoint string, onPrice fun
 		return err
 	}
 	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetReadDeadline(deadline)
-	}
+	stopKeepalive := c.startWSKeepalive(ctx, conn)
+	defer stopKeepalive()
 
 	// RTDS 订阅符号默认随市场资产自动切换，例如 BTC -> btc/usd，ETH -> eth/usd。
 	rtdsSymbol := c.cfg.ResolvedRTDSSymbol()
@@ -203,7 +211,8 @@ func (c *Client) runRTDSWSLoop(ctx context.Context, endpoint string, onPrice fun
 			return ctx.Err()
 		default:
 		}
-
+		// RTDS 若长时间没有任何行情或 pong，就会在这里超时返回，外层会自动重连。
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return err
@@ -340,4 +349,30 @@ func maybeFloat(v any) *float64 {
 		}
 	}
 	return nil
+}
+
+// startWSKeepalive 为行情 websocket 安装统一的读超时和 ping 保活逻辑。
+func (c *Client) startWSKeepalive(ctx context.Context, conn *websocket.Conn) func() {
+	_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	})
+
+	keepaliveCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveCtx.Done():
+				return
+			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return cancel
 }

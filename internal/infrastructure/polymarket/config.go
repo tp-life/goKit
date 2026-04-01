@@ -10,14 +10,13 @@ import (
 
 // ConditionConfig 表示一条自动交易触发规则。
 type ConditionConfig struct {
+	// Slot 表示条件在配置文件中的原始编号，方便排序后仍保留“条件 1-4”的语义。
+	Slot int
 	Time int
-	// Diff 表示绝对价差阈值；主要用于兼容旧版 BTC 单市场配置。
-	Diff float64
-	// DiffBps 表示相对价差阈值，单位是 bps；大于 0 时优先于 Diff 生效，更适合多市场共用一套规则。
+	// DiffBps 表示相对价差阈值，单位是 bps；4 个档位统一基于它判断是否触发。
 	DiffBps float64
 	MinProb float64
 	MaxProb float64
-	Side    string
 }
 
 // MarketTargetConfig 表示一个需要并行跟踪的市场目标。
@@ -30,69 +29,93 @@ type MarketTargetConfig struct {
 
 // Config 汇总了 Polymarket SDK 及其相邻机器人能力的配置项。
 type Config struct {
-	Enabled              bool
-	Host                 string
-	RelayerURL           string
-	GammaAPI             string
-	DataAPI              string
-	CryptoPriceAPI       string
-	ClobWSURL            string
-	RTDSWSURL            string
-	ProxyURL             string
-	MarketSymbol         string
-	MarketIntervalSec    int
-	MarketSlugPrefix     string
-	MarketSlugInterval   string
-	RTDSSymbol           string
-	CryptoPriceSymbol    string
-	CryptoPriceVariant   string
-	ChainID              int64
-	PrivateKey           string
-	APIKey               string
-	APISecret            string
-	APIPassphrase        string
-	BuilderAPIKey        string
-	BuilderSecret        string
-	BuilderPassphrase    string
-	RelayerAPIKey        string
-	RelayerAPIKeyAddress string
-	FunderAddress        string
-	SignatureType        int
-	PolygonRPCURL        string
-	AutoTrade            bool
-	AutoRedeem           bool
-	AutoRedeemHourLocal  int
-	AutoRedeemMaxRetry   int
-	AutoRedeemRetryDelay int
-	AutoRedeemMaxPerRun  int
-	AutoRedeemReceiptSec int
-	AutoRedeemMinSize    float64
-	CTFContract          string
-	USDCCollateral       string
-	TradeAmount          float64
-	OrderTimeoutSec      int
-	SlippageThreshold    float64
-	MaxRetryPerMarket    int
-	BuyRetryStep         float64
-	StopLossProbPct      float64
-	TakeProfitRR         float64
-	TakeProfitCap        float64
-	TakeProfitRetryStep  float64
-	TakeProfitRetryMax   int
-	MarketDataMaxLagSec  float64
-	LoopIntervalSec      float64
-	MarketMetaRefreshSec int
-	PriceRefreshSec      int
-	BinanceSymbol        string
-	BinanceWSURL         string
-	BinancePriceURL      string
-	StateFile            string
-	DashboardStaticDir   string
-	Conditions           []ConditionConfig
-	MarketTargets        []MarketTargetConfig
-	EnableBalancePolling bool
-	EnableAccountPolling bool
-	EnableAutoRedeemer   bool
+	Enabled                    bool
+	Host                       string
+	RelayerURL                 string
+	GammaAPI                   string
+	DataAPI                    string
+	CryptoPriceAPI             string
+	ClobWSURL                  string
+	RTDSWSURL                  string
+	ProxyURL                   string
+	MarketSymbol               string
+	MarketIntervalSec          int
+	MarketSlugPrefix           string
+	MarketSlugInterval         string
+	RTDSSymbol                 string
+	CryptoPriceSymbol          string
+	CryptoPriceVariant         string
+	ChainID                    int64
+	PrivateKey                 string
+	APIKey                     string
+	APISecret                  string
+	APIPassphrase              string
+	BuilderAPIKey              string
+	BuilderSecret              string
+	BuilderPassphrase          string
+	RelayerAPIKey              string
+	RelayerAPIKeyAddress       string
+	FunderAddress              string
+	SignatureType              int
+	PolygonRPCURL              string
+	AutoTrade                  bool
+	AutoRedeem                 bool
+	AutoRedeemHourLocal        int
+	AutoRedeemMaxRetry         int
+	AutoRedeemRetryDelay       int
+	AutoRedeemMaxPerRun        int
+	AutoRedeemReceiptSec       int
+	AutoRedeemMinSize          float64
+	CTFContract                string
+	USDCCollateral             string
+	TradeAmount                float64
+	OrderTimeoutSec            int
+	SlippageThreshold          float64
+	AutoTradeConfirmSec        float64
+	MinNetEdgeBps              float64
+	PreferPostOnly             bool
+	PostOnlyTTLSec             int
+	AutoSizeByPerformance      bool
+	AutoSizeLookback           int
+	AutoSizeMinTrades          int
+	AutoSizeMinMultiplier      float64
+	AutoSizeMaxMultiplier      float64
+	MaxRetryPerMarket          int
+	BuyRetryStep               float64
+	StopLossProbPct            float64
+	StopLossHoldFinalSec       int
+	StopLossHoldMinDiffBps     float64
+	StopLossHoldRequireBinance bool
+	StopLossHoldMaxLagSec      float64
+	TakeProfitRR               float64
+	TakeProfitCap              float64
+	TakeProfitRetryStep        float64
+	TakeProfitRetryMax         int
+	MarketDataMaxLagSec        float64
+	LoopIntervalSec            float64
+	MarketMetaRefreshSec       int
+	PriceRefreshSec            int
+	MaxConcurrentMarkets       int
+	MaxTotalOpenNotional       float64
+	MaxSameSideMarkets         int
+	LossStreakLimit            int
+	LossStreakCooldownMin      int
+	AutoDisableNegative        bool
+	AutoDisableLookback        int
+	AutoDisableMinProfit       float64
+	BinanceRequireAlign        bool
+	BinanceConfirmMinBps       float64
+	BinanceVetoMaxDevBps       float64
+	BinanceSymbol              string
+	BinanceWSURL               string
+	BinancePriceURL            string
+	StateFile                  string
+	DashboardStaticDir         string
+	Conditions                 []ConditionConfig
+	MarketTargets              []MarketTargetConfig
+	EnableBalancePolling       bool
+	EnableAccountPolling       bool
+	EnableAutoRedeemer         bool
 }
 
 // LoadConfig 读取 Polymarket 相关环境变量，并转换成强类型配置。
@@ -102,62 +125,86 @@ func LoadConfig() (Config, error) {
 
 	cfg := Config{
 		// 默认值与当前 BTC 15 分钟市场的运行方式保持一致，同时允许通过环境变量切换资产与周期。
-		Enabled:              getEnvBool("POLYMARKET_ENABLED", true),
-		Host:                 getEnv("POLYMARKET_HOST", "https://clob.polymarket.com"),
-		RelayerURL:           getEnv("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com"),
-		GammaAPI:             getEnv("POLYMARKET_GAMMA_API", "https://gamma-api.polymarket.com"),
-		DataAPI:              getEnv("POLYMARKET_DATA_API", "https://data-api.polymarket.com"),
-		CryptoPriceAPI:       getEnv("POLYMARKET_CRYPTO_PRICE_API", "https://polymarket.com/api/crypto/crypto-price"),
-		ClobWSURL:            getEnv("POLYMARKET_CLOB_WS", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
-		RTDSWSURL:            getEnv("POLYMARKET_RTDS_WS", "wss://ws-live-data.polymarket.com"),
-		ProxyURL:             getFirstEnv("POLYMARKET_PROXY_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"),
-		MarketSymbol:         marketSymbol,
-		MarketIntervalSec:    marketIntervalSec,
-		MarketSlugPrefix:     getEnv("POLYMARKET_MARKET_SLUG_PREFIX", defaultMarketSlugPrefix(marketSymbol)),
-		MarketSlugInterval:   getEnv("POLYMARKET_MARKET_SLUG_INTERVAL", defaultMarketSlugInterval(marketIntervalSec)),
-		RTDSSymbol:           getEnv("POLYMARKET_RTDS_SYMBOL", defaultRTDSSymbol(marketSymbol)),
-		CryptoPriceSymbol:    getEnv("POLYMARKET_CRYPTO_PRICE_SYMBOL", marketSymbol),
-		CryptoPriceVariant:   getEnv("POLYMARKET_CRYPTO_PRICE_VARIANT", defaultCryptoPriceVariant(marketIntervalSec)),
-		ChainID:              getEnvInt64("POLYMARKET_CHAIN_ID", 137),
-		PrivateKey:           strings.TrimSpace(getEnv("PRIVATE_KEY", "")),
-		APIKey:               strings.TrimSpace(getEnv("POLYMARKET_API_KEY", "")),
-		APISecret:            strings.TrimSpace(getEnv("POLYMARKET_API_SECRET", "")),
-		APIPassphrase:        strings.TrimSpace(getEnv("POLYMARKET_API_PASSPHRASE", "")),
-		BuilderAPIKey:        strings.TrimSpace(getEnv("POLY_BUILDER_API_KEY", "")),
-		BuilderSecret:        strings.TrimSpace(getEnv("POLY_BUILDER_SECRET", "")),
-		BuilderPassphrase:    strings.TrimSpace(getEnv("POLY_BUILDER_PASSPHRASE", "")),
-		RelayerAPIKey:        strings.TrimSpace(getEnv("POLYMARKET_RELAYER_API_KEY", "")),
-		RelayerAPIKeyAddress: strings.TrimSpace(getEnv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "")),
-		FunderAddress:        strings.TrimSpace(getEnv("FUNDER_ADDRESS", "")),
-		SignatureType:        getEnvInt("SIGNATURE_TYPE", 2),
-		PolygonRPCURL:        strings.TrimSpace(getEnv("POLYGON_RPC_URL", "")),
-		AutoTrade:            getEnvBool("AUTO_TRADE", false),
-		AutoRedeem:           getEnvBool("AUTO_REDEEM", false),
-		AutoRedeemHourLocal:  getEnvInt("AUTO_REDEEM_HOUR_LOCAL", 3),
-		AutoRedeemMaxRetry:   getEnvInt("AUTO_REDEEM_MAX_RETRY", 2),
-		AutoRedeemRetryDelay: getEnvInt("AUTO_REDEEM_RETRY_DELAY_SEC", 15),
-		AutoRedeemMaxPerRun:  getEnvInt("AUTO_REDEEM_MAX_PER_RUN", 5),
-		AutoRedeemReceiptSec: getEnvInt("AUTO_REDEEM_RECEIPT_TIMEOUT_SEC", 90),
-		AutoRedeemMinSize:    getEnvFloat("AUTO_REDEEM_MIN_SIZE", 0.01),
-		CTFContract:          getEnv("CTF_CONTRACT", "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"),
-		USDCCollateral:       getEnv("USDC_E_CONTRACT", "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
-		TradeAmount:          getEnvFloat("TRADE_AMOUNT", 5),
-		OrderTimeoutSec:      getEnvInt("ORDER_TIMEOUT_SEC", 8),
-		SlippageThreshold:    getEnvFloat("SLIPPAGE_THRESHOLD", 0.05),
-		MaxRetryPerMarket:    getEnvInt("MAX_RETRY_PER_MARKET", 2),
-		BuyRetryStep:         getEnvFloat("BUY_RETRY_STEP", 0.01),
-		StopLossProbPct:      getEnvFloat("STOP_LOSS_PROB_PCT", 0.15),
-		TakeProfitRR:         getEnvFloat("TAKE_PROFIT_RR", 1.0),
-		TakeProfitCap:        getEnvFloat("TAKE_PROFIT_CAP", 0.99),
-		TakeProfitRetryStep:  getEnvFloat("TAKE_PROFIT_RETRY_STEP", 0.005),
-		TakeProfitRetryMax:   getEnvInt("TAKE_PROFIT_RETRY_MAX", 3),
-		MarketDataMaxLagSec:  getEnvFloat("MARKET_DATA_MAX_LAG_SEC", 1.2),
-		LoopIntervalSec:      getEnvFloat("LOOP_INTERVAL_SEC", 0.25),
-		MarketMetaRefreshSec: getEnvInt("MARKET_META_REFRESH_SEC", 5),
-		PriceRefreshSec:      getEnvInt("PRICE_REFRESH_SEC", 5),
-		BinanceSymbol:        getEnv("BINANCE_SYMBOL", defaultBinanceSymbol(marketSymbol)),
-		BinanceWSURL:         getEnv("BINANCE_WS_URL", ""),
-		BinancePriceURL:      getEnv("BINANCE_PRICE_URL", "https://api.binance.com/api/v3/ticker/price"),
+		Enabled:                    getEnvBool("POLYMARKET_ENABLED", true),
+		Host:                       getEnv("POLYMARKET_HOST", "https://clob.polymarket.com"),
+		RelayerURL:                 getEnv("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com"),
+		GammaAPI:                   getEnv("POLYMARKET_GAMMA_API", "https://gamma-api.polymarket.com"),
+		DataAPI:                    getEnv("POLYMARKET_DATA_API", "https://data-api.polymarket.com"),
+		CryptoPriceAPI:             getEnv("POLYMARKET_CRYPTO_PRICE_API", "https://polymarket.com/api/crypto/crypto-price"),
+		ClobWSURL:                  getEnv("POLYMARKET_CLOB_WS", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+		RTDSWSURL:                  getEnv("POLYMARKET_RTDS_WS", "wss://ws-live-data.polymarket.com"),
+		ProxyURL:                   getFirstEnv("POLYMARKET_PROXY_URL", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"),
+		MarketSymbol:               marketSymbol,
+		MarketIntervalSec:          marketIntervalSec,
+		MarketSlugPrefix:           getEnv("POLYMARKET_MARKET_SLUG_PREFIX", defaultMarketSlugPrefix(marketSymbol)),
+		MarketSlugInterval:         getEnv("POLYMARKET_MARKET_SLUG_INTERVAL", defaultMarketSlugInterval(marketIntervalSec)),
+		RTDSSymbol:                 getEnv("POLYMARKET_RTDS_SYMBOL", defaultRTDSSymbol(marketSymbol)),
+		CryptoPriceSymbol:          getEnv("POLYMARKET_CRYPTO_PRICE_SYMBOL", marketSymbol),
+		CryptoPriceVariant:         getEnv("POLYMARKET_CRYPTO_PRICE_VARIANT", defaultCryptoPriceVariant(marketIntervalSec)),
+		ChainID:                    getEnvInt64("POLYMARKET_CHAIN_ID", 137),
+		PrivateKey:                 strings.TrimSpace(getEnv("PRIVATE_KEY", "")),
+		APIKey:                     strings.TrimSpace(getEnv("POLYMARKET_API_KEY", "")),
+		APISecret:                  strings.TrimSpace(getEnv("POLYMARKET_API_SECRET", "")),
+		APIPassphrase:              strings.TrimSpace(getEnv("POLYMARKET_API_PASSPHRASE", "")),
+		BuilderAPIKey:              strings.TrimSpace(getEnv("POLY_BUILDER_API_KEY", "")),
+		BuilderSecret:              strings.TrimSpace(getEnv("POLY_BUILDER_SECRET", "")),
+		BuilderPassphrase:          strings.TrimSpace(getEnv("POLY_BUILDER_PASSPHRASE", "")),
+		RelayerAPIKey:              strings.TrimSpace(getEnv("POLYMARKET_RELAYER_API_KEY", "")),
+		RelayerAPIKeyAddress:       strings.TrimSpace(getEnv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "")),
+		FunderAddress:              strings.TrimSpace(getEnv("FUNDER_ADDRESS", "")),
+		SignatureType:              getEnvInt("SIGNATURE_TYPE", 2),
+		PolygonRPCURL:              strings.TrimSpace(getEnv("POLYGON_RPC_URL", "")),
+		AutoTrade:                  getEnvBool("AUTO_TRADE", false),
+		AutoRedeem:                 getEnvBool("AUTO_REDEEM", false),
+		AutoRedeemHourLocal:        getEnvInt("AUTO_REDEEM_HOUR_LOCAL", 3),
+		AutoRedeemMaxRetry:         getEnvInt("AUTO_REDEEM_MAX_RETRY", 2),
+		AutoRedeemRetryDelay:       getEnvInt("AUTO_REDEEM_RETRY_DELAY_SEC", 15),
+		AutoRedeemMaxPerRun:        getEnvInt("AUTO_REDEEM_MAX_PER_RUN", 5),
+		AutoRedeemReceiptSec:       getEnvInt("AUTO_REDEEM_RECEIPT_TIMEOUT_SEC", 90),
+		AutoRedeemMinSize:          getEnvFloat("AUTO_REDEEM_MIN_SIZE", 0.01),
+		CTFContract:                getEnv("CTF_CONTRACT", "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"),
+		USDCCollateral:             getEnv("USDC_E_CONTRACT", "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
+		TradeAmount:                getEnvFloat("TRADE_AMOUNT", 5),
+		OrderTimeoutSec:            getEnvInt("ORDER_TIMEOUT_SEC", 8),
+		SlippageThreshold:          getEnvFloat("SLIPPAGE_THRESHOLD", 0.05),
+		AutoTradeConfirmSec:        getEnvFloat("AUTO_TRADE_CONFIRM_SEC", 0),
+		MinNetEdgeBps:              getEnvFloat("MIN_NET_EDGE_BPS", 1.5),
+		PreferPostOnly:             getEnvBool("AUTO_TRADE_PREFER_POST_ONLY", true),
+		PostOnlyTTLSec:             getEnvInt("AUTO_TRADE_POST_ONLY_TTL_SEC", 2),
+		AutoSizeByPerformance:      getEnvBool("AUTO_SIZE_BY_PERFORMANCE", false),
+		AutoSizeLookback:           getEnvInt("AUTO_SIZE_LOOKBACK_TRADES", 6),
+		AutoSizeMinTrades:          getEnvInt("AUTO_SIZE_MIN_TRADES", 3),
+		AutoSizeMinMultiplier:      getEnvFloat("AUTO_SIZE_MIN_MULTIPLIER", 0.5),
+		AutoSizeMaxMultiplier:      getEnvFloat("AUTO_SIZE_MAX_MULTIPLIER", 1.5),
+		MaxRetryPerMarket:          getEnvInt("MAX_RETRY_PER_MARKET", 2),
+		BuyRetryStep:               getEnvFloat("BUY_RETRY_STEP", 0.01),
+		StopLossProbPct:            getEnvFloat("STOP_LOSS_PROB_PCT", 0.15),
+		StopLossHoldFinalSec:       getEnvInt("STOP_LOSS_HOLD_FINAL_SEC", 0),
+		StopLossHoldMinDiffBps:     getEnvFloat("STOP_LOSS_HOLD_MIN_DIFF_BPS", 8),
+		StopLossHoldRequireBinance: getEnvBool("STOP_LOSS_HOLD_REQUIRE_BINANCE_ALIGNMENT", true),
+		StopLossHoldMaxLagSec:      getEnvFloat("STOP_LOSS_HOLD_MAX_LAG_SEC", 1.0),
+		TakeProfitRR:               getEnvFloat("TAKE_PROFIT_RR", 1.0),
+		TakeProfitCap:              getEnvFloat("TAKE_PROFIT_CAP", 0.99),
+		TakeProfitRetryStep:        getEnvFloat("TAKE_PROFIT_RETRY_STEP", 0.005),
+		TakeProfitRetryMax:         getEnvInt("TAKE_PROFIT_RETRY_MAX", 3),
+		MarketDataMaxLagSec:        getEnvFloat("MARKET_DATA_MAX_LAG_SEC", 1.2),
+		LoopIntervalSec:            getEnvFloat("LOOP_INTERVAL_SEC", 0.25),
+		MarketMetaRefreshSec:       getEnvInt("MARKET_META_REFRESH_SEC", 5),
+		PriceRefreshSec:            getEnvInt("PRICE_REFRESH_SEC", 5),
+		MaxConcurrentMarkets:       getEnvInt("MAX_CONCURRENT_MARKETS", 0),
+		MaxTotalOpenNotional:       getEnvFloat("MAX_TOTAL_OPEN_NOTIONAL", 0),
+		MaxSameSideMarkets:         getEnvInt("MAX_SAME_SIDE_MARKETS", 0),
+		LossStreakLimit:            getEnvInt("LOSS_STREAK_LIMIT", 0),
+		LossStreakCooldownMin:      getEnvInt("LOSS_STREAK_COOLDOWN_MIN", 0),
+		AutoDisableNegative:        getEnvBool("AUTO_DISABLE_NEGATIVE_STRATEGIES", false),
+		AutoDisableLookback:        getEnvInt("AUTO_DISABLE_LOOKBACK_TRADES", 4),
+		AutoDisableMinProfit:       getEnvFloat("AUTO_DISABLE_MIN_TOTAL_PNL", 0),
+		BinanceRequireAlign:        getEnvBool("BINANCE_REQUIRE_ALIGNMENT", false),
+		BinanceConfirmMinBps:       getEnvFloat("BINANCE_CONFIRM_MIN_DIFF_BPS", 0),
+		BinanceVetoMaxDevBps:       getEnvFloat("BINANCE_VETO_MAX_DEVIATION_BPS", 0),
+		BinanceSymbol:              getEnv("BINANCE_SYMBOL", defaultBinanceSymbol(marketSymbol)),
+		BinanceWSURL:               getEnv("BINANCE_WS_URL", ""),
+		BinancePriceURL:            getEnv("BINANCE_PRICE_URL", "https://api.binance.com/api/v3/ticker/price"),
 		// 默认把运行时状态放到 data 目录，把 dashboard 静态资源放到 web 目录，彻底摆脱旧 Python 目录依赖。
 		StateFile:            getEnv("POLYMARKET_STATE_FILE", filepath.Join("data", "polymarket", "state.json")),
 		DashboardStaticDir:   getEnv("POLYMARKET_DASHBOARD_STATIC_DIR", filepath.Join("web", "polymarket")),
@@ -168,36 +215,32 @@ func LoadConfig() (Config, error) {
 
 	cfg.Conditions = []ConditionConfig{
 		{
+			Slot:    1,
 			Time:    getEnvInt("CONDITION_1_TIME", 120),
-			Diff:    getEnvFloat("CONDITION_1_DIFF", 30),
-			DiffBps: getEnvFloat("CONDITION_1_DIFF_BPS", 0),
+			DiffBps: getEnvFloat("CONDITION_1_DIFF_BPS", 5),
 			MinProb: getEnvFloat("CONDITION_1_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_1_MAX_PROB", 0.92),
-			Side:    "UP",
 		},
 		{
+			Slot:    2,
 			Time:    getEnvInt("CONDITION_2_TIME", 120),
-			Diff:    getEnvFloat("CONDITION_2_DIFF", 30),
-			DiffBps: getEnvFloat("CONDITION_2_DIFF_BPS", 0),
+			DiffBps: getEnvFloat("CONDITION_2_DIFF_BPS", 5),
 			MinProb: getEnvFloat("CONDITION_2_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_2_MAX_PROB", 0.92),
-			Side:    "DOWN",
 		},
 		{
+			Slot:    3,
 			Time:    getEnvInt("CONDITION_3_TIME", 60),
-			Diff:    getEnvFloat("CONDITION_3_DIFF", 50),
-			DiffBps: getEnvFloat("CONDITION_3_DIFF_BPS", 0),
+			DiffBps: getEnvFloat("CONDITION_3_DIFF_BPS", 8),
 			MinProb: getEnvFloat("CONDITION_3_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_3_MAX_PROB", 0.92),
-			Side:    "UP",
 		},
 		{
+			Slot:    4,
 			Time:    getEnvInt("CONDITION_4_TIME", 60),
-			Diff:    getEnvFloat("CONDITION_4_DIFF", 50),
-			DiffBps: getEnvFloat("CONDITION_4_DIFF_BPS", 0),
+			DiffBps: getEnvFloat("CONDITION_4_DIFF_BPS", 8),
 			MinProb: getEnvFloat("CONDITION_4_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_4_MAX_PROB", 0.92),
-			Side:    "DOWN",
 		},
 	}
 	cfg.MarketTargets = parseMarketTargets(getEnv("POLYMARKET_MARKETS", ""), cfg.MarketSymbol, cfg.MarketIntervalSec)
@@ -239,12 +282,69 @@ func LoadConfig() (Config, error) {
 	if cfg.TakeProfitRetryMax <= 0 {
 		cfg.TakeProfitRetryMax = 1
 	}
+	if cfg.StopLossHoldFinalSec < 0 {
+		cfg.StopLossHoldFinalSec = 0
+	}
+	if cfg.StopLossHoldMinDiffBps < 0 {
+		cfg.StopLossHoldMinDiffBps = 0
+	}
+	if cfg.StopLossHoldMaxLagSec <= 0 {
+		cfg.StopLossHoldMaxLagSec = 1.0
+	}
 	if cfg.TakeProfitRetryStep < 0 {
 		cfg.TakeProfitRetryStep = 0.005
+	}
+	if cfg.MaxConcurrentMarkets < 0 {
+		cfg.MaxConcurrentMarkets = 0
+	}
+	if cfg.MaxTotalOpenNotional < 0 {
+		cfg.MaxTotalOpenNotional = 0
+	}
+	if cfg.AutoTradeConfirmSec < 0 {
+		cfg.AutoTradeConfirmSec = 0
+	}
+	if cfg.MinNetEdgeBps < 0 {
+		cfg.MinNetEdgeBps = 0
+	}
+	if cfg.PostOnlyTTLSec <= 0 {
+		cfg.PostOnlyTTLSec = 2
+	}
+	if cfg.AutoSizeLookback < 0 {
+		cfg.AutoSizeLookback = 0
+	}
+	if cfg.AutoSizeMinTrades < 0 {
+		cfg.AutoSizeMinTrades = 0
+	}
+	if cfg.AutoSizeMinMultiplier <= 0 {
+		cfg.AutoSizeMinMultiplier = 0.5
+	}
+	if cfg.AutoSizeMaxMultiplier < cfg.AutoSizeMinMultiplier {
+		cfg.AutoSizeMaxMultiplier = cfg.AutoSizeMinMultiplier
+	}
+	if cfg.MaxSameSideMarkets < 0 {
+		cfg.MaxSameSideMarkets = 0
+	}
+	if cfg.LossStreakLimit < 0 {
+		cfg.LossStreakLimit = 0
+	}
+	if cfg.LossStreakCooldownMin < 0 {
+		cfg.LossStreakCooldownMin = 0
+	}
+	if cfg.AutoDisableLookback < 0 {
+		cfg.AutoDisableLookback = 0
+	}
+	if cfg.BinanceConfirmMinBps < 0 {
+		cfg.BinanceConfirmMinBps = 0
+	}
+	if cfg.BinanceVetoMaxDevBps < 0 {
+		cfg.BinanceVetoMaxDevBps = 0
 	}
 	for idx := range cfg.Conditions {
 		if cfg.Conditions[idx].DiffBps < 0 {
 			cfg.Conditions[idx].DiffBps = 0
+		}
+		if cfg.Conditions[idx].Slot <= 0 {
+			cfg.Conditions[idx].Slot = idx + 1
 		}
 	}
 	if strings.TrimSpace(cfg.MarketSymbol) == "" {
@@ -319,6 +419,11 @@ func (c Config) ResolvedMarketTargets() []MarketTargetConfig {
 	return out
 }
 
+// ResolvedMarketKey 返回当前单市场 worker 对应的稳定 watchlist 键名。
+func (c Config) ResolvedMarketKey() string {
+	return buildMarketTargetKey(c.MarketSymbol, c.ResolvedMarketIntervalSec())
+}
+
 // CloneForTarget 基于基础配置派生一个单市场 worker 配置。
 func (c Config) CloneForTarget(target MarketTargetConfig, workerIndex int, enableSharedTasks bool) Config {
 	out := c
@@ -330,9 +435,10 @@ func (c Config) CloneForTarget(target MarketTargetConfig, workerIndex int, enabl
 	out.CryptoPriceSymbol = out.MarketSymbol
 	out.CryptoPriceVariant = defaultCryptoPriceVariant(out.MarketIntervalSec)
 	out.BinanceSymbol = defaultBinanceSymbol(out.MarketSymbol)
+	applyMarketOverrides(target, &out)
 	// 多市场模式下，如果 BINANCE_WS_URL 只是沿用了基础市场的默认值，
 	// 这里清空后让子 worker 按各自 symbol 重新派生 websocket 地址。
-	if shouldDeriveBinanceWSURLForTarget(c.BinanceWSURL, c.ResolvedBinanceSymbol()) {
+	if out.BinanceWSURL == c.BinanceWSURL && shouldDeriveBinanceWSURLForTarget(c.BinanceWSURL, c.ResolvedBinanceSymbol()) {
 		out.BinanceWSURL = ""
 	}
 	out.MarketTargets = nil
@@ -348,6 +454,57 @@ func (c Config) CloneForTarget(target MarketTargetConfig, workerIndex int, enabl
 		out.StateFile = absPath
 	}
 	return out
+}
+
+// applyMarketOverrides 允许某个 watchlist 市场覆盖默认策略参数，避免不同资产共用完全相同的阈值。
+func applyMarketOverrides(target MarketTargetConfig, cfg *Config) {
+	prefix := marketOverridePrefix(target)
+	if prefix == "" {
+		return
+	}
+
+	overrideString(prefix+"POLYMARKET_MARKET_SLUG_PREFIX", &cfg.MarketSlugPrefix)
+	overrideString(prefix+"POLYMARKET_MARKET_SLUG_INTERVAL", &cfg.MarketSlugInterval)
+	overrideString(prefix+"POLYMARKET_RTDS_SYMBOL", &cfg.RTDSSymbol)
+	overrideString(prefix+"POLYMARKET_CRYPTO_PRICE_SYMBOL", &cfg.CryptoPriceSymbol)
+	overrideString(prefix+"POLYMARKET_CRYPTO_PRICE_VARIANT", &cfg.CryptoPriceVariant)
+	overrideString(prefix+"BINANCE_SYMBOL", &cfg.BinanceSymbol)
+	overrideString(prefix+"BINANCE_WS_URL", &cfg.BinanceWSURL)
+
+	overrideFloat(prefix+"TRADE_AMOUNT", &cfg.TradeAmount)
+	overrideInt(prefix+"ORDER_TIMEOUT_SEC", &cfg.OrderTimeoutSec)
+	overrideFloat(prefix+"SLIPPAGE_THRESHOLD", &cfg.SlippageThreshold)
+	overrideFloat(prefix+"AUTO_TRADE_CONFIRM_SEC", &cfg.AutoTradeConfirmSec)
+	overrideFloat(prefix+"MIN_NET_EDGE_BPS", &cfg.MinNetEdgeBps)
+	overrideBool(prefix+"AUTO_TRADE_PREFER_POST_ONLY", &cfg.PreferPostOnly)
+	overrideInt(prefix+"AUTO_TRADE_POST_ONLY_TTL_SEC", &cfg.PostOnlyTTLSec)
+	overrideBool(prefix+"AUTO_SIZE_BY_PERFORMANCE", &cfg.AutoSizeByPerformance)
+	overrideInt(prefix+"AUTO_SIZE_LOOKBACK_TRADES", &cfg.AutoSizeLookback)
+	overrideInt(prefix+"AUTO_SIZE_MIN_TRADES", &cfg.AutoSizeMinTrades)
+	overrideFloat(prefix+"AUTO_SIZE_MIN_MULTIPLIER", &cfg.AutoSizeMinMultiplier)
+	overrideFloat(prefix+"AUTO_SIZE_MAX_MULTIPLIER", &cfg.AutoSizeMaxMultiplier)
+	overrideInt(prefix+"MAX_RETRY_PER_MARKET", &cfg.MaxRetryPerMarket)
+	overrideFloat(prefix+"BUY_RETRY_STEP", &cfg.BuyRetryStep)
+	overrideFloat(prefix+"STOP_LOSS_PROB_PCT", &cfg.StopLossProbPct)
+	overrideInt(prefix+"STOP_LOSS_HOLD_FINAL_SEC", &cfg.StopLossHoldFinalSec)
+	overrideFloat(prefix+"STOP_LOSS_HOLD_MIN_DIFF_BPS", &cfg.StopLossHoldMinDiffBps)
+	overrideBool(prefix+"STOP_LOSS_HOLD_REQUIRE_BINANCE_ALIGNMENT", &cfg.StopLossHoldRequireBinance)
+	overrideFloat(prefix+"STOP_LOSS_HOLD_MAX_LAG_SEC", &cfg.StopLossHoldMaxLagSec)
+	overrideFloat(prefix+"TAKE_PROFIT_RR", &cfg.TakeProfitRR)
+	overrideFloat(prefix+"TAKE_PROFIT_CAP", &cfg.TakeProfitCap)
+	overrideFloat(prefix+"TAKE_PROFIT_RETRY_STEP", &cfg.TakeProfitRetryStep)
+	overrideInt(prefix+"TAKE_PROFIT_RETRY_MAX", &cfg.TakeProfitRetryMax)
+	overrideFloat(prefix+"MARKET_DATA_MAX_LAG_SEC", &cfg.MarketDataMaxLagSec)
+	overrideBool(prefix+"BINANCE_REQUIRE_ALIGNMENT", &cfg.BinanceRequireAlign)
+	overrideFloat(prefix+"BINANCE_CONFIRM_MIN_DIFF_BPS", &cfg.BinanceConfirmMinBps)
+	overrideFloat(prefix+"BINANCE_VETO_MAX_DEVIATION_BPS", &cfg.BinanceVetoMaxDevBps)
+
+	for idx := range cfg.Conditions {
+		overrideInt(fmt.Sprintf("%sCONDITION_%d_TIME", prefix, idx+1), &cfg.Conditions[idx].Time)
+		overrideFloat(fmt.Sprintf("%sCONDITION_%d_DIFF_BPS", prefix, idx+1), &cfg.Conditions[idx].DiffBps)
+		overrideFloat(fmt.Sprintf("%sCONDITION_%d_MIN_PROB", prefix, idx+1), &cfg.Conditions[idx].MinProb)
+		overrideFloat(fmt.Sprintf("%sCONDITION_%d_MAX_PROB", prefix, idx+1), &cfg.Conditions[idx].MaxProb)
+	}
 }
 
 // ResolvedMarketSlugPrefix 返回市场 slug 前缀，默认形如 `btc-updown`。
@@ -579,6 +736,14 @@ func buildMarketTargetLabel(symbol string, intervalSec int) string {
 	return normalizeMarketSymbol(symbol) + " " + defaultMarketSlugInterval(intervalSec)
 }
 
+// marketOverridePrefix 生成市场级别覆盖前缀，例如 `MARKET_BTC_15M_`。
+func marketOverridePrefix(target MarketTargetConfig) string {
+	if strings.TrimSpace(target.Symbol) == "" || target.IntervalSec <= 0 {
+		return ""
+	}
+	return "MARKET_" + strings.ToUpper(normalizeMarketSymbol(target.Symbol)) + "_" + strings.ToUpper(defaultMarketSlugInterval(target.IntervalSec)) + "_"
+}
+
 // targetStateFilePath 为多市场 worker 派生独立的状态文件路径。
 func targetStateFilePath(basePath string, target MarketTargetConfig) string {
 	dir := filepath.Dir(basePath)
@@ -659,4 +824,44 @@ func getEnvFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return v
+}
+
+// overrideString 仅在环境变量非空时覆盖字符串配置。
+func overrideString(key string, target *string) {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		*target = value
+	}
+}
+
+// overrideBool 仅在环境变量可解析时覆盖布尔配置。
+func overrideBool(key string, target *bool) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return
+	}
+	if value, err := strconv.ParseBool(raw); err == nil {
+		*target = value
+	}
+}
+
+// overrideInt 仅在环境变量可解析时覆盖整型配置。
+func overrideInt(key string, target *int) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return
+	}
+	if value, err := strconv.Atoi(raw); err == nil {
+		*target = value
+	}
+}
+
+// overrideFloat 仅在环境变量可解析时覆盖浮点配置。
+func overrideFloat(key string, target *float64) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" || strings.EqualFold(raw, "xx") {
+		return
+	}
+	if value, err := strconv.ParseFloat(raw, 64); err == nil {
+		*target = value
+	}
 }

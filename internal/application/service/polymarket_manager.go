@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"goKit/internal/application/dto"
 	"goKit/internal/domain/entity"
@@ -38,6 +39,9 @@ type PolymarketManager struct {
 	nextSubID int
 	subs      map[int]chan entity.DashboardState
 	cancel    context.CancelFunc
+
+	lossCooldownUntil   time.Time
+	lossCooldownTrigger string
 }
 
 // NewPolymarketManager 创建多市场管理器。
@@ -72,6 +76,8 @@ func NewPolymarketManager(cfg infraPolymarket.Config, logger *slog.Logger) *Poly
 		}
 
 		worker := NewPolymarketService(childCfg, repo, client, feeds, logger)
+		worker.SetAutoTradeRiskGuard(manager.checkAutoTradeRisk)
+		worker.SetAutoTradeSizeAllocator(manager.recommendAutoTradeAmount)
 		manager.workers[target.Key] = &managedWorker{
 			target:   target,
 			service:  worker,
@@ -222,7 +228,11 @@ func (m *PolymarketManager) Unsubscribe(id int) {
 
 // DefaultTradeAmount 返回当前统一使用的默认下单金额。
 func (m *PolymarketManager) DefaultTradeAmount() float64 {
-	return m.cfg.TradeAmount
+	worker := m.focusedWorker()
+	if worker == nil {
+		return m.cfg.TradeAmount
+	}
+	return worker.service.DefaultTradeAmount()
 }
 
 // SubmitTUIQuickOrder 把终端快捷单路由到当前焦点市场。
@@ -361,6 +371,7 @@ func (m *PolymarketManager) rebuildSnapshotLocked() {
 	merged.TradeHistory = m.mergeTradeHistoryLocked()
 	merged.Activity = m.mergeActivityLocked()
 	merged.RoundResults = m.mergeRoundResultsLocked()
+	merged.StrategyPerformance = m.buildStrategyPerformanceLocked()
 
 	if primary := m.workers[m.order[0]]; primary != nil {
 		primarySnapshot := primary.snapshot
@@ -374,11 +385,22 @@ func (m *PolymarketManager) rebuildSnapshotLocked() {
 		merged.LiveTotalPnL = primarySnapshot.LiveTotalPnL
 		merged.AutoRedeem = cloneAutoRedeemStatus(primarySnapshot.AutoRedeem)
 	}
+	merged.GlobalRisk = m.buildGlobalRiskStatusLocked(m.snapshot.GlobalRisk.LastBlockReason, "")
 
 	if strings.TrimSpace(merged.UpdatedAt) == "" {
 		merged.UpdatedAt = mergedTimestamp(merged.Markets)
 	}
 	m.snapshot = merged
+}
+
+// buildStrategyPerformanceLocked 汇总本地闭环交易的策略收益榜。
+func (m *PolymarketManager) buildStrategyPerformanceLocked() []entity.StrategyPerformance {
+	return buildStrategyPerformanceFromHistory(
+		m.mergeTradeHistoryLocked(),
+		m.cfg.AutoDisableLookback,
+		m.cfg.AutoDisableMinProfit,
+		m.cfg.AutoDisableNegative,
+	)
 }
 
 // buildTrackedMarketsLocked 输出所有 watchlist 市场的摘要切片。
@@ -402,6 +424,7 @@ func (m *PolymarketManager) buildTrackedMarketsLocked() []entity.TrackedMarketVi
 			PendingOrder: clonePendingOrder(snapshot.PendingOrder),
 			LastOrder:    cloneLastOrder(snapshot.LastOrder),
 			AutoTrade:    cloneAutoTradeDiagnostics(snapshot.AutoTrade),
+			AutoConfig:   cloneAutoTradeConfigView(snapshot.AutoTradeConfig),
 		})
 	}
 	return out

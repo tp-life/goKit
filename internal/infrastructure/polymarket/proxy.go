@@ -101,7 +101,12 @@ func DialProxyEthClient(ctx context.Context, cfg Config) (*ethclient.Client, err
 
 // newProxyHTTPTransport 根据代理协议构造 HTTP transport。
 func newProxyHTTPTransport(cfg Config) (*http.Transport, error) {
+	baseTransport, ok := http.DefaultTransport.(*http.Transport)
 	transport := &http.Transport{}
+	if ok {
+		// 复用 Go 默认 transport 的成熟连接池与 HTTP/2 参数，避免代理环境下出现过于脆弱的零值 transport。
+		transport = baseTransport.Clone()
+	}
 
 	proxyURL, err := parseConfiguredProxyURL(cfg.ProxyURL)
 	if err != nil {

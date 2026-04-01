@@ -2,25 +2,32 @@ package entity
 
 // Position 表示机器人当前记录的持仓。
 type Position struct {
-	Slug       string  `json:"slug"`
-	Side       string  `json:"side"`
-	EntryPrice float64 `json:"entry_price"`
-	EntryDiff  float64 `json:"entry_diff"`
-	Size       float64 `json:"size"`
-	Amount     float64 `json:"amount,omitempty"`
+	Slug        string  `json:"slug"`
+	Side        string  `json:"side"`
+	EntryPrice  float64 `json:"entry_price"`
+	EntryDiff   float64 `json:"entry_diff"`
+	Size        float64 `json:"size"`
+	Amount      float64 `json:"amount,omitempty"`
+	WindowSec   int     `json:"window_sec,omitempty"`
+	StrategyKey string  `json:"strategy_key,omitempty"`
+	Execution   string  `json:"execution,omitempty"`
 }
 
 // PendingOrder 表示当前仍在挂单中的订单。
 type PendingOrder struct {
-	OrderID string  `json:"order_id"`
-	Time    string  `json:"time"`
-	Slug    string  `json:"slug"`
-	Side    string  `json:"side"`
-	Action  string  `json:"action"`
-	Reason  string  `json:"reason,omitempty"`
-	Price   float64 `json:"price"`
-	Size    float64 `json:"size,omitempty"`
-	Amount  float64 `json:"amount,omitempty"`
+	OrderID     string  `json:"order_id"`
+	Time        string  `json:"time"`
+	Slug        string  `json:"slug"`
+	Side        string  `json:"side"`
+	Action      string  `json:"action"`
+	Reason      string  `json:"reason,omitempty"`
+	Price       float64 `json:"price"`
+	Size        float64 `json:"size,omitempty"`
+	Amount      float64 `json:"amount,omitempty"`
+	WindowSec   int     `json:"window_sec,omitempty"`
+	StrategyKey string  `json:"strategy_key,omitempty"`
+	Execution   string  `json:"execution,omitempty"`
+	PostOnly    bool    `json:"post_only,omitempty"`
 }
 
 // LastOrder 记录同一市场同一方向最近一次尝试下单的信息。
@@ -34,20 +41,25 @@ type LastOrder struct {
 
 // TradeHistoryItem 表示机器人侧的交易历史项。
 type TradeHistoryItem struct {
-	ID      string   `json:"id,omitempty"`
-	Time    string   `json:"time"`
-	Slug    string   `json:"slug"`
-	Action  string   `json:"action"`
-	Side    string   `json:"side"`
-	Price   float64  `json:"price"`
-	Amount  float64  `json:"amount,omitempty"`
-	Size    float64  `json:"size,omitempty"`
-	OrderID string   `json:"order_id,omitempty"`
-	Status  string   `json:"status,omitempty"`
-	Reason  string   `json:"reason,omitempty"`
-	Error   string   `json:"error,omitempty"`
-	Diff    *float64 `json:"diff,omitempty"`
-	PnL     *float64 `json:"pnl,omitempty"`
+	ID          string   `json:"id,omitempty"`
+	Time        string   `json:"time"`
+	Slug        string   `json:"slug"`
+	Action      string   `json:"action"`
+	Side        string   `json:"side"`
+	Price       float64  `json:"price"`
+	Amount      float64  `json:"amount,omitempty"`
+	Size        float64  `json:"size,omitempty"`
+	OrderID     string   `json:"order_id,omitempty"`
+	Status      string   `json:"status,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	Diff        *float64 `json:"diff,omitempty"`
+	PnL         *float64 `json:"pnl,omitempty"`
+	WindowSec   int      `json:"window_sec,omitempty"`
+	StrategyKey string   `json:"strategy_key,omitempty"`
+	Execution   string   `json:"execution,omitempty"`
+	PostOnly    bool     `json:"post_only,omitempty"`
+	NetEdgeBps  *float64 `json:"net_edge_bps,omitempty"`
 }
 
 // PolymarketState 表示需要持久化到本地文件的交易状态。
@@ -124,6 +136,7 @@ type TrackedMarketView struct {
 	PendingOrder *PendingOrder        `json:"pending_order,omitempty"`
 	LastOrder    *LastOrder           `json:"last_order,omitempty"`
 	AutoTrade    AutoTradeDiagnostics `json:"auto_trade"`
+	AutoConfig   AutoTradeConfigView  `json:"auto_trade_config"`
 }
 
 // WalletPosition 表示从 Data API 同步回来的钱包持仓视图。
@@ -193,9 +206,70 @@ type AutoTradeDiagnostics struct {
 	DataLagCount          int    `json:"data_lag_count"`
 	BlockedByStateCount   int    `json:"blocked_by_state_count"`
 	RetryLimitCount       int    `json:"retry_limit_count"`
+	SignalConfirmCount    int    `json:"signal_confirm_count"`
+	BinanceVetoCount      int    `json:"binance_veto_count"`
+	NetEdgeMissCount      int    `json:"net_edge_miss_count"`
 	LastReason            string `json:"last_reason,omitempty"`
 	LastReasonAt          string `json:"last_reason_at,omitempty"`
 	LastTriggerAt         string `json:"last_trigger_at,omitempty"`
+}
+
+// AutoTradeConditionView 表示一条自动交易触发条件的只读视图。
+type AutoTradeConditionView struct {
+	Index   int     `json:"index"`
+	Enabled bool    `json:"enabled"`
+	Time    int     `json:"time,omitempty"`
+	DiffBps float64 `json:"diff_bps,omitempty"`
+	MinProb float64 `json:"min_prob,omitempty"`
+	MaxProb float64 `json:"max_prob,omitempty"`
+}
+
+// AutoTradeConfigView 表示当前市场实际生效的自动交易配置摘要。
+type AutoTradeConfigView struct {
+	TradeAmount                float64                  `json:"trade_amount,omitempty"`
+	ConfirmSec                 float64                  `json:"confirm_sec,omitempty"`
+	MarketDataMaxLagSec        float64                  `json:"market_data_max_lag_sec,omitempty"`
+	MinNetEdgeBps              float64                  `json:"min_net_edge_bps,omitempty"`
+	PreferPostOnly             bool                     `json:"prefer_post_only,omitempty"`
+	StopLossProbPct            float64                  `json:"stop_loss_prob_pct,omitempty"`
+	StopLossHoldFinalSec       int                      `json:"stop_loss_hold_final_sec,omitempty"`
+	StopLossHoldMinDiffBps     float64                  `json:"stop_loss_hold_min_diff_bps,omitempty"`
+	StopLossHoldRequireBinance bool                     `json:"stop_loss_hold_require_binance,omitempty"`
+	StopLossHoldMaxLagSec      float64                  `json:"stop_loss_hold_max_lag_sec,omitempty"`
+	TakeProfitRR               float64                  `json:"take_profit_rr,omitempty"`
+	BinanceRequireAlign        bool                     `json:"binance_require_alignment,omitempty"`
+	BinanceConfirmMinBps       float64                  `json:"binance_confirm_min_bps,omitempty"`
+	BinanceVetoMaxDevBps       float64                  `json:"binance_veto_max_dev_bps,omitempty"`
+	Conditions                 []AutoTradeConditionView `json:"conditions,omitempty"`
+}
+
+// StrategyPerformance 表示某个市场/窗口/方向在本地闭环历史上的收益表现。
+type StrategyPerformance struct {
+	StrategyKey   string  `json:"strategy_key"`
+	MarketKey     string  `json:"market_key"`
+	MarketSlug    string  `json:"market_slug,omitempty"`
+	Side          string  `json:"side,omitempty"`
+	WindowSec     int     `json:"window_sec,omitempty"`
+	Trades        int     `json:"trades"`
+	Wins          int     `json:"wins"`
+	Losses        int     `json:"losses"`
+	WinRate       float64 `json:"win_rate"`
+	Profit        float64 `json:"profit"`
+	AvgProfit     float64 `json:"avg_profit"`
+	LastClosedAt  string  `json:"last_closed_at,omitempty"`
+	Disabled      bool    `json:"disabled,omitempty"`
+	DisableReason string  `json:"disable_reason,omitempty"`
+}
+
+// GlobalRiskStatus 表示多市场账户层全局风控的当前状态。
+type GlobalRiskStatus struct {
+	Enabled             bool    `json:"enabled"`
+	OpenMarkets         int     `json:"open_markets"`
+	OpenNotional        float64 `json:"open_notional"`
+	SameSideOpenMarkets int     `json:"same_side_open_markets"`
+	LossStreak          int     `json:"loss_streak"`
+	CooldownUntil       string  `json:"cooldown_until,omitempty"`
+	LastBlockReason     string  `json:"last_block_reason,omitempty"`
 }
 
 // RoundResult 表示一个市场轮次的结算结果摘要。
@@ -215,27 +289,30 @@ type RoundResult struct {
 
 // DashboardState 表示前端 dashboard 所需的完整状态快照。
 type DashboardState struct {
-	UpdatedAt          string               `json:"updated_at,omitempty"`
-	SelectedMarketKey  string               `json:"selected_market_key,omitempty"`
-	Market             DashboardMarket      `json:"market"`
-	WalletBalance      *float64             `json:"wallet_balance,omitempty"`
-	Prices             DashboardPrices      `json:"prices"`
-	Position           *Position            `json:"position,omitempty"`
-	PendingOrder       *PendingOrder        `json:"pending_order,omitempty"`
-	LastOrder          *LastOrder           `json:"last_order,omitempty"`
-	TradeHistory       []TradeHistoryItem   `json:"trade_history,omitempty"`
-	WalletPositions    []WalletPosition     `json:"wallet_positions,omitempty"`
-	WalletHistory      []TradeHistoryItem   `json:"wallet_history,omitempty"`
-	LiveTrades         []LiveTradeSummary   `json:"live_trades,omitempty"`
-	LivePositionsCount int                  `json:"live_positions_count"`
-	LiveRealizedPnL    float64              `json:"live_realized_pnl"`
-	LiveUnrealizedPnL  float64              `json:"live_unrealized_pnl"`
-	LiveTotalPnL       float64              `json:"live_total_pnl"`
-	AutoTrade          AutoTradeDiagnostics `json:"auto_trade"`
-	AutoRedeem         AutoRedeemStatus     `json:"auto_redeem"`
-	Markets            []TrackedMarketView  `json:"markets,omitempty"`
-	Activity           []ActivityLog        `json:"activity,omitempty"`
-	RoundResults       []RoundResult        `json:"round_results,omitempty"`
+	UpdatedAt           string                `json:"updated_at,omitempty"`
+	SelectedMarketKey   string                `json:"selected_market_key,omitempty"`
+	Market              DashboardMarket       `json:"market"`
+	WalletBalance       *float64              `json:"wallet_balance,omitempty"`
+	Prices              DashboardPrices       `json:"prices"`
+	Position            *Position             `json:"position,omitempty"`
+	PendingOrder        *PendingOrder         `json:"pending_order,omitempty"`
+	LastOrder           *LastOrder            `json:"last_order,omitempty"`
+	TradeHistory        []TradeHistoryItem    `json:"trade_history,omitempty"`
+	WalletPositions     []WalletPosition      `json:"wallet_positions,omitempty"`
+	WalletHistory       []TradeHistoryItem    `json:"wallet_history,omitempty"`
+	LiveTrades          []LiveTradeSummary    `json:"live_trades,omitempty"`
+	LivePositionsCount  int                   `json:"live_positions_count"`
+	LiveRealizedPnL     float64               `json:"live_realized_pnl"`
+	LiveUnrealizedPnL   float64               `json:"live_unrealized_pnl"`
+	LiveTotalPnL        float64               `json:"live_total_pnl"`
+	AutoTrade           AutoTradeDiagnostics  `json:"auto_trade"`
+	AutoTradeConfig     AutoTradeConfigView   `json:"auto_trade_config"`
+	AutoRedeem          AutoRedeemStatus      `json:"auto_redeem"`
+	GlobalRisk          GlobalRiskStatus      `json:"global_risk"`
+	Markets             []TrackedMarketView   `json:"markets,omitempty"`
+	StrategyPerformance []StrategyPerformance `json:"strategy_performance,omitempty"`
+	Activity            []ActivityLog         `json:"activity,omitempty"`
+	RoundResults        []RoundResult         `json:"round_results,omitempty"`
 }
 
 // NewDashboardState 返回带有默认值的 dashboard 初始状态。
@@ -249,12 +326,14 @@ func NewDashboardState() DashboardState {
 			Enabled:    false,
 			LastResult: map[string]any{},
 		},
-		Markets:         []TrackedMarketView{},
-		TradeHistory:    []TradeHistoryItem{},
-		WalletPositions: []WalletPosition{},
-		WalletHistory:   []TradeHistoryItem{},
-		LiveTrades:      []LiveTradeSummary{},
-		Activity:        []ActivityLog{},
-		RoundResults:    []RoundResult{},
+		GlobalRisk:          GlobalRiskStatus{},
+		Markets:             []TrackedMarketView{},
+		StrategyPerformance: []StrategyPerformance{},
+		TradeHistory:        []TradeHistoryItem{},
+		WalletPositions:     []WalletPosition{},
+		WalletHistory:       []TradeHistoryItem{},
+		LiveTrades:          []LiveTradeSummary{},
+		Activity:            []ActivityLog{},
+		RoundResults:        []RoundResult{},
 	}
 }

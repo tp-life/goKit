@@ -6,8 +6,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 // TestTickSizeResponseAcceptsNumber 确认 tick-size 元数据在服务端返回 number 时也能正常解析。
 func TestTickSizeResponseAcceptsNumber(t *testing.T) {
@@ -134,5 +141,45 @@ func TestPlaceLimitOrderRefreshesInvalidConfiguredAPIKey(t *testing.T) {
 	}
 	if orderCalls != 2 {
 		t.Fatalf("expected order endpoint to be called twice, got %d", orderCalls)
+	}
+}
+
+// TestGetTickSizeRetriesTransientEOF 确认只读元数据请求遇到瞬时 EOF 时会自动短重试一次。
+func TestGetTickSizeRetriesTransientEOF(t *testing.T) {
+	attempts := 0
+	client := &Client{
+		cfg: Config{
+			Host: "https://clob.polymarket.com",
+		},
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		http:       &http.Client{},
+		tickSizes:  map[string]string{},
+		negRisk:    map[string]bool{},
+		feeRateBps: map[string]int{},
+	}
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if req.Method != http.MethodGet {
+			t.Fatalf("expected GET request, got %s", req.Method)
+		}
+		if attempts == 1 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"minimum_tick_size":"0.01"}`)),
+		}, nil
+	})
+
+	tickSize, err := client.GetTickSize(t.Context(), "token-1")
+	if err != nil {
+		t.Fatalf("GetTickSize returned error: %v", err)
+	}
+	if tickSize != "0.01" {
+		t.Fatalf("unexpected tick size %q", tickSize)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
 }

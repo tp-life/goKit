@@ -92,19 +92,25 @@ func (c *Client) cancelOrder(ctx context.Context, orderID string, allowRetry boo
 	return nil
 }
 
-// PlaceLimitOrder 构造、签名并提交一个 GTC 限价单到 CLOB。
+// PlaceLimitOrder 构造、签名并提交一个默认的 GTC 限价单到 CLOB。
 func (c *Client) PlaceLimitOrder(ctx context.Context, tokenID string, action string, price float64, sizeShares float64) (string, float64, error) {
+	return c.PlaceLimitOrderWithOptions(ctx, tokenID, action, price, sizeShares, PlaceOrderOptions{})
+}
+
+// PlaceLimitOrderWithOptions 构造、签名并提交一个带执行属性的限价单到 CLOB。
+func (c *Client) PlaceLimitOrderWithOptions(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, opts PlaceOrderOptions) (string, float64, error) {
 	if !c.HasPrivateKey() {
 		return "", 0, errors.New("private key is not configured")
 	}
+	opts = normalizePlaceOrderOptions(opts)
 
 	// 基于市场元数据完成价格/数量归一化后再签名。
-	order, normalizedSize, err := c.createSignedLimitOrder(ctx, tokenID, action, price, sizeShares)
+	order, normalizedSize, err := c.createSignedLimitOrder(ctx, tokenID, action, price, sizeShares, opts)
 	if err != nil {
 		return "", 0, err
 	}
 
-	orderID, err := c.submitSignedOrder(ctx, order, true)
+	orderID, err := c.submitSignedOrder(ctx, order, opts, true)
 	if err != nil {
 		return "", 0, err
 	}
@@ -112,13 +118,13 @@ func (c *Client) PlaceLimitOrder(ctx context.Context, tokenID string, action str
 }
 
 // submitSignedOrder 负责用当前 L2 凭证提交已签名订单，并在凭证失效时自动刷新后重试一次。
-func (c *Client) submitSignedOrder(ctx context.Context, order *SignedOrder, allowRetry bool) (string, error) {
+func (c *Client) submitSignedOrder(ctx context.Context, order *SignedOrder, opts PlaceOrderOptions, allowRetry bool) (string, error) {
 	// 出线 payload 必须与 L2 鉴权签名时使用的字节串完全一致。
 	creds, err := c.CreateOrDeriveAPIKey(ctx, 0)
 	if err != nil {
 		return "", err
 	}
-	payload, err := c.toPostOrderPayload(order, creds.Key, "GTC", false, false)
+	payload, err := c.toPostOrderPayload(order, creds.Key, opts.OrderType, false, opts.PostOnly)
 	if err != nil {
 		return "", err
 	}
@@ -135,7 +141,7 @@ func (c *Client) submitSignedOrder(ctx context.Context, order *SignedOrder, allo
 	if err := c.doJSON(ctx, http.MethodPost, c.cfg.Host+"/order", bodyBytes, headers, &resp); err != nil {
 		if allowRetry && isInvalidAPIKeyError(err) && c.HasPrivateKey() {
 			if _, refreshErr := c.RefreshAPIKey(ctx, 0); refreshErr == nil {
-				return c.submitSignedOrder(ctx, order, false)
+				return c.submitSignedOrder(ctx, order, opts, false)
 			}
 		}
 		return "", err
@@ -147,7 +153,7 @@ func (c *Client) submitSignedOrder(ctx context.Context, order *SignedOrder, allo
 }
 
 // createSignedLimitOrder 会先按市场 tick 规则归一化价格和数量，再生成 EIP-712 订单载荷。
-func (c *Client) createSignedLimitOrder(ctx context.Context, tokenID string, action string, price float64, sizeShares float64) (*SignedOrder, float64, error) {
+func (c *Client) createSignedLimitOrder(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, opts PlaceOrderOptions) (*SignedOrder, float64, error) {
 	// 先拉齐市场元数据，确保舍入规则和验签合约选择都是确定的。
 	tickSize, err := c.GetTickSize(ctx, tokenID)
 	if err != nil {
@@ -206,7 +212,7 @@ func (c *Client) createSignedLimitOrder(ctx context.Context, tokenID string, act
 		TokenID:       tokenID,
 		MakerAmount:   decimalToScaledInt(makerAmount, 6),
 		TakerAmount:   decimalToScaledInt(takerAmount, 6),
-		Expiration:    "0",
+		Expiration:    expirationString(opts),
 		Nonce:         "0",
 		FeeRateBps:    strconv.Itoa(feeRate),
 		Side:          orderSide,
@@ -225,6 +231,26 @@ func (c *Client) createSignedLimitOrder(ctx context.Context, tokenID string, act
 	}
 	order.Signature = signature
 	return order, rawSize.InexactFloat64(), nil
+}
+
+// normalizePlaceOrderOptions 统一兜底执行属性，避免调用方遗漏默认值。
+func normalizePlaceOrderOptions(opts PlaceOrderOptions) PlaceOrderOptions {
+	opts.OrderType = strings.ToUpper(strings.TrimSpace(opts.OrderType))
+	if opts.OrderType == "" {
+		opts.OrderType = "GTC"
+	}
+	if opts.OrderType != "GTD" {
+		opts.ExpirationTS = 0
+	}
+	return opts
+}
+
+// expirationString 把 GTD 到期时间转成 CLOB 期望的 Unix 秒字符串。
+func expirationString(opts PlaceOrderOptions) string {
+	if strings.EqualFold(strings.TrimSpace(opts.OrderType), "GTD") && opts.ExpirationTS > 0 {
+		return strconv.FormatInt(opts.ExpirationTS, 10)
+	}
+	return "0"
 }
 
 // orderDigest 生成订单 EIP-712 摘要，使得签名结果可直接提交给 CLOB。

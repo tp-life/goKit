@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +61,11 @@ func (s *stubPolymarketSDK) PlaceLimitOrder(ctx context.Context, tokenID string,
 		return s.placeLimitOrderFn(ctx, tokenID, action, price, sizeShares)
 	}
 	return "", 0, errors.New("not implemented")
+}
+
+// PlaceLimitOrderWithOptions 为测试桩提供带执行属性的下单行为，并复用同一套回调。
+func (s *stubPolymarketSDK) PlaceLimitOrderWithOptions(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, _ polymarket.PlaceOrderOptions) (string, float64, error) {
+	return s.PlaceLimitOrder(ctx, tokenID, action, price, sizeShares)
 }
 
 // CancelOrder 为测试桩提供可注入的撤单行为。
@@ -510,7 +516,7 @@ func TestEvaluateAutoTradeRecordsConcreteOrderError(t *testing.T) {
 			TradeAmount:         5,
 			MarketDataMaxLagSec: 5,
 			Conditions: []polymarket.ConditionConfig{
-				{Time: 120, Diff: 30, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.92},
 			},
 		},
 		repo:        noopStateRepo{},
@@ -561,7 +567,7 @@ func TestEvaluateAutoTradeRecordsDiffMissDiagnostics(t *testing.T) {
 			TradeAmount:         5,
 			MarketDataMaxLagSec: 5,
 			Conditions: []polymarket.ConditionConfig{
-				{Time: 120, Diff: 30, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+				{Slot: 1, Time: 120, DiffBps: 3000, MinProb: 0.80, MaxProb: 0.92},
 			},
 		},
 		repo:        noopStateRepo{},
@@ -611,7 +617,7 @@ func TestEvaluateAutoTradeRecordsProbabilityMissDiagnostics(t *testing.T) {
 			TradeAmount:         5,
 			MarketDataMaxLagSec: 5,
 			Conditions: []polymarket.ConditionConfig{
-				{Time: 120, Diff: 30, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.92},
 			},
 		},
 		repo:        noopStateRepo{},
@@ -673,7 +679,7 @@ func TestEvaluateAutoTradeSupportsRelativeDiffBpsAcrossMarkets(t *testing.T) {
 			TradeAmount:         5,
 			MarketDataMaxLagSec: 5,
 			Conditions: []polymarket.ConditionConfig{
-				{Time: 120, Diff: 30, DiffBps: 4, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+				{Slot: 1, Time: 120, DiffBps: 4, MinProb: 0.80, MaxProb: 0.92},
 			},
 		},
 		repo:        noopStateRepo{},
@@ -702,6 +708,519 @@ func TestEvaluateAutoTradeSupportsRelativeDiffBpsAcrossMarkets(t *testing.T) {
 	}
 	if svc.state.PendingOrder.OrderID != "order-eth-1" {
 		t.Fatalf("unexpected pending order: %+v", svc.state.PendingOrder)
+	}
+}
+
+func TestEvaluateAutoTradeAutoSideUsesPositiveDiffToBuyUP(t *testing.T) {
+	referencePrice := 2000.0
+	ptb := 1998.8
+	upAsk := 0.84
+	downAsk := 0.16
+
+	sdk := &stubPolymarketSDK{
+		placeLimitOrderFn: func(_ context.Context, tokenID, action string, price, size float64) (string, float64, error) {
+			if tokenID != "eth-up-token" {
+				t.Fatalf("expected UP token, got %s", tokenID)
+			}
+			if action != "BUY" {
+				t.Fatalf("unexpected action: %s", action)
+			}
+			if price != upAsk {
+				t.Fatalf("unexpected price %.4f", price)
+			}
+			return "order-auto-up-1", size, nil
+		},
+	}
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 5, MinProb: 0.80, MaxProb: 0.92},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      sdk,
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "eth-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "eth-up-token",
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.state.PendingOrder == nil {
+		t.Fatalf("expected auto-side condition to trigger an order")
+	}
+	if svc.state.PendingOrder.Side != "UP" {
+		t.Fatalf("expected auto-side to resolve to UP, got %+v", svc.state.PendingOrder)
+	}
+}
+
+func TestEvaluateAutoTradePrefersNearestTimeWindowRegardlessOfSlotOrder(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.3
+	upAsk := 0.84
+	downAsk := 0.16
+
+	sdk := &stubPolymarketSDK{
+		placeLimitOrderFn: func(_ context.Context, tokenID, action string, price, size float64) (string, float64, error) {
+			return "order-window-1", size, nil
+		},
+	}
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 180, DiffBps: 4, MinProb: 0.80, MaxProb: 0.92},
+				{Slot: 4, Time: 120, DiffBps: 6, MinProb: 0.80, MaxProb: 0.92},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      sdk,
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(100 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.state.PendingOrder == nil {
+		t.Fatalf("expected one pending order")
+	}
+	if svc.state.PendingOrder.WindowSec != 120 {
+		t.Fatalf("expected nearest time window 120s to take precedence, got %+v", svc.state.PendingOrder)
+	}
+	if !strings.Contains(svc.state.PendingOrder.Reason, "条件4") {
+		t.Fatalf("expected reason to reference slot 4, got %+v", svc.state.PendingOrder)
+	}
+}
+
+func TestValidateBinanceEntryLockedSupportsDownDirection(t *testing.T) {
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			BinanceRequireAlign:  true,
+			BinanceConfirmMinBps: 1.5,
+		},
+	}
+
+	ok, reason := svc.validateBinanceEntryLocked("DOWN", 99.0, 98.0, 100.0)
+	if !ok {
+		t.Fatalf("expected DOWN confirmation to pass, got reason=%s", reason)
+	}
+}
+
+func TestEvaluateAutoTradeRejectsWideAskSlippage(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.90
+	upDisplay := 0.82
+	downAsk := 0.10
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			SlippageThreshold:   0.05,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+			UpPrice: &upDisplay,
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.upPrice = &upDisplay
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.state.PendingOrder != nil {
+		t.Fatalf("expected wide ask slippage to block entry, got %+v", svc.state.PendingOrder)
+	}
+	if svc.autoTrade.ProbabilityMissCount != 1 {
+		t.Fatalf("expected slippage rejection to count as probability miss, got %+v", svc.autoTrade)
+	}
+	if !strings.Contains(svc.autoTrade.LastReason, "滑点") {
+		t.Fatalf("expected concrete slippage reason, got %+v", svc.autoTrade)
+	}
+}
+
+func TestBuildAutoBuyDecisionRequiresSignalConfirmation(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.84
+	downAsk := 0.16
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			AutoTradeConfirmSec: 2,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.mu.Lock()
+	first := svc.buildAutoBuyDecisionLocked()
+	svc.mu.Unlock()
+	if first.reasonCode != autoTradeRejectSignalConfirm {
+		t.Fatalf("expected signal confirmation reject first, got %+v", first)
+	}
+
+	svc.mu.Lock()
+	svc.signalConfirmSince = time.Now().Add(-3 * time.Second)
+	second := svc.buildAutoBuyDecisionLocked()
+	svc.mu.Unlock()
+	if !second.ok {
+		t.Fatalf("expected confirmed signal to pass, got %+v", second)
+	}
+}
+
+func TestEvaluateAutoTradeRejectsWhenBinanceDoesNotConfirmDirection(t *testing.T) {
+	referencePrice := 100.0
+	binancePrice := 98.8
+	ptb := 99.0
+	upAsk := 0.84
+	downAsk := 0.16
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:            true,
+			TradeAmount:          5,
+			MarketDataMaxLagSec:  5,
+			BinanceRequireAlign:  true,
+			BinanceConfirmMinBps: 5,
+			BinanceVetoMaxDevBps: 0,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.binance = &binancePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.state.PendingOrder != nil {
+		t.Fatalf("expected Binance veto to block entry, got %+v", svc.state.PendingOrder)
+	}
+	if svc.autoTrade.BinanceVetoCount != 1 {
+		t.Fatalf("expected Binance veto diagnostics, got %+v", svc.autoTrade)
+	}
+	if !strings.Contains(svc.autoTrade.LastReason, "Binance") {
+		t.Fatalf("expected concrete Binance veto reason, got %+v", svc.autoTrade)
+	}
+}
+
+func TestBuildAutoBuyDecisionPrefersPostOnlyMakerOnFirstAttempt(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.86
+	upBid := 0.84
+	upDisplay := 0.85
+	downAsk := 0.14
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			PreferPostOnly:      true,
+			PostOnlyTTLSec:      2,
+			MinNetEdgeBps:       0,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+			UpPrice: &upDisplay,
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.upBid = &upBid
+	svc.price.upPrice = &upDisplay
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.mu.Lock()
+	decision := svc.buildAutoBuyDecisionLocked()
+	svc.mu.Unlock()
+
+	if !decision.ok {
+		t.Fatalf("expected maker-capable signal to pass, got %+v", decision)
+	}
+	if !decision.plan.postOnly || decision.plan.orderType != "GTD" || decision.plan.execution != "maker_gtd" {
+		t.Fatalf("expected maker GTD plan, got %+v", decision.plan)
+	}
+	if math.Abs(decision.plan.price-upBid) > 1e-9 {
+		t.Fatalf("expected maker price %.4f, got %.4f", upBid, decision.plan.price)
+	}
+}
+
+func TestEvaluateAutoTradeRejectsLowNetEdge(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.94
+	upAsk := 0.86
+	upDisplay := 0.85
+	downAsk := 0.14
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			MinNetEdgeBps:       2,
+			SlippageThreshold:   0.05,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 5, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+			UpPrice: &upDisplay,
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.upPrice = &upDisplay
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.autoTrade.NetEdgeMissCount != 1 {
+		t.Fatalf("expected net edge diagnostics, got %+v", svc.autoTrade)
+	}
+	if !strings.Contains(svc.autoTrade.LastReason, "净边际") {
+		t.Fatalf("expected concrete net edge reason, got %+v", svc.autoTrade)
+	}
+}
+
+func TestManagePositionKeepsPositionWhileStopLossOrderPending(t *testing.T) {
+	currentProb := 0.66
+	bestBid := 0.65
+	chainlink := 100.0
+	ptb := 98.0
+	placeCalls := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade: true,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		client: &stubPolymarketSDK{
+			placeLimitOrderFn: func(_ context.Context, tokenID string, action string, price float64, sizeShares float64) (string, float64, error) {
+				placeCalls++
+				if tokenID != "up-token-1" || action != "SELL" {
+					t.Fatalf("unexpected stop loss order payload: token=%s action=%s", tokenID, action)
+				}
+				if math.Abs(price-bestBid) > 1e-9 {
+					t.Fatalf("expected best bid %.4f, got %.4f", bestBid, price)
+				}
+				return "stop-loss-order-1", sizeShares, nil
+			},
+		},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			UpToken: "up-token-1",
+		},
+		state: entity.PolymarketState{
+			Position: &entity.Position{
+				Slug:       "btc-updown-15m",
+				Side:       "UP",
+				EntryPrice: 0.80,
+				Size:       5,
+				Amount:     5,
+			},
+		},
+	}
+	svc.price.upPrice = &currentProb
+	svc.price.upBid = &bestBid
+	svc.price.btc = &chainlink
+	svc.price.ptb = &ptb
+
+	svc.managePosition(context.Background())
+
+	if placeCalls != 1 {
+		t.Fatalf("expected one stop loss order submission, got %d", placeCalls)
+	}
+	if svc.state.Position == nil {
+		t.Fatalf("expected position to remain until stop loss order fills")
+	}
+	if svc.state.TakeProfitOrder == nil {
+		t.Fatalf("expected stop loss sell order to be tracked")
+	}
+	if svc.state.TakeProfitOrder.Reason != "stop_loss" {
+		t.Fatalf("expected tracked sell reason stop_loss, got %+v", svc.state.TakeProfitOrder)
+	}
+}
+
+func TestManagePositionSkipsStopLossWhenFinalWindowSignalRemainsStrong(t *testing.T) {
+	currentProb := 0.69
+	bestBid := 0.68
+	chainlink := 68860.0
+	ptb := 68800.0
+	binance := 68858.0
+	placeCalls := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:                  true,
+			StopLossProbPct:            0.12,
+			StopLossHoldFinalSec:       30,
+			StopLossHoldMinDiffBps:     8,
+			StopLossHoldRequireBinance: true,
+			StopLossHoldMaxLagSec:      1.0,
+			BinanceConfirmMinBps:       1.5,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		client: &stubPolymarketSDK{
+			placeLimitOrderFn: func(_ context.Context, _ string, _ string, _ float64, _ float64) (string, float64, error) {
+				placeCalls++
+				return "unexpected-stop-loss-order", 0, nil
+			},
+		},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(20 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+		state: entity.PolymarketState{
+			Position: &entity.Position{
+				Slug:       "btc-updown-15m",
+				Side:       "UP",
+				EntryPrice: 0.80,
+				Size:       5,
+				Amount:     5,
+			},
+		},
+	}
+	svc.price.upPrice = &currentProb
+	svc.price.upBid = &bestBid
+	svc.price.btc = &chainlink
+	svc.price.ptb = &ptb
+	svc.price.binance = &binance
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.binanceUpdateTS = time.Now()
+
+	svc.managePosition(context.Background())
+
+	if placeCalls != 0 {
+		t.Fatalf("expected final-window strong signal protection to skip stop loss, got %d sell attempts", placeCalls)
+	}
+	if svc.state.Position == nil {
+		t.Fatalf("expected position to remain while stop loss is deferred")
+	}
+	if svc.state.TakeProfitOrder != nil {
+		t.Fatalf("expected no stop loss order while final-window protection is active, got %+v", svc.state.TakeProfitOrder)
 	}
 }
 

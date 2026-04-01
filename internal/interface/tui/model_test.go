@@ -172,6 +172,31 @@ func TestRenderAutoTradeDiagnosticsLines(t *testing.T) {
 	}
 }
 
+// TestRenderGlobalRiskIncludesCooldownAndReason 确认 TUI 会展示全局风控冷却状态和最近拦截原因。
+func TestRenderGlobalRiskIncludesCooldownAndReason(t *testing.T) {
+	text := renderGlobalRisk(entity.GlobalRiskStatus{
+		Enabled:             true,
+		OpenMarkets:         1,
+		OpenNotional:        5,
+		SameSideOpenMarkets: 1,
+		LossStreak:          3,
+		CooldownUntil:       "2026-04-01T14:00:00+08:00",
+		LastBlockReason:     "连续亏损停机中，恢复时间 2026-04-01 14:00:00",
+	})
+	if !strings.Contains(text, "市场=1") {
+		t.Fatalf("expected open market count, got %q", text)
+	}
+	if !strings.Contains(text, "连亏=3") {
+		t.Fatalf("expected loss streak, got %q", text)
+	}
+	if !strings.Contains(text, "冷却至=") {
+		t.Fatalf("expected cooldown text, got %q", text)
+	}
+	if !strings.Contains(text, "连续亏损停机中") {
+		t.Fatalf("expected block reason, got %q", text)
+	}
+}
+
 // TestRecordSnapshotTracksFlashesForNonSelectedMarket 确认非焦点市场也会记录独立价格高亮。
 func TestRecordSnapshotTracksFlashesForNonSelectedMarket(t *testing.T) {
 	prevUp := 0.61

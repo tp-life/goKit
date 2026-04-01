@@ -2,6 +2,13 @@ package polymarket
 
 import "context"
 
+// PlaceOrderOptions 描述提交限价单时可选的执行属性。
+type PlaceOrderOptions struct {
+	OrderType    string
+	ExpirationTS int64
+	PostOnly     bool
+}
+
 // Authenticator 定义 Polymarket API 凭证引导相关能力。
 type Authenticator interface {
 	CreateOrDeriveAPIKey(ctx context.Context, nonce int) (*APIKeyCreds, error)
@@ -10,6 +17,7 @@ type Authenticator interface {
 // OrderClient 定义下单、撤单和订单元数据查询能力。
 type OrderClient interface {
 	PlaceLimitOrder(ctx context.Context, tokenID string, action string, price float64, sizeShares float64) (string, float64, error)
+	PlaceLimitOrderWithOptions(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, opts PlaceOrderOptions) (string, float64, error)
 	CancelOrder(ctx context.Context, orderID string) error
 	GetOrderStatus(ctx context.Context, orderID string) (*OrderStatus, error)
 	GetTickSize(ctx context.Context, tokenID string) (string, error)

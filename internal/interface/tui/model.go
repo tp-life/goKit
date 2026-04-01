@@ -841,11 +841,14 @@ func (m model) renderOverviewTab() string {
 		fmt.Sprintf("仓位校验: %s", m.renderPositionBalanceCheck()),
 		fmt.Sprintf("挂单状态: %s", renderPending(m.state.PendingOrder)),
 		fmt.Sprintf("最近下单: %s", renderLastOrder(m.state.LastOrder)),
+		fmt.Sprintf("全局风控: %s", renderGlobalRisk(m.state.GlobalRisk)),
 		fmt.Sprintf("自动兑奖: %s", renderAutoRedeem(m.state.AutoRedeem)),
 	})
 
 	topRight := m.renderPanel("市场列表（并行监控，仅切换焦点）", m.renderTrackedMarketsLines())
+	conditions := m.renderWidePanel("当前条件", m.renderAutoTradeConfigLines())
 	diagnostics := m.renderWidePanel("自动交易诊断", m.renderAutoTradeDiagnosticsLines())
+	performance := m.renderWidePanel("策略收益榜", m.renderStrategyPerformanceLines())
 	bottomLeft := m.renderPanel("价格趋势", m.renderPriceTrendLines())
 	bottomRight := m.renderPanel("轮次结果", renderRoundResults(m.state.RoundResults, 6))
 	logs := m.renderWidePanel("最新日志", renderLogs(m.state.Activity, 8))
@@ -853,7 +856,9 @@ func (m model) renderOverviewTab() string {
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		lipgloss.JoinHorizontal(lipgloss.Top, topLeft, topRight),
+		conditions,
 		diagnostics,
+		performance,
 		lipgloss.JoinHorizontal(lipgloss.Top, bottomLeft, bottomRight),
 		logs,
 	)
@@ -1082,6 +1087,12 @@ func (m model) renderAutoTradeDiagnosticsLines() []string {
 			diag.BlockedByStateCount,
 			diag.RetryLimitCount,
 		),
+		fmt.Sprintf(
+			"未命中分布: 信号确认=%d Binance 否决=%d",
+			diag.SignalConfirmCount,
+			diag.BinanceVetoCount,
+		),
+		fmt.Sprintf("未命中分布: 净边际不足=%d", diag.NetEdgeMissCount),
 	}
 
 	if strings.TrimSpace(diag.LastReason) != "" {
@@ -1090,6 +1101,33 @@ func (m model) renderAutoTradeDiagnosticsLines() []string {
 			fmt.Sprintf("最近原因: %s", compactDetail(diag.LastReason, 140)),
 			fmt.Sprintf("记录时间: %s", emptyFallback(diag.LastReasonAt, "-")),
 		)
+	}
+	return lines
+}
+
+// renderStrategyPerformanceLines 输出最近本地闭环交易的收益榜，便于快速识别该停掉哪些市场窗口。
+func (m model) renderStrategyPerformanceLines() []string {
+	if len(m.state.StrategyPerformance) == 0 {
+		return []string{"暂无本地闭环策略收益数据"}
+	}
+
+	limit := minInt(6, len(m.state.StrategyPerformance))
+	lines := make([]string, 0, limit)
+	for _, item := range m.state.StrategyPerformance[:limit] {
+		line := fmt.Sprintf(
+			"%s | %ds | %s | trades=%d | win=%.1f%% | pnl=%.4f | avg=%.4f",
+			emptyFallback(item.MarketKey, "-"),
+			item.WindowSec,
+			emptyFallback(item.Side, "-"),
+			item.Trades,
+			item.WinRate,
+			item.Profit,
+			item.AvgProfit,
+		)
+		if item.Disabled {
+			line += " | 已停用: " + compactDetail(item.DisableReason, 36)
+		}
+		lines = append(lines, line)
 	}
 	return lines
 }
@@ -1125,6 +1163,49 @@ func (m model) renderTrackedMarketsLines() []string {
 			positionText,
 		)
 		lines = append(lines, line)
+	}
+	return lines
+}
+
+// renderAutoTradeConfigLines 输出当前焦点市场实际生效的自动交易条件，便于值守时直接核对。
+func (m model) renderAutoTradeConfigLines() []string {
+	config, prices, label := m.focusedAutoTradeConfig()
+	lines := []string{
+		fmt.Sprintf(
+			"焦点市场: %s | 基础仓位=%.2f | 确认=%.1fs | 数据延迟<=%.1fs | 净边际>=%.2fbps | maker优先=%s",
+			label,
+			config.TradeAmount,
+			config.ConfirmSec,
+			config.MarketDataMaxLagSec,
+			config.MinNetEdgeBps,
+			onOffText(config.PreferPostOnly),
+		),
+		fmt.Sprintf(
+			"止损=%.2f%% | 止盈RR=%.2f | 尾盘保护=%s",
+			config.StopLossProbPct*100,
+			config.TakeProfitRR,
+			renderStopLossHoldSummary(config),
+		),
+		fmt.Sprintf(
+			"Binance确认=%s | 最小确认=%.2fbps | 双源偏差上限=%.2fbps",
+			onOffText(config.BinanceRequireAlign),
+			config.BinanceConfirmMinBps,
+			config.BinanceVetoMaxDevBps,
+		),
+	}
+	if diff, diffBps, ok := deriveCurrentDiff(prices); ok {
+		lines = append(lines, fmt.Sprintf(
+			"当前差值: %s | 当前强度: %s | 参考价=%s | PTB=%s",
+			formatSignedFloat(diff, 2),
+			formatSignedBps(diffBps),
+			formatFloatPtr(prices.ChainlinkBTC),
+			formatFloatPtr(prices.PTB),
+		))
+	} else {
+		lines = append(lines, "当前差值: 未就绪 | 当前强度: 未就绪 | 参考价或 PTB 尚未到位")
+	}
+	for _, condition := range config.Conditions {
+		lines = append(lines, renderAutoTradeConditionLine(condition, prices))
 	}
 	return lines
 }
@@ -1422,6 +1503,28 @@ func renderAutoRedeem(status entity.AutoRedeemStatus) string {
 	return line
 }
 
+// renderGlobalRisk 输出多市场账户层风控的当前状态摘要。
+func renderGlobalRisk(status entity.GlobalRiskStatus) string {
+	if !status.Enabled {
+		return "未启用"
+	}
+
+	line := fmt.Sprintf(
+		"市场=%d | 敞口=%.2f | 同向=%d | 连亏=%d",
+		status.OpenMarkets,
+		status.OpenNotional,
+		status.SameSideOpenMarkets,
+		status.LossStreak,
+	)
+	if strings.TrimSpace(status.CooldownUntil) != "" {
+		line += " | 冷却至=" + compactDetail(status.CooldownUntil, 24)
+	}
+	if strings.TrimSpace(status.LastBlockReason) != "" {
+		line += " | " + compactDetail(status.LastBlockReason, 36)
+	}
+	return line
+}
+
 // formatFloatPtr 统一格式化可空浮点数。
 func formatFloatPtr(v *float64) string {
 	if v == nil {
@@ -1461,6 +1564,12 @@ func renderTradeHistoryLine(item entity.TradeHistoryItem) string {
 		item.Amount,
 		emptyFallback(item.Status, "-"),
 	)
+	if strings.TrimSpace(item.Execution) != "" {
+		line += " | " + item.Execution
+	}
+	if item.WindowSec > 0 {
+		line += fmt.Sprintf(" | %ds", item.WindowSec)
+	}
 	if strings.TrimSpace(item.Error) != "" {
 		line += " | err=" + compactDetail(item.Error, 42)
 	}
@@ -1601,6 +1710,187 @@ func renderTradeInputLine(label, value string, focused, editing bool, hint strin
 	return fmt.Sprintf("%s%s: %s%s  (%s)", prefix, label, value, suffix, hint)
 }
 
+// focusedAutoTradeConfig 返回当前焦点市场的自动交易配置与对应价格视图。
+func (m model) focusedAutoTradeConfig() (entity.AutoTradeConfigView, entity.DashboardPrices, string) {
+	for _, item := range m.state.Markets {
+		if item.Key == m.state.SelectedMarketKey {
+			return item.AutoConfig, item.Prices, emptyFallback(item.Label, item.Key)
+		}
+	}
+	return m.state.AutoTradeConfig, m.state.Prices, marketDisplayLabel(m.state)
+}
+
+// renderAutoTradeConditionLine 输出单条自动交易条件的人类可读描述。
+func renderAutoTradeConditionLine(condition entity.AutoTradeConditionView, prices entity.DashboardPrices) string {
+	if !condition.Enabled || condition.Time <= 0 {
+		return fmt.Sprintf("档位%d: 关闭", condition.Index)
+	}
+	thresholdAmount, thresholdBps := conditionThresholdValues(condition, prices)
+	currentDiff, currentDiffBps, diffReady := deriveCurrentDiff(prices)
+	currentSide := deriveDisplayConditionSide(currentDiff)
+	currentProb := currentProbabilityForSide(currentSide, prices)
+	status := "等待差值"
+	gapText := "还差=未就绪"
+	if diffReady {
+		status = conditionMatchStatus(currentDiff, currentDiffBps, thresholdBps)
+		switch status {
+		case "已满足":
+			gapText = "还差=0.00 / 0.00bps"
+		case "方向反向":
+			gapText = "还差=方向尚未翻转"
+		default:
+			gapAmount := math.Max(0, thresholdAmount-math.Abs(currentDiff))
+			gapBps := math.Max(0, thresholdBps-math.Abs(currentDiffBps))
+			gapText = fmt.Sprintf("还差=%.2f / %.2fbps", gapAmount, gapBps)
+		}
+	}
+	return fmt.Sprintf(
+		"档位%d: 方向=%s | %s | 剩余<=%ds | 当前=%s / %s | 阈值=%.2f / %.2fbps | %s | 当前概率=%s | 目标概率=%.2f%%~%.2f%%",
+		condition.Index,
+		currentSide,
+		status,
+		condition.Time,
+		renderCurrentDiffText(diffReady, currentDiff),
+		renderCurrentBpsText(diffReady, currentDiffBps),
+		thresholdAmount,
+		thresholdBps,
+		gapText,
+		renderCurrentProbabilityText(currentProb),
+		condition.MinProb*100,
+		condition.MaxProb*100,
+	)
+}
+
+// conditionThresholdValues 计算一条条件在当前参考价格级别下对应的金额阈值与 bps 阈值。
+func conditionThresholdValues(condition entity.AutoTradeConditionView, prices entity.DashboardPrices) (float64, float64) {
+	base := maxAbsFloatPtr(prices.ChainlinkBTC, prices.PTB)
+	if base > 0 {
+		return base * condition.DiffBps / 10000, condition.DiffBps
+	}
+	return 0, condition.DiffBps
+}
+
+// renderStopLossHoldSummary 输出尾盘止损保护的配置摘要。
+func renderStopLossHoldSummary(config entity.AutoTradeConfigView) string {
+	if config.StopLossHoldFinalSec <= 0 {
+		return "关闭"
+	}
+	return fmt.Sprintf(
+		"最后%ds 且 >=%.2fbps 且 Binance=%s 且 延迟<=%.1fs",
+		config.StopLossHoldFinalSec,
+		config.StopLossHoldMinDiffBps,
+		onOffText(config.StopLossHoldRequireBinance),
+		config.StopLossHoldMaxLagSec,
+	)
+}
+
+// onOffText 把布尔值转换成更容易扫读的中文状态。
+func onOffText(enabled bool) string {
+	if enabled {
+		return "开"
+	}
+	return "关"
+}
+
+// deriveCurrentDiff 计算当前参考价与 PTB 的签名价差及其 bps。
+func deriveCurrentDiff(prices entity.DashboardPrices) (float64, float64, bool) {
+	if prices.ChainlinkBTC == nil || prices.PTB == nil {
+		return 0, 0, false
+	}
+	referencePrice := *prices.ChainlinkBTC
+	ptb := *prices.PTB
+	denominator := math.Max(math.Abs(referencePrice), math.Abs(ptb))
+	if denominator <= 0 {
+		return 0, 0, false
+	}
+	diff := referencePrice - ptb
+	return diff, diff / denominator * 10000, true
+}
+
+// currentProbabilityForSide 返回指定方向当前正在展示的概率价格。
+func currentProbabilityForSide(side string, prices entity.DashboardPrices) *float64 {
+	switch {
+	case strings.Contains(strings.ToUpper(strings.TrimSpace(side)), "UP"):
+		return prices.UpPrice
+	case strings.Contains(strings.ToUpper(strings.TrimSpace(side)), "DOWN"):
+		return prices.DownPrice
+	default:
+		return nil
+	}
+}
+
+// conditionMatchStatus 返回当前差值相对某条条件的匹配状态。
+func conditionMatchStatus(diff, diffBps, thresholdBps float64) string {
+	if diff == 0 {
+		return "方向未定"
+	}
+	if math.Abs(diffBps) >= thresholdBps {
+		return "已满足"
+	}
+	return "差值不足"
+}
+
+// renderCurrentDiffText 渲染当前签名差值。
+func renderCurrentDiffText(ready bool, diff float64) string {
+	if !ready {
+		return "未就绪"
+	}
+	return formatSignedFloat(diff, 2)
+}
+
+// renderCurrentBpsText 渲染当前差值强度。
+func renderCurrentBpsText(ready bool, diffBps float64) string {
+	if !ready {
+		return "未就绪"
+	}
+	return formatSignedBps(diffBps)
+}
+
+// renderCurrentProbabilityText 渲染当前方向概率。
+func renderCurrentProbabilityText(value *float64) string {
+	if value == nil {
+		return "未就绪"
+	}
+	return fmt.Sprintf("%.2f%%", *value*100)
+}
+
+// formatSignedFloat 以带符号的形式格式化浮点数。
+func formatSignedFloat(value float64, decimals int) string {
+	return fmt.Sprintf("%+.*f", decimals, value)
+}
+
+// formatSignedBps 以带符号的形式格式化 bps 值。
+func formatSignedBps(value float64) string {
+	return fmt.Sprintf("%+.2fbps", value)
+}
+
+// deriveDisplayConditionSide 根据当前差值返回档位本轮实际对应的方向文本。
+func deriveDisplayConditionSide(diff float64) string {
+	switch {
+	case diff > 0:
+		return "自动->UP"
+	case diff < 0:
+		return "自动->DOWN"
+	default:
+		return "自动"
+	}
+}
+
+// maxAbsFloatPtr 返回多个浮点指针绝对值中的最大值。
+func maxAbsFloatPtr(values ...*float64) float64 {
+	maxValue := 0.0
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		absValue := math.Abs(*value)
+		if absValue > maxValue {
+			maxValue = absValue
+		}
+	}
+	return maxValue
+}
+
 // tabTitles 返回 TUI 当前支持的所有页面标签。
 func tabTitles() []string {
 	return []string{"概览", "钱包", "历史", "日志", "交易"}
@@ -1692,6 +1982,14 @@ func lastRoundResults(items []entity.RoundResult, limit int) []entity.RoundResul
 // maxInt 返回两个整数中的较大值。
 func maxInt(left, right int) int {
 	if left > right {
+		return left
+	}
+	return right
+}
+
+// minInt 返回两个整数中的较小值。
+func minInt(left, right int) int {
+	if left < right {
 		return left
 	}
 	return right

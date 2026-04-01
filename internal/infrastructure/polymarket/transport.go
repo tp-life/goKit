@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,11 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/gorilla/websocket"
 	"log/slog"
+)
+
+const (
+	httpSafeRetryAttempts = 2
+	httpRetryDelay        = 200 * time.Millisecond
 )
 
 // runWSLoop 负责维持 websocket 订阅，直到调用方取消上下文。
@@ -58,6 +64,41 @@ func (c *Client) runWSLoop(ctx context.Context, endpoint string, fn func(conn *w
 
 // doJSON 发起 HTTP 请求，并把 JSON 响应解码到目标对象中。
 func (c *Client) doJSON(ctx context.Context, method, rawURL string, body []byte, headers http.Header, out any) error {
+	attempts := 1
+	if isSafeRetryableMethod(method) {
+		attempts = httpSafeRetryAttempts
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := c.doJSONOnce(ctx, method, rawURL, body, headers, out)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !shouldRetryHTTPError(ctx, method, attempt, attempts, err) {
+			return err
+		}
+		if c.logger != nil {
+			c.logger.Warn(
+				"polymarket_http_retry",
+				slog.String("method", method),
+				slog.String("url", rawURL),
+				slog.Int("attempt", attempt+1),
+				slog.Any("err", err),
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(httpRetryDelay):
+		}
+	}
+	return lastErr
+}
+
+// doJSONOnce 执行一次 HTTP 请求，不做任何自动重试。
+func (c *Client) doJSONOnce(ctx context.Context, method, rawURL string, body []byte, headers http.Header, out any) error {
 	var reader io.Reader
 	if len(body) > 0 {
 		reader = bytes.NewReader(body)
@@ -95,10 +136,53 @@ func (c *Client) doJSON(ctx context.Context, method, rawURL string, body []byte,
 
 	// 调用方只关心成功与否时，也要把响应体读完再返回。
 	if out == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil
+		_, err = io.Copy(io.Discard, resp.Body)
+		return err
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// isSafeRetryableMethod 判断该 HTTP 方法是否适合做一次透明重试。
+func isSafeRetryableMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldRetryHTTPError 判断当前错误是否属于可安全短重试的传输层瞬断。
+func shouldRetryHTTPError(ctx context.Context, method string, attempt, attempts int, err error) bool {
+	if err == nil || ctx.Err() != nil || attempt >= attempts || !isSafeRetryableMethod(method) {
+		return false
+	}
+	return isTransientHTTPError(err)
+}
+
+// isTransientHTTPError 识别网络层瞬断，避免把业务错误误判成可重试。
+func isTransientHTTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "unexpected eof") ||
+		strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "server closed idle connection") ||
+		strings.Contains(message, "timeout awaiting response headers")
 }
 
 // HTTPStatusError 表示 HTTP 非 2xx 响应，便于上层按状态码做兼容重试。
