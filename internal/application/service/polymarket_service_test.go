@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"goKit/internal/application/dto"
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 	"goKit/internal/infrastructure/polymarket"
@@ -17,6 +18,7 @@ import (
 
 type stubPolymarketSDK struct {
 	placeLimitOrderFn       func(ctx context.Context, tokenID string, action string, price float64, sizeShares float64) (string, float64, error)
+	placeLimitOrderWithOpts func(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, opts polymarket.PlaceOrderOptions) (string, float64, error)
 	cancelOrderFn           func(ctx context.Context, orderID string) error
 	getOrderStatusFn        func(ctx context.Context, orderID string) (*polymarket.OrderStatus, error)
 	getActiveMarketFn       func(ctx context.Context) (*polymarket.ActiveMarketView, error)
@@ -64,7 +66,10 @@ func (s *stubPolymarketSDK) PlaceLimitOrder(ctx context.Context, tokenID string,
 }
 
 // PlaceLimitOrderWithOptions 为测试桩提供带执行属性的下单行为，并复用同一套回调。
-func (s *stubPolymarketSDK) PlaceLimitOrderWithOptions(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, _ polymarket.PlaceOrderOptions) (string, float64, error) {
+func (s *stubPolymarketSDK) PlaceLimitOrderWithOptions(ctx context.Context, tokenID string, action string, price float64, sizeShares float64, opts polymarket.PlaceOrderOptions) (string, float64, error) {
+	if s.placeLimitOrderWithOpts != nil {
+		return s.placeLimitOrderWithOpts(ctx, tokenID, action, price, sizeShares, opts)
+	}
 	return s.PlaceLimitOrder(ctx, tokenID, action, price, sizeShares)
 }
 
@@ -1049,6 +1054,95 @@ func TestBuildAutoBuyDecisionPrefersPostOnlyMakerOnFirstAttempt(t *testing.T) {
 	}
 }
 
+func TestEvaluateAutoTradeFallsBackWhenPostOnlyCrossesBook(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.86
+	upBid := 0.84
+	upDisplay := 0.85
+	downAsk := 0.14
+	callCount := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			PreferPostOnly:      true,
+			PostOnlyTTLSec:      2,
+			MinNetEdgeBps:       0,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+			UpPrice: &upDisplay,
+		},
+		client: &stubPolymarketSDK{
+			placeLimitOrderWithOpts: func(_ context.Context, tokenID string, action string, price float64, sizeShares float64, opts polymarket.PlaceOrderOptions) (string, float64, error) {
+				callCount++
+				if tokenID != "up-token-1" || action != "BUY" {
+					t.Fatalf("unexpected order payload: token=%s action=%s", tokenID, action)
+				}
+				if math.Abs(price-upBid) > 1e-9 {
+					t.Fatalf("expected fallback to keep same limit price %.4f, got %.4f", upBid, price)
+				}
+				if callCount == 1 {
+					if !opts.PostOnly || opts.OrderType != "GTD" {
+						t.Fatalf("expected first attempt to use maker GTD, got %+v", opts)
+					}
+					return "", 0, errors.New(`POST https://clob.polymarket.com/order failed with status 400: {"error":"invalid post-only order: order crosses book"}`)
+				}
+				if opts.PostOnly || opts.OrderType != "GTC" {
+					t.Fatalf("expected fallback attempt to use plain GTC, got %+v", opts)
+				}
+				return "fallback-order-1", sizeShares, nil
+			},
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.upBid = &upBid
+	svc.price.upPrice = &upDisplay
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if callCount != 2 {
+		t.Fatalf("expected maker attempt plus one fallback attempt, got %d", callCount)
+	}
+	if svc.state.PendingOrder == nil {
+		t.Fatalf("expected fallback order to be submitted")
+	}
+	if svc.state.PendingOrder.Execution != "taker_gtc_fallback" || svc.state.PendingOrder.PostOnly {
+		t.Fatalf("expected fallback execution to be recorded, got %+v", svc.state.PendingOrder)
+	}
+	if len(svc.dashboard.Activity) == 0 {
+		t.Fatalf("expected fallback warning log to be recorded")
+	}
+	foundWarn := false
+	for _, item := range svc.dashboard.Activity {
+		if strings.Contains(item.Message, "maker 入场穿价") {
+			foundWarn = true
+			break
+		}
+	}
+	if !foundWarn {
+		t.Fatalf("expected fallback warning activity, got %+v", svc.dashboard.Activity)
+	}
+}
+
 func TestEvaluateAutoTradeRejectsLowNetEdge(t *testing.T) {
 	referencePrice := 100.0
 	ptb := 99.94
@@ -1095,6 +1189,80 @@ func TestEvaluateAutoTradeRejectsLowNetEdge(t *testing.T) {
 	}
 	if !strings.Contains(svc.autoTrade.LastReason, "净边际") {
 		t.Fatalf("expected concrete net edge reason, got %+v", svc.autoTrade)
+	}
+}
+
+func TestBuildAutoBuyDecisionRejectsWhenTradeAmountBelowMinimumShares(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.88
+	downAsk := 0.12
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         3,
+			MarketDataMaxLagSec: 5,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.mu.Lock()
+	decision := svc.buildAutoBuyDecisionLocked()
+	svc.mu.Unlock()
+
+	if decision.ok {
+		t.Fatalf("expected too-small trade amount to be rejected")
+	}
+	if !strings.Contains(decision.reason, "低于最小 5 份") {
+		t.Fatalf("expected clear minimum size reason, got %+v", decision)
+	}
+}
+
+func TestSubmitManualOrderRejectsWhenTradeAmountBelowMinimumShares(t *testing.T) {
+	probability := 0.88
+	svc := &PolymarketService{
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{hasPrivateKey: true, hasPrivateKeySet: true},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			UpToken: "up-token-1",
+		},
+	}
+
+	_, err := svc.SubmitManualOrder(context.Background(), dto.ManualOrderReq{
+		Action:      "BUY",
+		Outcome:     "UP",
+		Probability: probability,
+		Amount:      3,
+	})
+	if err == nil {
+		t.Fatalf("expected manual order to reject too-small amount")
+	}
+	if !strings.Contains(err.Error(), "低于最小 5 份") {
+		t.Fatalf("expected clear minimum size error, got %v", err)
 	}
 }
 

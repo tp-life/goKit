@@ -43,6 +43,8 @@ const (
 	autoTradeRejectNetEdgeMiss      autoTradeRejectCode = "net_edge_miss"
 )
 
+const minPolymarketBuyShares = 5.0
+
 // autoTradeDecision 表示一次自动交易评估的结果与归因。
 type autoTradeDecision struct {
 	plan       autoBuyPlan
@@ -369,6 +371,11 @@ func (s *PolymarketService) SubmitManualOrder(ctx context.Context, req dto.Manua
 	}
 	if size <= 0 {
 		return nil, errors.New("计算得到的下单份额无效")
+	}
+	if action == "BUY" {
+		if err := validateMinimumBuyShares(req.Amount, req.Probability); err != nil {
+			return nil, err
+		}
 	}
 
 	// 服务层只负责业务校验与状态维护，实际下单仍统一走底层 SDK。
@@ -951,18 +958,7 @@ func (s *PolymarketService) evaluateAutoTrade(ctx context.Context) {
 		return
 	}
 
-	orderID, normalizedSize, err := s.client.PlaceLimitOrderWithOptions(
-		ctx,
-		plan.tokenID,
-		"BUY",
-		plan.price,
-		plan.tradeAmount/plan.price,
-		infraPolymarket.PlaceOrderOptions{
-			OrderType:    plan.orderType,
-			ExpirationTS: plan.expirationTS,
-			PostOnly:     plan.postOnly,
-		},
-	)
+	submittedPlan, orderID, normalizedSize, err := s.submitAutoBuyPlan(ctx, plan)
 	s.mu.Lock()
 	if err != nil {
 		s.state.LastOrder = &entity.LastOrder{
@@ -1002,16 +998,16 @@ func (s *PolymarketService) evaluateAutoTrade(ctx context.Context) {
 		OrderID:     orderID,
 		Time:        time.Now().Format(time.RFC3339),
 		Slug:        market.Slug,
-		Side:        plan.side,
+		Side:        submittedPlan.side,
 		Action:      "BUY",
-		Reason:      plan.reason,
-		Price:       plan.price,
+		Reason:      submittedPlan.reason,
+		Price:       submittedPlan.price,
 		Size:        normalizedSize,
-		Amount:      plan.tradeAmount,
-		WindowSec:   plan.windowSec,
-		StrategyKey: plan.strategyKey,
-		Execution:   plan.execution,
-		PostOnly:    plan.postOnly,
+		Amount:      submittedPlan.tradeAmount,
+		WindowSec:   submittedPlan.windowSec,
+		StrategyKey: submittedPlan.strategyKey,
+		Execution:   submittedPlan.execution,
+		PostOnly:    submittedPlan.postOnly,
 	}
 	s.state.LastOrder = &entity.LastOrder{
 		Key:        plan.orderKey,
@@ -1024,25 +1020,28 @@ func (s *PolymarketService) evaluateAutoTrade(ctx context.Context) {
 		Time:        time.Now().Format("2006-01-02 15:04:05"),
 		Slug:        market.Slug,
 		Action:      "BUY",
-		Side:        plan.side,
-		Price:       plan.price,
-		Amount:      plan.tradeAmount,
+		Side:        submittedPlan.side,
+		Price:       submittedPlan.price,
+		Amount:      submittedPlan.tradeAmount,
 		Size:        normalizedSize,
 		OrderID:     orderID,
 		Status:      "submitted",
-		Reason:      plan.reason,
-		Diff:        floatPtr(plan.diff),
-		WindowSec:   plan.windowSec,
-		StrategyKey: plan.strategyKey,
-		Execution:   plan.execution,
-		PostOnly:    plan.postOnly,
-		NetEdgeBps:  floatPtr(plan.netEdgeBps),
+		Reason:      submittedPlan.reason,
+		Diff:        floatPtr(submittedPlan.diff),
+		WindowSec:   submittedPlan.windowSec,
+		StrategyKey: submittedPlan.strategyKey,
+		Execution:   submittedPlan.execution,
+		PostOnly:    submittedPlan.postOnly,
+		NetEdgeBps:  floatPtr(submittedPlan.netEdgeBps),
 	})
 	s.syncDashboardLocked()
 	s.persistLocked(context.Background())
 	s.publishLocked()
 	s.mu.Unlock()
-	s.addLog("TRADE", fmt.Sprintf("自动买单已提交: %s @ %.2f%% [%s]", plan.side, plan.price*100, plan.execution))
+	if plan.postOnly && !submittedPlan.postOnly {
+		s.addLog("WARN", fmt.Sprintf("maker 入场穿价，已自动回退为普通限价单: %s @ %.2f%%", submittedPlan.side, submittedPlan.price*100))
+	}
+	s.addLog("TRADE", fmt.Sprintf("自动买单已提交: %s @ %.2f%% [%s]", submittedPlan.side, submittedPlan.price*100, submittedPlan.execution))
 }
 
 type autoBuyPlan struct {
@@ -1061,6 +1060,52 @@ type autoBuyPlan struct {
 	orderType    string
 	expirationTS int64
 	netEdgeBps   float64
+}
+
+// submitAutoBuyPlan 负责提交自动开仓计划，并在 maker post-only 穿价时自动回退成普通限价单。
+func (s *PolymarketService) submitAutoBuyPlan(ctx context.Context, plan autoBuyPlan) (autoBuyPlan, string, float64, error) {
+	orderID, normalizedSize, err := s.client.PlaceLimitOrderWithOptions(
+		ctx,
+		plan.tokenID,
+		"BUY",
+		plan.price,
+		plan.tradeAmount/plan.price,
+		infraPolymarket.PlaceOrderOptions{
+			OrderType:    plan.orderType,
+			ExpirationTS: plan.expirationTS,
+			PostOnly:     plan.postOnly,
+		},
+	)
+	if err == nil {
+		return plan, orderID, normalizedSize, nil
+	}
+	if !plan.postOnly || !isPostOnlyCrossBookError(err) {
+		return plan, "", 0, err
+	}
+
+	// maker 入场只要因为“穿价”被拒，就立刻降级为普通限价单，避免错过同一轮信号。
+	fallback := plan
+	fallback.postOnly = false
+	fallback.orderType = "GTC"
+	fallback.expirationTS = 0
+	fallback.execution = "taker_gtc_fallback"
+
+	orderID, normalizedSize, fallbackErr := s.client.PlaceLimitOrderWithOptions(
+		ctx,
+		fallback.tokenID,
+		"BUY",
+		fallback.price,
+		fallback.tradeAmount/fallback.price,
+		infraPolymarket.PlaceOrderOptions{
+			OrderType:    fallback.orderType,
+			ExpirationTS: fallback.expirationTS,
+			PostOnly:     fallback.postOnly,
+		},
+	)
+	if fallbackErr != nil {
+		return plan, "", 0, fmt.Errorf("maker 入场被拒后回退失败: 首次=%v; 回退=%w", err, fallbackErr)
+	}
+	return fallback, orderID, normalizedSize, nil
 }
 
 // buildAutoBuyDecisionLocked 在持锁状态下评估本轮是否满足自动买入条件。
@@ -1279,6 +1324,12 @@ func (s *PolymarketService) buildAutoBuyDecisionLocked() autoTradeDecision {
 			}); sized > 0 {
 				tradeAmount = sized
 			}
+		}
+		if err := validateMinimumBuyShares(tradeAmount, price); err != nil {
+			s.resetSignalConfirmationLocked()
+			decision.reasonCode = autoTradeRejectProbabilityMiss
+			decision.reason = err.Error()
+			return decision
 		}
 		decision.plan = autoBuyPlan{
 			side:         side,
@@ -1806,6 +1857,35 @@ func (s *PolymarketService) resetSignalConfirmationLocked() {
 // formatConditionDiffThreshold 把条件阈值渲染成日志友好的文字，方便判断当前规则使用的是哪种模式。
 func formatConditionDiffThreshold(condition infraPolymarket.ConditionConfig) string {
 	return fmt.Sprintf("%.2f bps", condition.DiffBps)
+}
+
+// isPostOnlyCrossBookError 判断 post-only 挂单是否因为价格已穿过盘口而被交易所拒绝。
+func isPostOnlyCrossBookError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "invalid post-only order") && strings.Contains(message, "crosses book")
+}
+
+// validateMinimumBuyShares 校验买入金额在当前概率下是否至少能达到 Polymarket 的最小买入份额。
+func validateMinimumBuyShares(amount, price float64) error {
+	if amount <= 0 || price <= 0 {
+		return nil
+	}
+	size := amount / price
+	if size+1e-9 >= minPolymarketBuyShares {
+		return nil
+	}
+	requiredAmount := minPolymarketBuyShares * price
+	return fmt.Errorf(
+		"当前下单金额 %.2f USDC 在概率 %.2f%% 下仅能买 %.2f 份，低于最小 %.0f 份；请至少提高到 %.2f USDC",
+		amount,
+		price*100,
+		size,
+		minPolymarketBuyShares,
+		requiredAmount,
+	)
 }
 
 // orderedAutoTradeConditions 按时间窗口从近到远排序条件，避免编号顺序影响实际匹配优先级。
