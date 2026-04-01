@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -96,6 +97,17 @@ func (c *Client) RedeemCondition(ctx context.Context, conditionID string) (*Rede
 		return nil, err
 	}
 
+	// 在真正发 relayer 或链上交易前先做一次链上预检。
+	// Data API 的 redeemable 标记有时会比链上最终可兑状态更早刷新，
+	// 这时直接提交 relayer 事务只会得到一个笼统的 `transaction reverted`。
+	execAddr, err := c.redeemExecutionAddress()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.preflightRedeemExecution(ctx, execAddr, data); err != nil {
+		return &RedeemResult{ProxyWallet: execAddr.Hex()}, err
+	}
+
 	switch c.cfg.SignatureType {
 	case 1:
 		return c.redeemConditionViaProxyRelayer(ctx, normalizedConditionID, data)
@@ -110,6 +122,67 @@ func (c *Client) RedeemCondition(ctx context.Context, conditionID string) (*Rede
 		return nil, errors.New("EOA 兑奖要求签名地址与 FUNDER_ADDRESS 一致")
 	}
 	return c.redeemConditionDirect(ctx, data)
+}
+
+// redeemExecutionAddress 返回本次兑奖在链上真正消耗仓位的钱包地址。
+func (c *Client) redeemExecutionAddress() (common.Address, error) {
+	switch c.cfg.SignatureType {
+	case 1:
+		expectedProxy := deriveProxyWalletAddress(c.address)
+		if err := c.validateExpectedProxyWallet(expectedProxy); err != nil {
+			return common.Address{}, err
+		}
+		return expectedProxy, nil
+	case 2:
+		expectedSafe := deriveSafeWalletAddress(c.address)
+		if err := c.validateExpectedProxyWallet(expectedSafe); err != nil {
+			return common.Address{}, err
+		}
+		return expectedSafe, nil
+	default:
+		if funder := strings.TrimSpace(c.FunderHex()); funder != "" && !strings.EqualFold(funder, c.AddressHex()) {
+			return common.Address{}, errors.New("EOA 兑奖要求签名地址与 FUNDER_ADDRESS 一致")
+		}
+		return c.address, nil
+	}
+}
+
+// preflightRedeemExecution 使用 eth_estimateGas 对 redeemPositions 做一次链上预检。
+func (c *Client) preflightRedeemExecution(ctx context.Context, from common.Address, data []byte) error {
+	if strings.TrimSpace(c.cfg.PolygonRPCURL) == "" {
+		return nil
+	}
+
+	client, err := DialProxyEthClient(ctx, c.cfg)
+	if err != nil {
+		// 预检属于增强诊断能力；RPC 不可用时宁可降级跳过，也不阻断已可工作的兑奖链路。
+		return nil
+	}
+	defer client.Close()
+
+	ctfAddress := common.HexToAddress(c.cfg.CTFContract)
+	_, err = client.EstimateGas(ctx, ethereum.CallMsg{
+		From:  from,
+		To:    &ctfAddress,
+		Value: big.NewInt(0),
+		Data:  data,
+	})
+	if err == nil {
+		return nil
+	}
+	return formatRedeemPreflightError(err)
+}
+
+// formatRedeemPreflightError 把链上模拟失败压成更适合日志和 TUI 展示的说明。
+func formatRedeemPreflightError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		message = "unknown error"
+	}
+	return fmt.Errorf("链上预检失败，redeemPositions 会回滚: %s；常见原因：市场尚未最终结算、仓位已被兑完，或 Data API redeemable 标记滞后", message)
 }
 
 // redeemConditionDirect 直接向 CTF 合约发送 redeemPositions 交易，并等待链上回执。

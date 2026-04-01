@@ -111,6 +111,21 @@ type DashboardPrices struct {
 	UpdatedTS    int64    `json:"updated_ts,omitempty"`
 }
 
+// TrackedMarketView 表示 watchlist 中单个市场的快照摘要。
+type TrackedMarketView struct {
+	Key          string               `json:"key"`
+	Label        string               `json:"label,omitempty"`
+	Symbol       string               `json:"symbol,omitempty"`
+	IntervalSec  int                  `json:"interval_sec,omitempty"`
+	UpdatedAt    string               `json:"updated_at,omitempty"`
+	Market       DashboardMarket      `json:"market"`
+	Prices       DashboardPrices      `json:"prices"`
+	Position     *Position            `json:"position,omitempty"`
+	PendingOrder *PendingOrder        `json:"pending_order,omitempty"`
+	LastOrder    *LastOrder           `json:"last_order,omitempty"`
+	AutoTrade    AutoTradeDiagnostics `json:"auto_trade"`
+}
+
 // WalletPosition 表示从 Data API 同步回来的钱包持仓视图。
 type WalletPosition struct {
 	ProxyWallet string   `json:"proxyWallet,omitempty"`
@@ -163,6 +178,26 @@ type AutoRedeemStatus struct {
 	NextRunAt      string         `json:"next_run_at,omitempty"`
 }
 
+// AutoTradeDiagnostics 表示自动交易触发评估的诊断统计。
+type AutoTradeDiagnostics struct {
+	MarketSlug            string `json:"market_slug,omitempty"`
+	SampleCount           int    `json:"sample_count"`
+	TriggerCount          int    `json:"trigger_count"`
+	NoMarketCount         int    `json:"no_market_count"`
+	MarketClosedCount     int    `json:"market_closed_count"`
+	TimeWindowMissCount   int    `json:"time_window_miss_count"`
+	ReferenceMissingCount int    `json:"reference_missing_count"`
+	OutcomePriceMissing   int    `json:"outcome_price_missing_count"`
+	DiffMissCount         int    `json:"diff_miss_count"`
+	ProbabilityMissCount  int    `json:"probability_miss_count"`
+	DataLagCount          int    `json:"data_lag_count"`
+	BlockedByStateCount   int    `json:"blocked_by_state_count"`
+	RetryLimitCount       int    `json:"retry_limit_count"`
+	LastReason            string `json:"last_reason,omitempty"`
+	LastReasonAt          string `json:"last_reason_at,omitempty"`
+	LastTriggerAt         string `json:"last_trigger_at,omitempty"`
+}
+
 // RoundResult 表示一个市场轮次的结算结果摘要。
 type RoundResult struct {
 	Kind         string   `json:"kind"`
@@ -180,24 +215,27 @@ type RoundResult struct {
 
 // DashboardState 表示前端 dashboard 所需的完整状态快照。
 type DashboardState struct {
-	UpdatedAt          string             `json:"updated_at,omitempty"`
-	Market             DashboardMarket    `json:"market"`
-	WalletBalance      *float64           `json:"wallet_balance,omitempty"`
-	Prices             DashboardPrices    `json:"prices"`
-	Position           *Position          `json:"position,omitempty"`
-	PendingOrder       *PendingOrder      `json:"pending_order,omitempty"`
-	LastOrder          *LastOrder         `json:"last_order,omitempty"`
-	TradeHistory       []TradeHistoryItem `json:"trade_history,omitempty"`
-	WalletPositions    []WalletPosition   `json:"wallet_positions,omitempty"`
-	WalletHistory      []TradeHistoryItem `json:"wallet_history,omitempty"`
-	LiveTrades         []LiveTradeSummary `json:"live_trades,omitempty"`
-	LivePositionsCount int                `json:"live_positions_count"`
-	LiveRealizedPnL    float64            `json:"live_realized_pnl"`
-	LiveUnrealizedPnL  float64            `json:"live_unrealized_pnl"`
-	LiveTotalPnL       float64            `json:"live_total_pnl"`
-	AutoRedeem         AutoRedeemStatus   `json:"auto_redeem"`
-	Activity           []ActivityLog      `json:"activity,omitempty"`
-	RoundResults       []RoundResult      `json:"round_results,omitempty"`
+	UpdatedAt          string               `json:"updated_at,omitempty"`
+	SelectedMarketKey  string               `json:"selected_market_key,omitempty"`
+	Market             DashboardMarket      `json:"market"`
+	WalletBalance      *float64             `json:"wallet_balance,omitempty"`
+	Prices             DashboardPrices      `json:"prices"`
+	Position           *Position            `json:"position,omitempty"`
+	PendingOrder       *PendingOrder        `json:"pending_order,omitempty"`
+	LastOrder          *LastOrder           `json:"last_order,omitempty"`
+	TradeHistory       []TradeHistoryItem   `json:"trade_history,omitempty"`
+	WalletPositions    []WalletPosition     `json:"wallet_positions,omitempty"`
+	WalletHistory      []TradeHistoryItem   `json:"wallet_history,omitempty"`
+	LiveTrades         []LiveTradeSummary   `json:"live_trades,omitempty"`
+	LivePositionsCount int                  `json:"live_positions_count"`
+	LiveRealizedPnL    float64              `json:"live_realized_pnl"`
+	LiveUnrealizedPnL  float64              `json:"live_unrealized_pnl"`
+	LiveTotalPnL       float64              `json:"live_total_pnl"`
+	AutoTrade          AutoTradeDiagnostics `json:"auto_trade"`
+	AutoRedeem         AutoRedeemStatus     `json:"auto_redeem"`
+	Markets            []TrackedMarketView  `json:"markets,omitempty"`
+	Activity           []ActivityLog        `json:"activity,omitempty"`
+	RoundResults       []RoundResult        `json:"round_results,omitempty"`
 }
 
 // NewDashboardState 返回带有默认值的 dashboard 初始状态。
@@ -206,10 +244,12 @@ func NewDashboardState() DashboardState {
 		Market: DashboardMarket{
 			Status: "waiting",
 		},
+		AutoTrade: AutoTradeDiagnostics{},
 		AutoRedeem: AutoRedeemStatus{
 			Enabled:    false,
 			LastResult: map[string]any{},
 		},
+		Markets:         []TrackedMarketView{},
 		TradeHistory:    []TradeHistoryItem{},
 		WalletPositions: []WalletPosition{},
 		WalletHistory:   []TradeHistoryItem{},

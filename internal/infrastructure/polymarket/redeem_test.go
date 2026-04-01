@@ -162,3 +162,62 @@ func TestGetRedeemableConditionsSkipsDustAndMergeable(t *testing.T) {
 		t.Fatalf("unexpected claimable conditions: %+v", claimable)
 	}
 }
+
+// TestRedeemConditionPreflightReturnsReadableRevert 确认链上预检失败时会直接返回清晰原因，而不是继续提交 relayer。
+func TestRedeemConditionPreflightReturnsReadableRevert(t *testing.T) {
+	privateKeyHex := "59c6995e998f97a5a0044976f5d1b0f5d5a9b6715f7e5f1f1b72e38fcb0a6b15"
+	privateKey, err := crypto.HexToECDSA(privateKeyHex)
+	if err != nil {
+		t.Fatalf("failed to parse private key: %v", err)
+	}
+	signer := crypto.PubkeyToAddress(privateKey.PublicKey)
+	proxyWallet := deriveProxyWalletAddress(signer)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     any    `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode rpc request: %v", err)
+		}
+		if req.Method != "eth_estimateGas" {
+			t.Fatalf("unexpected rpc method %q", req.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"error": map[string]any{
+				"code":    3,
+				"message": "execution reverted",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		PolygonRPCURL:  server.URL,
+		PrivateKey:     "0x" + privateKeyHex,
+		FunderAddress:  proxyWallet.Hex(),
+		SignatureType:  1,
+		CTFContract:    "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+		USDCCollateral: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+	}, nil)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	result, err := client.RedeemCondition(context.Background(), "0x1111111111111111111111111111111111111111111111111111111111111111")
+	if err == nil {
+		t.Fatalf("expected preflight revert to fail")
+	}
+	if result == nil || !strings.EqualFold(result.ProxyWallet, proxyWallet.Hex()) {
+		t.Fatalf("expected proxy wallet to be preserved in result, got %+v", result)
+	}
+	if !strings.Contains(err.Error(), "链上预检失败") {
+		t.Fatalf("expected readable preflight error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "execution reverted") {
+		t.Fatalf("expected rpc revert details to be preserved, got %v", err)
+	}
+}

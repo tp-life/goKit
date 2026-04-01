@@ -10,11 +10,22 @@ import (
 
 // ConditionConfig 表示一条自动交易触发规则。
 type ConditionConfig struct {
-	Time    int
-	Diff    float64
+	Time int
+	// Diff 表示绝对价差阈值；主要用于兼容旧版 BTC 单市场配置。
+	Diff float64
+	// DiffBps 表示相对价差阈值，单位是 bps；大于 0 时优先于 Diff 生效，更适合多市场共用一套规则。
+	DiffBps float64
 	MinProb float64
 	MaxProb float64
 	Side    string
+}
+
+// MarketTargetConfig 表示一个需要并行跟踪的市场目标。
+type MarketTargetConfig struct {
+	Key         string
+	Label       string
+	Symbol      string
+	IntervalSec int
 }
 
 // Config 汇总了 Polymarket SDK 及其相邻机器人能力的配置项。
@@ -78,6 +89,10 @@ type Config struct {
 	StateFile            string
 	DashboardStaticDir   string
 	Conditions           []ConditionConfig
+	MarketTargets        []MarketTargetConfig
+	EnableBalancePolling bool
+	EnableAccountPolling bool
+	EnableAutoRedeemer   bool
 }
 
 // LoadConfig 读取 Polymarket 相关环境变量，并转换成强类型配置。
@@ -144,14 +159,18 @@ func LoadConfig() (Config, error) {
 		BinanceWSURL:         getEnv("BINANCE_WS_URL", ""),
 		BinancePriceURL:      getEnv("BINANCE_PRICE_URL", "https://api.binance.com/api/v3/ticker/price"),
 		// 默认把运行时状态放到 data 目录，把 dashboard 静态资源放到 web 目录，彻底摆脱旧 Python 目录依赖。
-		StateFile:          getEnv("POLYMARKET_STATE_FILE", filepath.Join("data", "polymarket", "state.json")),
-		DashboardStaticDir: getEnv("POLYMARKET_DASHBOARD_STATIC_DIR", filepath.Join("web", "polymarket")),
+		StateFile:            getEnv("POLYMARKET_STATE_FILE", filepath.Join("data", "polymarket", "state.json")),
+		DashboardStaticDir:   getEnv("POLYMARKET_DASHBOARD_STATIC_DIR", filepath.Join("web", "polymarket")),
+		EnableBalancePolling: true,
+		EnableAccountPolling: true,
+		EnableAutoRedeemer:   true,
 	}
 
 	cfg.Conditions = []ConditionConfig{
 		{
 			Time:    getEnvInt("CONDITION_1_TIME", 120),
 			Diff:    getEnvFloat("CONDITION_1_DIFF", 30),
+			DiffBps: getEnvFloat("CONDITION_1_DIFF_BPS", 0),
 			MinProb: getEnvFloat("CONDITION_1_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_1_MAX_PROB", 0.92),
 			Side:    "UP",
@@ -159,6 +178,7 @@ func LoadConfig() (Config, error) {
 		{
 			Time:    getEnvInt("CONDITION_2_TIME", 120),
 			Diff:    getEnvFloat("CONDITION_2_DIFF", 30),
+			DiffBps: getEnvFloat("CONDITION_2_DIFF_BPS", 0),
 			MinProb: getEnvFloat("CONDITION_2_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_2_MAX_PROB", 0.92),
 			Side:    "DOWN",
@@ -166,6 +186,7 @@ func LoadConfig() (Config, error) {
 		{
 			Time:    getEnvInt("CONDITION_3_TIME", 60),
 			Diff:    getEnvFloat("CONDITION_3_DIFF", 50),
+			DiffBps: getEnvFloat("CONDITION_3_DIFF_BPS", 0),
 			MinProb: getEnvFloat("CONDITION_3_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_3_MAX_PROB", 0.92),
 			Side:    "UP",
@@ -173,11 +194,13 @@ func LoadConfig() (Config, error) {
 		{
 			Time:    getEnvInt("CONDITION_4_TIME", 60),
 			Diff:    getEnvFloat("CONDITION_4_DIFF", 50),
+			DiffBps: getEnvFloat("CONDITION_4_DIFF_BPS", 0),
 			MinProb: getEnvFloat("CONDITION_4_MIN_PROB", 0.80),
 			MaxProb: getEnvFloat("CONDITION_4_MAX_PROB", 0.92),
 			Side:    "DOWN",
 		},
 	}
+	cfg.MarketTargets = parseMarketTargets(getEnv("POLYMARKET_MARKETS", ""), cfg.MarketSymbol, cfg.MarketIntervalSec)
 
 	if cfg.PriceRefreshSec <= 0 {
 		// 防御非法配置，避免轮询协程因为错误输入而停止工作。
@@ -219,6 +242,11 @@ func LoadConfig() (Config, error) {
 	if cfg.TakeProfitRetryStep < 0 {
 		cfg.TakeProfitRetryStep = 0.005
 	}
+	for idx := range cfg.Conditions {
+		if cfg.Conditions[idx].DiffBps < 0 {
+			cfg.Conditions[idx].DiffBps = 0
+		}
+	}
 	if strings.TrimSpace(cfg.MarketSymbol) == "" {
 		cfg.MarketSymbol = "BTC"
 	}
@@ -240,6 +268,16 @@ func LoadConfig() (Config, error) {
 	if strings.TrimSpace(cfg.BinanceSymbol) == "" {
 		cfg.BinanceSymbol = defaultBinanceSymbol(cfg.MarketSymbol)
 	}
+	if len(cfg.MarketTargets) == 0 {
+		cfg.MarketTargets = []MarketTargetConfig{
+			{
+				Key:         buildMarketTargetKey(cfg.MarketSymbol, cfg.MarketIntervalSec),
+				Label:       buildMarketTargetLabel(cfg.MarketSymbol, cfg.MarketIntervalSec),
+				Symbol:      normalizeMarketSymbol(cfg.MarketSymbol),
+				IntervalSec: cfg.ResolvedMarketIntervalSec(),
+			},
+		}
+	}
 
 	if absPath, err := filepath.Abs(cfg.StateFile); err == nil {
 		cfg.StateFile = absPath
@@ -249,6 +287,67 @@ func LoadConfig() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ResolvedMarketTargets 返回当前配置最终生效的市场 watchlist。
+func (c Config) ResolvedMarketTargets() []MarketTargetConfig {
+	if len(c.MarketTargets) == 0 {
+		return []MarketTargetConfig{
+			{
+				Key:         buildMarketTargetKey(c.MarketSymbol, c.MarketIntervalSec),
+				Label:       buildMarketTargetLabel(c.MarketSymbol, c.MarketIntervalSec),
+				Symbol:      normalizeMarketSymbol(c.MarketSymbol),
+				IntervalSec: c.ResolvedMarketIntervalSec(),
+			},
+		}
+	}
+	out := make([]MarketTargetConfig, 0, len(c.MarketTargets))
+	for _, item := range c.MarketTargets {
+		normalized := item
+		normalized.Symbol = normalizeMarketSymbol(item.Symbol)
+		if normalized.IntervalSec <= 0 {
+			normalized.IntervalSec = c.ResolvedMarketIntervalSec()
+		}
+		if strings.TrimSpace(normalized.Key) == "" {
+			normalized.Key = buildMarketTargetKey(normalized.Symbol, normalized.IntervalSec)
+		}
+		if strings.TrimSpace(normalized.Label) == "" {
+			normalized.Label = buildMarketTargetLabel(normalized.Symbol, normalized.IntervalSec)
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+// CloneForTarget 基于基础配置派生一个单市场 worker 配置。
+func (c Config) CloneForTarget(target MarketTargetConfig, workerIndex int, enableSharedTasks bool) Config {
+	out := c
+	out.MarketSymbol = normalizeMarketSymbol(target.Symbol)
+	out.MarketIntervalSec = target.IntervalSec
+	out.MarketSlugPrefix = defaultMarketSlugPrefix(out.MarketSymbol)
+	out.MarketSlugInterval = defaultMarketSlugInterval(out.MarketIntervalSec)
+	out.RTDSSymbol = defaultRTDSSymbol(out.MarketSymbol)
+	out.CryptoPriceSymbol = out.MarketSymbol
+	out.CryptoPriceVariant = defaultCryptoPriceVariant(out.MarketIntervalSec)
+	out.BinanceSymbol = defaultBinanceSymbol(out.MarketSymbol)
+	// 多市场模式下，如果 BINANCE_WS_URL 只是沿用了基础市场的默认值，
+	// 这里清空后让子 worker 按各自 symbol 重新派生 websocket 地址。
+	if shouldDeriveBinanceWSURLForTarget(c.BinanceWSURL, c.ResolvedBinanceSymbol()) {
+		out.BinanceWSURL = ""
+	}
+	out.MarketTargets = nil
+	out.EnableBalancePolling = enableSharedTasks
+	out.EnableAccountPolling = enableSharedTasks
+	out.EnableAutoRedeemer = enableSharedTasks
+
+	// 多市场模式下为每个 worker 分配独立状态文件，避免相互覆盖。
+	if len(c.ResolvedMarketTargets()) > 1 {
+		out.StateFile = targetStateFilePath(c.StateFile, target)
+	}
+	if absPath, err := filepath.Abs(out.StateFile); err == nil {
+		out.StateFile = absPath
+	}
+	return out
 }
 
 // ResolvedMarketSlugPrefix 返回市场 slug 前缀，默认形如 `btc-updown`。
@@ -315,6 +414,16 @@ func (c Config) ResolvedBinanceWSURL() string {
 	return "wss://stream.binance.com:9443/ws/" + strings.ToLower(c.ResolvedBinanceSymbol()) + "@trade"
 }
 
+// shouldDeriveBinanceWSURLForTarget 判断子市场 worker 是否应重新按 symbol 派生 Binance WS 地址。
+func shouldDeriveBinanceWSURLForTarget(rawURL string, baseSymbol string) bool {
+	normalized := strings.TrimSpace(rawURL)
+	if normalized == "" {
+		return true
+	}
+	expected := "wss://stream.binance.com:9443/ws/" + strings.ToLower(strings.TrimSpace(baseSymbol)) + "@trade"
+	return strings.EqualFold(normalized, expected)
+}
+
 // HasBuilderRelayerAuth 判断是否完整配置了 Builder API 凭证。
 func (c Config) HasBuilderRelayerAuth() bool {
 	return strings.TrimSpace(c.BuilderAPIKey) != "" &&
@@ -375,6 +484,111 @@ func defaultCryptoPriceVariant(intervalSec int) string {
 	default:
 		return ""
 	}
+}
+
+// parseMarketTargets 解析形如 `BTC:15m,ETH:15m,SOL:5m` 的市场 watchlist。
+func parseMarketTargets(raw string, fallbackSymbol string, fallbackIntervalSec int) []MarketTargetConfig {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	items := strings.Split(raw, ",")
+	targets := make([]MarketTargetConfig, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		symbol, intervalSec, ok := parseMarketTarget(strings.TrimSpace(item), fallbackSymbol, fallbackIntervalSec)
+		if !ok {
+			continue
+		}
+		key := buildMarketTargetKey(symbol, intervalSec)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, MarketTargetConfig{
+			Key:         key,
+			Label:       buildMarketTargetLabel(symbol, intervalSec),
+			Symbol:      symbol,
+			IntervalSec: intervalSec,
+		})
+	}
+	return targets
+}
+
+// parseMarketTarget 解析单个 watchlist 项，支持 `BTC:15m`、`ETH:900` 这类格式。
+func parseMarketTarget(raw string, fallbackSymbol string, fallbackIntervalSec int) (string, int, bool) {
+	if raw == "" {
+		return "", 0, false
+	}
+
+	symbol := normalizeMarketSymbol(fallbackSymbol)
+	intervalSec := fallbackIntervalSec
+	parts := strings.Split(raw, ":")
+	if len(parts) >= 1 && strings.TrimSpace(parts[0]) != "" {
+		symbol = normalizeMarketSymbol(parts[0])
+	}
+	if len(parts) >= 2 {
+		parsedInterval, ok := parseMarketIntervalSpec(parts[1])
+		if !ok {
+			return "", 0, false
+		}
+		intervalSec = parsedInterval
+	}
+	if intervalSec <= 0 {
+		intervalSec = 900
+	}
+	return symbol, intervalSec, true
+}
+
+// parseMarketIntervalSpec 把 `5m`、`15m`、`1h` 或纯秒数转成秒。
+func parseMarketIntervalSpec(raw string) (int, bool) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return 0, false
+	}
+
+	if strings.HasSuffix(value, "m") {
+		minutes, err := strconv.Atoi(strings.TrimSuffix(value, "m"))
+		if err != nil || minutes <= 0 {
+			return 0, false
+		}
+		return minutes * 60, true
+	}
+	if strings.HasSuffix(value, "h") {
+		hours, err := strconv.Atoi(strings.TrimSuffix(value, "h"))
+		if err != nil || hours <= 0 {
+			return 0, false
+		}
+		return hours * 3600, true
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
+// buildMarketTargetKey 生成稳定的 watchlist 键名，例如 `btc-15m`。
+func buildMarketTargetKey(symbol string, intervalSec int) string {
+	return strings.ToLower(normalizeMarketSymbol(symbol)) + "-" + defaultMarketSlugInterval(intervalSec)
+}
+
+// buildMarketTargetLabel 生成终端与日志中展示的短标签。
+func buildMarketTargetLabel(symbol string, intervalSec int) string {
+	return normalizeMarketSymbol(symbol) + " " + defaultMarketSlugInterval(intervalSec)
+}
+
+// targetStateFilePath 为多市场 worker 派生独立的状态文件路径。
+func targetStateFilePath(basePath string, target MarketTargetConfig) string {
+	dir := filepath.Dir(basePath)
+	ext := filepath.Ext(basePath)
+	name := strings.TrimSuffix(filepath.Base(basePath), ext)
+	if ext == "" {
+		ext = ".json"
+	}
+	suffix := strings.ReplaceAll(strings.ToLower(target.Key), "-", "_")
+	return filepath.Join(dir, name+"_"+suffix+ext)
 }
 
 // getFirstEnv 返回多个候选环境变量里第一个非空值。

@@ -17,12 +17,12 @@ import (
 
 // PolymarketHandler 负责暴露 dashboard、SSE 与手动下单接口。
 type PolymarketHandler struct {
-	svc *service.PolymarketService
+	svc service.PolymarketApp
 	cfg infraPolymarket.Config
 }
 
 // NewPolymarketHandler 创建 Polymarket HTTP 处理器。
-func NewPolymarketHandler(svc *service.PolymarketService, cfg infraPolymarket.Config) *PolymarketHandler {
+func NewPolymarketHandler(svc service.PolymarketApp, cfg infraPolymarket.Config) *PolymarketHandler {
 	return &PolymarketHandler{svc: svc, cfg: cfg}
 }
 

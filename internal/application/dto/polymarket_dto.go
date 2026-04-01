@@ -2,6 +2,7 @@ package dto
 
 // ManualOrderReq 表示 dashboard 发起的手动下单请求。
 type ManualOrderReq struct {
+	MarketKey   string  `json:"market_key,omitempty"`
 	Action      string  `json:"action"`
 	Outcome     string  `json:"outcome"`
 	Amount      float64 `json:"amount"`

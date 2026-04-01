@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"goKit/internal/domain/entity"
 )
@@ -132,4 +133,151 @@ func TestWalletPositionSizeForPositionUsesOutcomeFallback(t *testing.T) {
 	if size != 3.25 {
 		t.Fatalf("expected matched size 3.25, got %.4f", size)
 	}
+}
+
+// TestRenderAutoTradeDiagnosticsLines 确认自动交易诊断面板会输出关键统计项。
+func TestRenderAutoTradeDiagnosticsLines(t *testing.T) {
+	m := model{
+		state: entity.DashboardState{
+			Market: entity.DashboardMarket{
+				Slug: "btc-updown-15m",
+			},
+			AutoTrade: entity.AutoTradeDiagnostics{
+				MarketSlug:           "btc-updown-15m",
+				SampleCount:          120,
+				TriggerCount:         6,
+				DiffMissCount:        40,
+				ProbabilityMissCount: 18,
+				DataLagCount:         3,
+				LastReason:           "当前价差 22.15 未达到配置阈值",
+				LastReasonAt:         "2026-03-31T18:10:00Z",
+				LastTriggerAt:        "2026-03-31T18:09:30Z",
+			},
+		},
+	}
+
+	lines := m.renderAutoTradeDiagnosticsLines()
+	text := strings.Join(lines, "\n")
+	if !strings.Contains(text, "样本=120") {
+		t.Fatalf("expected sample count to be rendered, got %q", text)
+	}
+	if !strings.Contains(text, "命中=6") {
+		t.Fatalf("expected trigger count to be rendered, got %q", text)
+	}
+	if !strings.Contains(text, "价差不足=40") {
+		t.Fatalf("expected diff miss count to be rendered, got %q", text)
+	}
+	if !strings.Contains(text, "最近原因: 当前价差 22.15 未达到配置阈值") {
+		t.Fatalf("expected last reason to be rendered, got %q", text)
+	}
+}
+
+// TestRecordSnapshotTracksFlashesForNonSelectedMarket 确认非焦点市场也会记录独立价格高亮。
+func TestRecordSnapshotTracksFlashesForNonSelectedMarket(t *testing.T) {
+	prevUp := 0.61
+	nextUp := 0.63
+	prevBinance := 3200.0
+	nextBinance := 3210.0
+	prevDiff := 12.5
+	nextDiff := 14.5
+
+	m := model{
+		state: entity.DashboardState{
+			SelectedMarketKey: "btc-15m",
+			Markets: []entity.TrackedMarketView{
+				{
+					Key:   "btc-15m",
+					Label: "BTC 15m",
+					Prices: entity.DashboardPrices{
+						UpPrice:      floatPtr(0.82),
+						BinanceBTC:   floatPtr(82000),
+						ChainlinkBTC: floatPtr(82005),
+					},
+				},
+				{
+					Key:   "eth-15m",
+					Label: "ETH 15m",
+					Prices: entity.DashboardPrices{
+						UpPrice:    &prevUp,
+						BinanceBTC: &prevBinance,
+						Diff:       &prevDiff,
+					},
+				},
+			},
+		},
+		flashes: map[string]flashMarker{},
+	}
+
+	next := m.state
+	next.Markets = []entity.TrackedMarketView{
+		m.state.Markets[0],
+		{
+			Key:   "eth-15m",
+			Label: "ETH 15m",
+			Prices: entity.DashboardPrices{
+				UpPrice:    &nextUp,
+				BinanceBTC: &nextBinance,
+				Diff:       &nextDiff,
+			},
+		},
+	}
+
+	m.recordSnapshot(next)
+
+	if marker, ok := m.flashes[trackedFlashKey("eth-15m", "up")]; !ok || marker.direction != 1 {
+		t.Fatalf("expected eth up flash to be recorded, got %+v exists=%v", marker, ok)
+	}
+	if marker, ok := m.flashes[trackedFlashKey("eth-15m", "binance")]; !ok || marker.direction != 1 {
+		t.Fatalf("expected eth binance flash to be recorded, got %+v exists=%v", marker, ok)
+	}
+	if marker, ok := m.flashes[trackedFlashKey("eth-15m", "diff")]; !ok || marker.direction != 1 {
+		t.Fatalf("expected eth diff flash to be recorded, got %+v exists=%v", marker, ok)
+	}
+}
+
+// TestRenderTrackedMarketMetricUsesPerMarketFlash 确认 header 和市场列表里的非焦点市场也会按自身涨跌高亮。
+func TestRenderTrackedMarketMetricUsesPerMarketFlash(t *testing.T) {
+	value := 0.63
+	diff := 14.5
+	now := time.Now()
+	item := entity.TrackedMarketView{
+		Key:   "eth-15m",
+		Label: "ETH 15m",
+		Prices: entity.DashboardPrices{
+			UpPrice: &value,
+			Diff:    &diff,
+		},
+	}
+
+	m := model{
+		state: entity.DashboardState{
+			SelectedMarketKey: "btc-15m",
+			Markets:           []entity.TrackedMarketView{item},
+		},
+		flashes: map[string]flashMarker{
+			trackedFlashKey("eth-15m", "up"):   {direction: 1, changedAt: now},
+			trackedFlashKey("eth-15m", "diff"): {direction: -1, changedAt: now},
+		},
+	}
+
+	upText := m.renderTrackedMarketMetric(item, "up", item.Prices.UpPrice)
+	diffText := m.renderTrackedMarketDiff(item)
+	lines := strings.Join(m.renderTrackedMarketsLines(), "\n")
+
+	if !strings.Contains(upText, "0.6300 +") {
+		t.Fatalf("expected per-market up highlight, got %q", upText)
+	}
+	if !strings.Contains(diffText, "+14.5000 -") {
+		t.Fatalf("expected per-market diff highlight, got %q", diffText)
+	}
+	if !strings.Contains(lines, "0.6300 +") {
+		t.Fatalf("expected market list to reuse highlighted up price, got %q", lines)
+	}
+	if !strings.Contains(lines, "+14.5000 -") {
+		t.Fatalf("expected market list to reuse highlighted diff, got %q", lines)
+	}
+}
+
+func floatPtr(v float64) *float64 {
+	return &v
 }

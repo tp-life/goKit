@@ -549,6 +549,162 @@ func TestEvaluateAutoTradeRecordsConcreteOrderError(t *testing.T) {
 	}
 }
 
+func TestEvaluateAutoTradeRecordsDiffMissDiagnostics(t *testing.T) {
+	btc := 100.0
+	ptb := 80.0
+	upAsk := 0.81
+	downAsk := 0.19
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			Conditions: []polymarket.ConditionConfig{
+				{Time: 120, Diff: 30, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+	}
+	svc.price.btc = &btc
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.autoTrade.SampleCount != 1 {
+		t.Fatalf("expected one diagnostics sample, got %+v", svc.autoTrade)
+	}
+	if svc.autoTrade.DiffMissCount != 1 {
+		t.Fatalf("expected diff miss diagnostics, got %+v", svc.autoTrade)
+	}
+	if svc.autoTrade.TriggerCount != 0 {
+		t.Fatalf("expected no trigger when diff misses, got %+v", svc.autoTrade)
+	}
+	if svc.autoTrade.LastReason == "" {
+		t.Fatalf("expected concrete diff miss reason, got %+v", svc.autoTrade)
+	}
+}
+
+func TestEvaluateAutoTradeRecordsProbabilityMissDiagnostics(t *testing.T) {
+	btc := 100.0
+	ptb := 50.0
+	upAsk := 0.95
+	downAsk := 0.05
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			Conditions: []polymarket.ConditionConfig{
+				{Time: 120, Diff: 30, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+	}
+	svc.price.btc = &btc
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.autoTrade.SampleCount != 1 {
+		t.Fatalf("expected one diagnostics sample, got %+v", svc.autoTrade)
+	}
+	if svc.autoTrade.ProbabilityMissCount != 1 {
+		t.Fatalf("expected probability miss diagnostics, got %+v", svc.autoTrade)
+	}
+	if svc.autoTrade.LastReason == "" {
+		t.Fatalf("expected concrete probability miss reason, got %+v", svc.autoTrade)
+	}
+}
+
+func TestEvaluateAutoTradeSupportsRelativeDiffBpsAcrossMarkets(t *testing.T) {
+	referencePrice := 2000.0
+	ptb := 1999.1
+	upAsk := 0.81
+	downAsk := 0.19
+
+	sdk := &stubPolymarketSDK{
+		placeLimitOrderFn: func(_ context.Context, tokenID, action string, price, size float64) (string, float64, error) {
+			if tokenID != "eth-up-token" {
+				t.Fatalf("unexpected token id: %s", tokenID)
+			}
+			if action != "BUY" {
+				t.Fatalf("unexpected action: %s", action)
+			}
+			if price != upAsk {
+				t.Fatalf("unexpected price %.4f", price)
+			}
+			return "order-eth-1", size, nil
+		},
+	}
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			MarketDataMaxLagSec: 5,
+			Conditions: []polymarket.ConditionConfig{
+				{Time: 120, Diff: 30, DiffBps: 4, MinProb: 0.80, MaxProb: 0.92, Side: "UP"},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      sdk,
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "eth-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "eth-up-token",
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.evaluateAutoTrade(context.Background())
+
+	if svc.state.PendingOrder == nil {
+		t.Fatalf("expected relative diff bps condition to trigger an order")
+	}
+	if svc.state.PendingOrder.OrderID != "order-eth-1" {
+		t.Fatalf("unexpected pending order: %+v", svc.state.PendingOrder)
+	}
+}
+
 func TestRedeemConditionWithRetryDoesNotResubmitSubmittedRelayerTxn(t *testing.T) {
 	attempts := 0
 	sdk := &stubPolymarketSDK{

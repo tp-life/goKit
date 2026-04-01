@@ -96,6 +96,15 @@
     .quick-amounts{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
     .chip{border:1px solid #355283;background:#0d1629;color:#cfe1ff;border-radius:999px;padding:5px 10px;font-size:12px;cursor:pointer;}
     .chip:hover{border-color:#6ea0ff;background:#122242;}
+    .market-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;}
+    .market-pill{
+      border:1px solid #355283;background:#0d1629;color:#cfe1ff;border-radius:12px;
+      padding:8px 10px;font-size:12px;cursor:pointer;min-width:180px;text-align:left;
+    }
+    .market-pill:hover{border-color:#6ea0ff;background:#122242;}
+    .market-pill.active{border-color:#7ec7ff;background:linear-gradient(180deg,#143055,#10233d);box-shadow:0 0 0 1px rgba(126,199,255,.25) inset;}
+    .market-pill-title{font-weight:700;color:#e6efff;}
+    .market-pill-meta{margin-top:4px;color:var(--muted);font-size:11px;line-height:1.45;}
     @media (max-width:1080px){ .grid{grid-template-columns:1fr;} .logs{height:360px;min-height:300px;} .round-list{height:220px;} .kv,.kv-tight,.kv2,.kv-price{grid-template-columns:1fr 1fr; justify-content:stretch;} }
     @media (max-width:760px){ .kv,.kv-tight,.kv2,.kv-price,.trade-panel{grid-template-columns:1fr;} .v{font-size:16px;} .trade-actions{flex-direction:column;} }
 </style>
@@ -120,6 +129,7 @@
             <div class="item"><div class="k">市场状态</div><div id="marketStatus" class="v">-</div></div>
             <div class="item"><div class="k">更新时间戳</div><div id="priceUpdatedTs" class="v mono">-</div></div>
           </div>
+          <div id="marketList" class="market-list"></div>
         </section>
 
         <section class="card">
@@ -225,6 +235,8 @@
     let historySig = "";
     let roundSig = "";
     let remainingEndsAtMs = null;
+    let selectedMarketKey = "";
+    let latestSnapshot = {};
     let latestMarket = {};
     let latestPrices = {};
     const priceTrend = {
@@ -273,8 +285,11 @@
       return `${side} | 入场 ${px} | Diff ${df} | ${slug}`;
     }
 
-    function fmtWalletPositions(rows) {
-      const arr = Array.isArray(rows) ? rows : [];
+    function fmtWalletPositions(rows, slug) {
+      const source = Array.isArray(rows) ? rows : [];
+      const arr = slug
+        ? source.filter((x) => String(x.slug || x.market_slug || "").trim() === slug)
+        : source;
       if (!arr.length) return "-";
       const top = arr.slice(0, 3).map((x) => {
         const side = x.outcome || x.side || "-";
@@ -297,6 +312,48 @@
       if (!v || Object.keys(v).length === 0) return "-";
       const slug = v.slug ? ` | ${v.slug}` : "";
       return `${v.side || "-"} | 价 ${v.price !== undefined ? `${fmt(Number(v.price) * 100, 2)}%` : "-"} | 订单 ${v.order_id || "-"}${slug}`;
+    }
+
+    function currentTrackedMarket(data) {
+      const markets = Array.isArray(data.markets) ? data.markets : [];
+      if (!markets.length) return null;
+      const preferred = selectedMarketKey || data.selected_market_key || "";
+      const found = markets.find((x) => x && x.key === preferred);
+      return found || markets[0] || null;
+    }
+
+    function filterRowsBySlug(rows, slug) {
+      if (!Array.isArray(rows) || !slug) return Array.isArray(rows) ? rows : [];
+      return rows.filter((x) => String(x.slug || x.market_slug || "").trim() === slug);
+    }
+
+    function renderMarketList(markets, activeKey) {
+      const box = $("marketList");
+      const rows = Array.isArray(markets) ? markets : [];
+      if (!rows.length) {
+        box.innerHTML = '<div class="muted">暂无已配置市场</div>';
+        return;
+      }
+      box.innerHTML = rows.map((item) => {
+        const active = item.key === activeKey;
+        const diff = maybeNum(item?.prices?.diff);
+        const diffText = diff === null ? "-" : `${diff >= 0 ? "+" : ""}${fmt(diff, 0)}`;
+        const up = item?.prices?.up_price === undefined ? "-" : fmtPct(item.prices.up_price);
+        const down = item?.prices?.down_price === undefined ? "-" : fmtPct(item.prices.down_price);
+        const remain = item?.market?.remaining_text || item?.market?.status || "-";
+        return `
+          <button type="button" class="market-pill ${active ? "active" : ""}" data-market-key="${item.key || ""}">
+            <div class="market-pill-title">${item.label || item.key || "-"}</div>
+            <div class="market-pill-meta">状态 ${item?.market?.status || "-"} | 剩余 ${remain}</div>
+            <div class="market-pill-meta">UP ${up} | DOWN ${down} | Diff ${diffText}</div>
+          </button>`;
+      }).join("");
+      box.querySelectorAll("[data-market-key]").forEach((el) => {
+        el.addEventListener("click", () => {
+          selectedMarketKey = el.dataset.marketKey || "";
+          renderStatus(latestSnapshot || {});
+        });
+      });
     }
 
     function fmtLast(v) {
@@ -443,9 +500,21 @@
     }
 
     function renderStatus(data) {
-      const market = data.market || {};
-      const prices = data.prices || {};
+      latestSnapshot = data || {};
+      const tracked = currentTrackedMarket(data || {}) || {};
+      const market = tracked.market || data.market || {};
+      const prices = tracked.prices || data.prices || {};
       const redeem = data.auto_redeem || {};
+      const trackedPosition = tracked.position !== undefined ? tracked.position : data.position;
+      const trackedPending = tracked.pending_order !== undefined ? tracked.pending_order : data.pending_order;
+      const trackedLastOrder = tracked.last_order !== undefined ? tracked.last_order : data.last_order;
+      const trackedAutoTrade = tracked.auto_trade || data.auto_trade || {};
+      const marketLabel = tracked.label || tracked.key || market.slug || "-";
+      if (tracked.key) {
+        selectedMarketKey = tracked.key;
+      } else if (!selectedMarketKey && data.selected_market_key) {
+        selectedMarketKey = data.selected_market_key;
+      }
       latestMarket = market;
       latestPrices = prices;
 
@@ -453,7 +522,8 @@
 
       const bal = data.wallet_balance;
       $("walletBalance").textContent = bal !== undefined && bal !== null ? `余额: $${Number(bal).toLocaleString("zh-CN", {minimumFractionDigits: 2, maximumFractionDigits: 2})}` : "余额: -";
-      $("marketSlug").textContent = `市场: ${market.slug || "-"}`;
+      const marketCount = Array.isArray(data.markets) && data.markets.length ? data.markets.length : 1;
+      $("marketSlug").textContent = `并行监控 ${marketCount} 个市场 | 当前查看: ${marketLabel}${market.slug ? ` | ${market.slug}` : ""}`;
       const rem = maybeNum(market.remaining);
       if (rem !== null && rem >= 0 && (market.status || "") === "active") {
         remainingEndsAtMs = Date.now() + Math.round(rem * 1000);
@@ -464,6 +534,7 @@
       }
       $("marketStatus").textContent = market.status || "-";
       $("priceUpdatedTs").textContent = prices.updated_ts ? String(prices.updated_ts) : "-";
+      renderMarketList(data.markets || [], selectedMarketKey);
 
       $("ptb").textContent = fmtPrice(prices.ptb);
       setPriceWithArrow("chainlink", prices.chainlink_btc, "chainlink");
@@ -472,13 +543,13 @@
       setPctWithArrow("downPrice", prices.down_price, "down");
       setDiff(prices.diff);
 
-      const localPos = fmtPosition(data.position);
-      const walletPos = fmtWalletPositions(data.wallet_positions);
+      const localPos = fmtPosition(trackedPosition);
+      const walletPos = fmtWalletPositions(data.wallet_positions, market.slug || "");
       $("position").textContent = localPos !== "-" ? localPos : (walletPos !== "-" ? `钱包同步: ${walletPos}` : "-");
-      const pendingText = fmtPending(data.pending_order, market.slug || "");
+      const pendingText = fmtPending(trackedPending, market.slug || "");
       $("pendingOrder").textContent = pendingText;
-      const hasCrossMarketPending = pendingText === "-" && data.pending_order && Object.keys(data.pending_order).length > 0;
-      $("lastOrder").textContent = hasCrossMarketPending ? `跨市场挂单 | ${fmtPendingAny(data.pending_order)}` : fmtLast(data.last_order);
+      const hasCrossMarketPending = pendingText === "-" && trackedPending && Object.keys(trackedPending).length > 0;
+      $("lastOrder").textContent = hasCrossMarketPending ? `跨市场挂单 | ${fmtPendingAny(trackedPending)}` : fmtLast(trackedLastOrder);
 
       const enabled = !!redeem.enabled;
       $("redeemEnabled").textContent = enabled ? "开启" : "关闭";
@@ -493,7 +564,8 @@
         if (!market.slug) {
           tip.textContent = "提示: 当前无活跃市场，暂时不能手动下单。";
         } else {
-          tip.textContent = `提示: 当前市场 ${market.slug}，可手动买入/卖出。`;
+          const hitRate = trackedAutoTrade.sample_count ? ((Number(trackedAutoTrade.trigger_count || 0) / Number(trackedAutoTrade.sample_count || 1)) * 100).toFixed(1) : "-";
+          tip.textContent = `提示: 系统会并行监控全部已配置市场；当前仅查看 ${marketLabel}${market.slug ? ` (${market.slug})` : ""}，命中率 ${hitRate}% ，手动操作也只作用于当前选中市场。`;
         }
       }
 
@@ -510,11 +582,11 @@
       upEl.className = `v ${up === null ? "" : (up >= 0 ? "up" : "down")}`;
       tpEl.className = `v ${tp === null ? "" : (tp >= 0 ? "up" : "down")}`;
 
-      const liveTrades = Array.isArray(data.live_trades) ? data.live_trades : [];
-      const localHistory = Array.isArray(data.trade_history) ? data.trade_history : [];
-      const walletHistory = Array.isArray(data.wallet_history) ? data.wallet_history : [];
+      const liveTrades = filterRowsBySlug(Array.isArray(data.live_trades) ? data.live_trades : [], market.slug || "");
+      const localHistory = filterRowsBySlug(Array.isArray(data.trade_history) ? data.trade_history : [], market.slug || "");
+      const walletHistory = filterRowsBySlug(Array.isArray(data.wallet_history) ? data.wallet_history : [], market.slug || "");
       const historyRows = liveTrades.length ? liveTrades : (localHistory.length ? localHistory : walletHistory);
-      renderRoundResults(data.round_results, historyRows);
+      renderRoundResults(filterRowsBySlug(data.round_results, market.slug || ""), historyRows);
       if (!historyRows.length) {
         if (historySig !== "0") {
           renderHistory([]);
@@ -583,6 +655,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            market_key: selectedMarketKey || latestSnapshot.selected_market_key || "",
             action,
             outcome,
             amount,

@@ -126,7 +126,7 @@ type tradeForm struct {
 
 type model struct {
 	cfg     Config
-	svc     *service.PolymarketService
+	svc     service.PolymarketApp
 	updates <-chan entity.DashboardState
 
 	state     entity.DashboardState
@@ -146,7 +146,7 @@ type model struct {
 }
 
 // newModel 创建 TUI 视图模型，并预装当前快照避免首屏空白。
-func newModel(cfg Config, svc *service.PolymarketService, updates <-chan entity.DashboardState) model {
+func newModel(cfg Config, svc service.PolymarketApp, updates <-chan entity.DashboardState) model {
 	state := svc.Snapshot()
 	m := model{
 		cfg:     cfg,
@@ -206,6 +206,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.syncTradeForm(false)
 			m.now = time.Now()
 			m.setStatus("OK", "已刷新当前快照")
+			return m, nil
+		case "[":
+			if key := strings.TrimSpace(m.svc.SelectPrevMarket()); key != "" {
+				next := m.svc.Snapshot()
+				m.recordSnapshot(next)
+				m.state = next
+				m.syncTradeForm(false)
+				m.now = time.Now()
+				m.setStatus("OK", fmt.Sprintf("已切换市场: %s", marketDisplayLabel(next)))
+			}
+			return m, nil
+		case "]":
+			if key := strings.TrimSpace(m.svc.SelectNextMarket()); key != "" {
+				next := m.svc.Snapshot()
+				m.recordSnapshot(next)
+				m.state = next
+				m.syncTradeForm(false)
+				m.now = time.Now()
+				m.setStatus("OK", fmt.Sprintf("已切换市场: %s", marketDisplayLabel(next)))
+			}
 			return m, nil
 		case "esc":
 			m.confirm = confirmState{}
@@ -428,7 +448,7 @@ func (m model) armOrExecuteTradeSubmit() (model, tea.Cmd, bool) {
 }
 
 // executeActionCmd 在后台调用 service 层的快捷操作，并把结果回推给 TUI 主循环。
-func executeActionCmd(svc *service.PolymarketService, action string) tea.Cmd {
+func executeActionCmd(svc service.PolymarketApp, action string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), actionTimeout)
 		defer cancel()
@@ -483,7 +503,7 @@ func executeActionCmd(svc *service.PolymarketService, action string) tea.Cmd {
 }
 
 // executeManualOrderCmd 在后台提交一笔自定义手动单，并把结果回推给 TUI。
-func executeManualOrderCmd(svc *service.PolymarketService, req dto.ManualOrderReq) tea.Cmd {
+func executeManualOrderCmd(svc service.PolymarketApp, req dto.ManualOrderReq) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), actionTimeout)
 		defer cancel()
@@ -519,6 +539,7 @@ func (m *model) recordSnapshot(next entity.DashboardState) {
 	m.updateFlash("diff", m.state.Prices.Diff, next.Prices.Diff, now)
 	m.updateFlash("up", m.state.Prices.UpPrice, next.Prices.UpPrice, now)
 	m.updateFlash("down", m.state.Prices.DownPrice, next.Prices.DownPrice, now)
+	m.updateTrackedMarketFlashes(m.state.Markets, next.Markets, now)
 
 	m.series.chainlink = appendValue(m.series.chainlink, next.Prices.ChainlinkBTC, priceHistoryLimit)
 	m.series.binance = appendValue(m.series.binance, next.Prices.BinanceBTC, priceHistoryLimit)
@@ -526,6 +547,40 @@ func (m *model) recordSnapshot(next entity.DashboardState) {
 	m.series.diff = appendValue(m.series.diff, next.Prices.Diff, priceHistoryLimit)
 	m.series.up = appendValue(m.series.up, next.Prices.UpPrice, priceHistoryLimit)
 	m.series.down = appendValue(m.series.down, next.Prices.DownPrice, priceHistoryLimit)
+}
+
+// updateTrackedMarketFlashes 为 watchlist 中的每个市场分别记录涨跌方向，避免非焦点市场丢失高亮。
+func (m *model) updateTrackedMarketFlashes(prevItems, nextItems []entity.TrackedMarketView, changedAt time.Time) {
+	if len(nextItems) == 0 {
+		return
+	}
+
+	prevByKey := make(map[string]entity.TrackedMarketView, len(prevItems))
+	for _, item := range prevItems {
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			continue
+		}
+		prevByKey[key] = item
+	}
+
+	for _, item := range nextItems {
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			continue
+		}
+		prev, ok := prevByKey[key]
+		if !ok {
+			continue
+		}
+
+		m.updateFlash(trackedFlashKey(key, "chainlink"), prev.Prices.ChainlinkBTC, item.Prices.ChainlinkBTC, changedAt)
+		m.updateFlash(trackedFlashKey(key, "binance"), prev.Prices.BinanceBTC, item.Prices.BinanceBTC, changedAt)
+		m.updateFlash(trackedFlashKey(key, "ptb"), prev.Prices.PTB, item.Prices.PTB, changedAt)
+		m.updateFlash(trackedFlashKey(key, "diff"), prev.Prices.Diff, item.Prices.Diff, changedAt)
+		m.updateFlash(trackedFlashKey(key, "up"), prev.Prices.UpPrice, item.Prices.UpPrice, changedAt)
+		m.updateFlash(trackedFlashKey(key, "down"), prev.Prices.DownPrice, item.Prices.DownPrice, changedAt)
+	}
 }
 
 // updateFlash 对比前后两个价格，记录最近一次涨跌方向用于界面高亮。
@@ -718,6 +773,7 @@ func (m model) buildTradeFormReq() (dto.ManualOrderReq, string, error) {
 	}
 
 	req := dto.ManualOrderReq{
+		MarketKey:   m.state.SelectedMarketKey,
 		Action:      strings.ToUpper(strings.TrimSpace(m.trade.action)),
 		Outcome:     strings.ToUpper(strings.TrimSpace(m.trade.outcome)),
 		Amount:      amount,
@@ -736,21 +792,17 @@ func (m model) buildTradeFormReq() (dto.ManualOrderReq, string, error) {
 func (m model) renderHeader() string {
 	state := m.state
 	title := titleStyle.Render("Polymarket TUI")
-
-	lines := []string{
-		fmt.Sprintf("市场: %s", emptyFallback(state.Market.Slug, "-")),
-		fmt.Sprintf("状态: %s", emptyFallback(state.Market.Status, "waiting")),
-		fmt.Sprintf("剩余: %s", emptyFallback(state.Market.RemainingText, fmt.Sprintf("%ds", state.Market.Remaining))),
-		fmt.Sprintf("UP: %s", m.renderMetricValue("up", state.Prices.UpPrice)),
-		fmt.Sprintf("DOWN: %s", m.renderMetricValue("down", state.Prices.DownPrice)),
-		fmt.Sprintf("Chainlink: %s", m.renderMetricValue("chainlink", state.Prices.ChainlinkBTC)),
-		fmt.Sprintf("Binance: %s", m.renderMetricValue("binance", state.Prices.BinanceBTC)),
-		fmt.Sprintf("PTB: %s", m.renderMetricValue("ptb", state.Prices.PTB)),
-		fmt.Sprintf("Diff: %s", m.renderMetricValue("diff", state.Prices.Diff)),
-		fmt.Sprintf("更新时间: %s", emptyFallback(state.UpdatedAt, m.now.Format(time.RFC3339))),
+	marketCount := len(state.Markets)
+	if marketCount <= 0 {
+		marketCount = 1
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, mutedStyle.Render(strings.Join(lines, "    ")))
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		title,
+		mutedStyle.Render(fmt.Sprintf("并行监控: %d 个市场", marketCount)),
+		m.renderHeaderMarketRows(),
+	)
 }
 
 // renderTabs 渲染顶部 tab 栏，帮助单终端查看不同维度的数据。
@@ -792,14 +844,18 @@ func (m model) renderOverviewTab() string {
 		fmt.Sprintf("自动兑奖: %s", renderAutoRedeem(m.state.AutoRedeem)),
 	})
 
-	topRight := m.renderPanel("轮次结果", renderRoundResults(m.state.RoundResults, 6))
+	topRight := m.renderPanel("市场列表（并行监控，仅切换焦点）", m.renderTrackedMarketsLines())
+	diagnostics := m.renderWidePanel("自动交易诊断", m.renderAutoTradeDiagnosticsLines())
 	bottomLeft := m.renderPanel("价格趋势", m.renderPriceTrendLines())
-	bottomRight := m.renderPanel("最新日志", renderLogs(m.state.Activity, 8))
+	bottomRight := m.renderPanel("轮次结果", renderRoundResults(m.state.RoundResults, 6))
+	logs := m.renderWidePanel("最新日志", renderLogs(m.state.Activity, 8))
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		lipgloss.JoinHorizontal(lipgloss.Top, topLeft, topRight),
+		diagnostics,
 		lipgloss.JoinHorizontal(lipgloss.Top, bottomLeft, bottomRight),
+		logs,
 	)
 }
 
@@ -968,6 +1024,19 @@ func (m model) renderPanel(title string, lines []string) string {
 		Render(titleStyle.Render(title) + "\n" + body)
 }
 
+// renderWidePanel 渲染横跨整行的宽面板，适合展示诊断统计。
+func (m model) renderWidePanel(title string, lines []string) string {
+	body := "暂无数据"
+	if len(lines) > 0 {
+		body = strings.Join(lines, "\n")
+	}
+
+	width := maxInt(60, m.width-8)
+	return panelStyle.
+		Width(width).
+		Render(titleStyle.Render(title) + "\n" + body)
+}
+
 // renderPriceTrendLines 输出总览页的价格趋势行。
 func (m model) renderPriceTrendLines() []string {
 	return []string{
@@ -980,6 +1049,152 @@ func (m model) renderPriceTrendLines() []string {
 	}
 }
 
+// renderAutoTradeDiagnosticsLines 输出自动交易命中与未命中原因统计。
+func (m model) renderAutoTradeDiagnosticsLines() []string {
+	diag := m.state.AutoTrade
+	hitRate := 0.0
+	if diag.SampleCount > 0 {
+		hitRate = float64(diag.TriggerCount) / float64(diag.SampleCount) * 100
+	}
+
+	lines := []string{
+		fmt.Sprintf(
+			"市场=%s | 样本=%d | 命中=%d | 命中率=%.2f%% | 上次命中=%s",
+			emptyFallback(diag.MarketSlug, emptyFallback(m.state.Market.Slug, "-")),
+			diag.SampleCount,
+			diag.TriggerCount,
+			hitRate,
+			emptyFallback(diag.LastTriggerAt, "-"),
+		),
+		fmt.Sprintf(
+			"未命中分布: 无市场=%d 已收盘=%d 未到窗口=%d 参考价缺失=%d 盘口价缺失=%d",
+			diag.NoMarketCount,
+			diag.MarketClosedCount,
+			diag.TimeWindowMissCount,
+			diag.ReferenceMissingCount,
+			diag.OutcomePriceMissing,
+		),
+		fmt.Sprintf(
+			"未命中分布: 价差不足=%d 概率越界=%d 行情滞后=%d 状态阻塞=%d 重试上限=%d",
+			diag.DiffMissCount,
+			diag.ProbabilityMissCount,
+			diag.DataLagCount,
+			diag.BlockedByStateCount,
+			diag.RetryLimitCount,
+		),
+	}
+
+	if strings.TrimSpace(diag.LastReason) != "" {
+		lines = append(
+			lines,
+			fmt.Sprintf("最近原因: %s", compactDetail(diag.LastReason, 140)),
+			fmt.Sprintf("记录时间: %s", emptyFallback(diag.LastReasonAt, "-")),
+		)
+	}
+	return lines
+}
+
+// renderTrackedMarketsLines 输出多市场 watchlist 摘要，便于在单终端里快速切焦。
+func (m model) renderTrackedMarketsLines() []string {
+	if len(m.state.Markets) == 0 {
+		return []string{"暂无已配置市场"}
+	}
+
+	lines := make([]string, 0, len(m.state.Markets))
+	for _, item := range m.state.Markets {
+		focus := "  "
+		if item.Key == m.state.SelectedMarketKey {
+			focus = "▶ "
+		}
+		diff := m.renderTrackedMarketDiff(item)
+		up := m.renderTrackedMarketMetric(item, "up", item.Prices.UpPrice)
+		down := m.renderTrackedMarketMetric(item, "down", item.Prices.DownPrice)
+		stateText := emptyFallback(item.Market.RemainingText, item.Market.Status)
+		positionText := "-"
+		if item.Position != nil {
+			positionText = fmt.Sprintf("%s %.4f", emptyFallback(item.Position.Side, "-"), item.Position.Size)
+		}
+		line := fmt.Sprintf(
+			"%s%s | %s | UP=%s DOWN=%s Diff=%s | 持仓=%s",
+			focus,
+			emptyFallback(item.Label, item.Key),
+			stateText,
+			up,
+			down,
+			diff,
+			positionText,
+		)
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// renderHeaderMarketRows 以“一个市场一整行”的方式输出 header 顶部多市场摘要。
+func (m model) renderHeaderMarketRows() string {
+	if len(m.state.Markets) == 0 {
+		return m.renderHeaderFallbackRow()
+	}
+
+	lines := make([]string, 0, len(m.state.Markets))
+	for _, item := range m.state.Markets {
+		line := m.renderHeaderMarketRow(item)
+		lines = append(lines, line)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// renderHeaderFallbackRow 在没有 watchlist 时输出当前单市场的 header 行。
+func (m model) renderHeaderFallbackRow() string {
+	label := marketDisplayLabel(m.state)
+	if strings.TrimSpace(m.state.SelectedMarketKey) != "" {
+		label = "▶ " + label
+	}
+	return fmt.Sprintf(
+		"市场: %s | 状态: %s | 剩余: %s | UP: %s | DOWN: %s | Chainlink: %s | Binance: %s | PTB: %s | Diff: %s | 更新时间: %s",
+		label,
+		emptyFallback(m.state.Market.Status, "waiting"),
+		emptyFallback(m.state.Market.RemainingText, fmt.Sprintf("%ds", m.state.Market.Remaining)),
+		m.renderMetricValue("up", m.state.Prices.UpPrice),
+		m.renderMetricValue("down", m.state.Prices.DownPrice),
+		m.renderMetricValue("chainlink", m.state.Prices.ChainlinkBTC),
+		m.renderMetricValue("binance", m.state.Prices.BinanceBTC),
+		m.renderMetricValue("ptb", m.state.Prices.PTB),
+		m.renderMetricValue("diff", m.state.Prices.Diff),
+		emptyFallback(m.state.UpdatedAt, m.now.Format(time.RFC3339)),
+	)
+}
+
+// renderHeaderMarketRow 输出单个市场在 header 中的一整行摘要。
+func (m model) renderHeaderMarketRow(item entity.TrackedMarketView) string {
+	label := emptyFallback(item.Label, item.Key)
+	if item.Key == m.state.SelectedMarketKey {
+		label = "▶ " + label
+	}
+	return fmt.Sprintf(
+		"市场: %s | 状态: %s | 剩余: %s | UP: %s | DOWN: %s | Chainlink: %s | Binance: %s | PTB: %s | Diff: %s | 更新时间: %s",
+		label,
+		emptyFallback(item.Market.Status, "waiting"),
+		emptyFallback(item.Market.RemainingText, fmt.Sprintf("%ds", item.Market.Remaining)),
+		m.renderTrackedMarketMetric(item, "up", item.Prices.UpPrice),
+		m.renderTrackedMarketMetric(item, "down", item.Prices.DownPrice),
+		m.renderTrackedMarketMetric(item, "chainlink", item.Prices.ChainlinkBTC),
+		m.renderTrackedMarketMetric(item, "binance", item.Prices.BinanceBTC),
+		m.renderTrackedMarketMetric(item, "ptb", item.Prices.PTB),
+		m.renderTrackedMarketDiff(item),
+		emptyFallback(item.UpdatedAt, "-"),
+	)
+}
+
+// renderTrackedMarketMetric 为 header 中的单市场摘要渲染一个指标值。
+func (m model) renderTrackedMarketMetric(item entity.TrackedMarketView, flashKey string, value *float64) string {
+	return m.renderMetricValueWithKey(trackedFlashKey(item.Key, flashKey), value)
+}
+
+// renderTrackedMarketDiff 为 header 中的单市场卡片渲染带正负号的 diff。
+func (m model) renderTrackedMarketDiff(item entity.TrackedMarketView) string {
+	return m.renderSignedMetricValueWithKey(trackedFlashKey(item.Key, "diff"), item.Prices.Diff)
+}
+
 // renderTrendLine 为单个指标生成静态数值行，不再渲染横向趋势条。
 func (m model) renderTrendLine(label, flashKey string, current *float64) string {
 	value := m.renderMetricValue(flashKey, current)
@@ -988,6 +1203,11 @@ func (m model) renderTrendLine(label, flashKey string, current *float64) string 
 
 // renderMetricValue 根据最近涨跌方向给指标值加上颜色和方向提示。
 func (m model) renderMetricValue(key string, value *float64) string {
+	return m.renderMetricValueWithKey(key, value)
+}
+
+// renderMetricValueWithKey 使用指定的 flash key 渲染普通浮点指标值。
+func (m model) renderMetricValueWithKey(key string, value *float64) string {
 	base := formatFloatPtr(value)
 	marker, ok := m.flashes[key]
 	if !ok || time.Since(marker.changedAt) > flashTTL {
@@ -1002,6 +1222,29 @@ func (m model) renderMetricValue(key string, value *float64) string {
 	default:
 		return base
 	}
+}
+
+// renderSignedMetricValueWithKey 使用指定的 flash key 渲染带正负号的指标值。
+func (m model) renderSignedMetricValueWithKey(key string, value *float64) string {
+	base := formatSignedFloatPtr(value)
+	marker, ok := m.flashes[key]
+	if !ok || time.Since(marker.changedAt) > flashTTL {
+		return base
+	}
+
+	switch marker.direction {
+	case 1:
+		return okStyle.Render(base + " +")
+	case -1:
+		return errStyle.Render(base + " -")
+	default:
+		return base
+	}
+}
+
+// trackedFlashKey 为多市场指标生成独立的高亮键，避免不同市场互相串色。
+func trackedFlashKey(marketKey, metricKey string) string {
+	return "market:" + strings.TrimSpace(marketKey) + ":" + strings.TrimSpace(metricKey)
 }
 
 // renderPositionBalanceCheck 输出本地持仓与钱包同向持仓的对账结果。
@@ -1187,6 +1430,17 @@ func formatFloatPtr(v *float64) string {
 	return fmt.Sprintf("%.4f", *v)
 }
 
+// formatSignedFloatPtr 统一格式化带正负号的可空浮点数。
+func formatSignedFloatPtr(v *float64) string {
+	if v == nil {
+		return "-"
+	}
+	if *v >= 0 {
+		return fmt.Sprintf("+%.4f", *v)
+	}
+	return fmt.Sprintf("%.4f", *v)
+}
+
 // formatTradeAmount 统一格式化交易表单里的金额输入。
 func formatTradeAmount(v float64) string {
 	return fmt.Sprintf("%.2f", v)
@@ -1312,9 +1566,9 @@ func emptyFallback(value, fallback string) string {
 // footerHelpText 根据当前 tab 输出对应的快捷键说明。
 func (m model) footerHelpText() string {
 	if m.activeTab == tradeTabIndex {
-		return "快捷键: 1-5切页  tab/h/l切页  b买入  s卖出  o切方向  j/k聚焦  +/-调整  e编辑  enter提交  x重置  esc取消  q退出"
+		return "快捷键: 1-5切页  tab/h/l切页  [/ ]切市场  b买入  s卖出  o切方向  j/k聚焦  +/-调整  e编辑  enter提交  x重置  esc取消  q退出"
 	}
-	return "快捷键: 1-5切页  tab/h/l切页  r刷新  u买UP  d买DOWN  s卖当前持仓  c撤单  esc取消确认  q退出"
+	return "快捷键: 1-5切页  tab/h/l切页  [/ ]切市场  r刷新  u买UP  d买DOWN  s卖当前持仓  c撤单  esc取消确认  q退出"
 }
 
 // renderTradeModeLine 渲染动作和方向这类二选一模式的当前状态。
@@ -1350,6 +1604,19 @@ func renderTradeInputLine(label, value string, focused, editing bool, hint strin
 // tabTitles 返回 TUI 当前支持的所有页面标签。
 func tabTitles() []string {
 	return []string{"概览", "钱包", "历史", "日志", "交易"}
+}
+
+// marketDisplayLabel 返回当前焦点市场的人类可读标签。
+func marketDisplayLabel(state entity.DashboardState) string {
+	for _, item := range state.Markets {
+		if item.Key == state.SelectedMarketKey {
+			return emptyFallback(item.Label, item.Key)
+		}
+	}
+	if state.SelectedMarketKey != "" {
+		return state.SelectedMarketKey
+	}
+	return emptyFallback(state.Market.Slug, "-")
 }
 
 // nextTradeField 切到下一个可编辑字段。

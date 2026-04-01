@@ -13,8 +13,6 @@ import (
 	"go.uber.org/fx"
 
 	"goKit/internal/application/service"
-	infraMarketData "goKit/internal/infrastructure/marketdata"
-	"goKit/internal/infrastructure/persistence"
 	infraPolymarket "goKit/internal/infrastructure/polymarket"
 	httphandler "goKit/internal/interface/http/handler"
 	httpInterface "goKit/internal/interface/http/router"
@@ -36,8 +34,10 @@ type AppConfig struct {
 }
 
 func LoadConfig() (*AppConfig, error) {
-	// 统一从 configs 目录读取 Polymarket 环境变量，避免再依赖旧的 Python 项目目录。
-	_ = godotenv.Load(".env")
+	// 优先读取 configs/polymarket.env；如果不存在，再把根目录 .env 当作补充来源。
+	// 不能把两个路径一次性传给 godotenv.Load：
+	// 当前依赖会在第一个文件不存在时直接返回，后面的回退文件不会继续加载。
+	_ = loadEnvIfExists(".env")
 
 	v := viper.New()
 	v.SetConfigName("config")
@@ -98,6 +98,20 @@ func LoadConfig() (*AppConfig, error) {
 	return &cfg, nil
 }
 
+// loadEnvIfExists 在文件存在时才加载环境变量，避免缺失文件阻断回退链路。
+func loadEnvIfExists(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return godotenv.Load(path)
+}
+
 func main() {
 	fx.New(
 		fx.Provide(LoadConfig),
@@ -115,12 +129,8 @@ func main() {
 
 		kit.Module,
 
-		fx.Provide(persistence.NewPolymarketStateRepository),
-		fx.Provide(infraPolymarket.NewClient),
-		fx.Provide(func(client *infraPolymarket.Client) infraPolymarket.SDK { return client }),
-		fx.Provide(infraMarketData.NewClient),
-		fx.Provide(func(client *infraMarketData.Client) infraMarketData.FeedClient { return client }),
-		fx.Provide(service.NewPolymarketService),
+		fx.Provide(service.NewPolymarketManager),
+		fx.Provide(func(manager *service.PolymarketManager) service.PolymarketApp { return manager }),
 		fx.Invoke(service.RegisterPolymarketLifecycle),
 		fx.Provide(httphandler.NewPolymarketHandler),
 		fx.Provide(tuiInterface.NewProgram),

@@ -14,7 +14,7 @@ import (
 // Program 负责把 Polymarket 服务状态投影到终端界面。
 type Program struct {
 	cfg        Config
-	svc        *service.PolymarketService
+	svc        service.PolymarketApp
 	shutdowner fx.Shutdowner
 	logger     *slog.Logger
 
@@ -24,7 +24,7 @@ type Program struct {
 }
 
 // NewProgram 创建 TUI 运行器；实际是否启动由生命周期阶段决定。
-func NewProgram(cfg Config, svc *service.PolymarketService, shutdowner fx.Shutdowner, logger *slog.Logger) *Program {
+func NewProgram(cfg Config, svc service.PolymarketApp, shutdowner fx.Shutdowner, logger *slog.Logger) *Program {
 	return &Program{
 		cfg:        cfg,
 		svc:        svc,
