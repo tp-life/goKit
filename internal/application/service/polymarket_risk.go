@@ -12,13 +12,17 @@ import (
 
 // autoTradeRiskRequest 表示单市场 worker 在自动开仓前提交给全局风控层的一次检查请求。
 type autoTradeRiskRequest struct {
-	MarketSlug   string
-	MarketKey    string
-	Side         string
-	TradeAmount  float64
-	CurrentPrice float64
-	WindowSec    int
-	StrategyKey  string
+	MarketSlug       string
+	MarketKey        string
+	StrategyMode     string
+	Side             string
+	TradeAmount      float64
+	CurrentPrice     float64
+	WindowSec        int
+	StrategyKey      string
+	LossStreakLimit  int
+	DisableLookback  int
+	DisableMinProfit float64
 }
 
 type autoTradeRiskGuard func(req autoTradeRiskRequest) error
@@ -84,8 +88,14 @@ func (m *PolymarketManager) checkAutoTradeRisk(req autoTradeRiskRequest) error {
 		m.snapshot.GlobalRisk = m.buildGlobalRiskStatusLocked(reason, req.Side)
 		return errors.New(reason)
 	}
-	if m.cfg.AutoDisableNegative {
+	if m.cfg.AutoDisableNegative || req.DisableLookback > 0 {
 		if reason := m.negativeStrategyBlockReasonLocked(req); reason != "" {
+			m.snapshot.GlobalRisk = m.buildGlobalRiskStatusLocked(reason, req.Side)
+			return errors.New(reason)
+		}
+	}
+	if req.LossStreakLimit > 0 {
+		if reason := m.strategyLossStreakBlockReasonLocked(req); reason != "" {
 			m.snapshot.GlobalRisk = m.buildGlobalRiskStatusLocked(reason, req.Side)
 			return errors.New(reason)
 		}

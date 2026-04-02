@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,13 @@ type stubPolymarketSDK struct {
 
 type noopStateRepo struct{}
 
+type stubFeedClient struct {
+	getBinancePriceFn func(ctx context.Context) (float64, error)
+	subscribeBinance  func(ctx context.Context, onPrice func(float64)) error
+	getCryptoPriceFn  func(ctx context.Context, startTime, endTime string) (openPrice *float64, closePrice *float64, err error)
+	subscribeRTDSFn   func(ctx context.Context, onPrice func(float64)) error
+}
+
 // Load 为测试仓储返回空状态。
 func (noopStateRepo) Load(_ context.Context) (*entity.PolymarketState, error) {
 	return &entity.PolymarketState{}, nil
@@ -51,6 +59,34 @@ func (noopStateRepo) Save(_ context.Context, _ *entity.PolymarketState) error {
 }
 
 var _ repository.PolymarketStateRepository = noopStateRepo{}
+
+func (s *stubFeedClient) GetBinanceBTCPrice(ctx context.Context) (float64, error) {
+	if s.getBinancePriceFn != nil {
+		return s.getBinancePriceFn(ctx)
+	}
+	return 0, nil
+}
+
+func (s *stubFeedClient) SubscribeBinanceBTC(ctx context.Context, onPrice func(float64)) error {
+	if s.subscribeBinance != nil {
+		return s.subscribeBinance(ctx, onPrice)
+	}
+	return nil
+}
+
+func (s *stubFeedClient) GetCryptoPrice(ctx context.Context, startTime, endTime string) (openPrice *float64, closePrice *float64, err error) {
+	if s.getCryptoPriceFn != nil {
+		return s.getCryptoPriceFn(ctx, startTime, endTime)
+	}
+	return nil, nil, nil
+}
+
+func (s *stubFeedClient) SubscribeRTDS(ctx context.Context, onPrice func(float64)) error {
+	if s.subscribeRTDSFn != nil {
+		return s.subscribeRTDSFn(ctx, onPrice)
+	}
+	return nil
+}
 
 // CreateOrDeriveAPIKey 为测试桩提供空实现。
 func (s *stubPolymarketSDK) CreateOrDeriveAPIKey(_ context.Context, _ int) (*polymarket.APIKeyCreds, error) {
@@ -255,6 +291,202 @@ func TestHistoryFallsBackToLocalAndWalletHistory(t *testing.T) {
 	}
 	if items[0].Slug != "local-history" || items[1].Slug != "wallet-history" {
 		t.Fatalf("unexpected history order: %+v", items)
+	}
+}
+
+func TestRefreshPTBSeparatesStrategyTargetAndDisplayPrice(t *testing.T) {
+	openPrice := 66576.25
+	closePrice := 66318.34
+	callCount := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			PriceRefreshSec: 1,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:  "btc-updown-5m",
+			Start: time.Now().Add(-1 * time.Minute).Format(time.RFC3339),
+			End:   time.Now().Add(4 * time.Minute).Format(time.RFC3339),
+		},
+		feeds: &stubFeedClient{
+			getCryptoPriceFn: func(_ context.Context, startTime, endTime string) (openPricePtr *float64, closePricePtr *float64, err error) {
+				callCount++
+				if startTime == "" || endTime == "" {
+					t.Fatalf("expected market window to be forwarded to PTB endpoint")
+				}
+				return &openPrice, &closePrice, nil
+			},
+		},
+	}
+
+	svc.refreshPTBIfNeeded(context.Background())
+	if got := derefFloat(svc.price.ptb); math.Abs(got-openPrice) > 1e-9 {
+		t.Fatalf("expected strategy PTB target to use open price %.2f, got %.2f", openPrice, got)
+	}
+	if got := derefFloat(svc.price.ptbDisplay); math.Abs(got-closePrice) > 1e-9 {
+		t.Fatalf("expected display PTB to use close price %.2f, got %.2f", closePrice, got)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected first refresh call count 1, got %d", callCount)
+	}
+
+	svc.refreshPTBIfNeeded(context.Background())
+	if callCount != 1 {
+		t.Fatalf("expected same market to reuse fixed PTB without refetch, got %d calls", callCount)
+	}
+}
+
+func TestRefreshPTBRefreshesDisplayPriceWhileKeepingStrategyTarget(t *testing.T) {
+	openPrice := 66576.25
+	closePrice1 := 66318.34
+	closePrice2 := 66843.00
+	callCount := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			PriceRefreshSec: 1,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:  "btc-updown-5m",
+			Start: time.Now().Add(-1 * time.Minute).Format(time.RFC3339),
+			End:   time.Now().Add(4 * time.Minute).Format(time.RFC3339),
+		},
+		feeds: &stubFeedClient{
+			getCryptoPriceFn: func(_ context.Context, _, _ string) (openPricePtr *float64, closePricePtr *float64, err error) {
+				callCount++
+				if callCount == 1 {
+					return &openPrice, &closePrice1, nil
+				}
+				return &openPrice, &closePrice2, nil
+			},
+		},
+	}
+
+	svc.refreshPTBIfNeeded(context.Background())
+	if got := derefFloat(svc.price.ptb); math.Abs(got-openPrice) > 1e-9 {
+		t.Fatalf("expected fixed strategy target %.2f, got %.2f", openPrice, got)
+	}
+	if got := derefFloat(svc.price.ptbDisplay); math.Abs(got-closePrice1) > 1e-9 {
+		t.Fatalf("expected first display PTB %.2f, got %.2f", closePrice1, got)
+	}
+
+	svc.price.ptbDisplayUpdateTS = time.Now().Add(-2 * time.Second)
+	svc.refreshPTBIfNeeded(context.Background())
+	if got := derefFloat(svc.price.ptb); math.Abs(got-openPrice) > 1e-9 {
+		t.Fatalf("expected strategy target to remain %.2f, got %.2f", openPrice, got)
+	}
+	if got := derefFloat(svc.price.ptbDisplay); math.Abs(got-closePrice2) > 1e-9 {
+		t.Fatalf("expected refreshed display PTB %.2f, got %.2f", closePrice2, got)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected display refresh to refetch once, got %d calls", callCount)
+	}
+}
+
+func TestPrewarmNextPTBPreloadsUpcomingWindow(t *testing.T) {
+	openPrice := 66800.10
+	closePrice := 66843.00
+	callCount := 0
+	now := time.Now().UTC()
+	currentStart := now.Add(-4 * time.Minute).Truncate(time.Second)
+	currentEnd := now.Add(45 * time.Second).Truncate(time.Second)
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			PriceRefreshSec:    1,
+			MarketSymbol:       "BTC",
+			MarketIntervalSec:  300,
+			MarketSlugPrefix:   "btc-updown",
+			MarketSlugInterval: "5m",
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:  "btc-updown-5m-current",
+			Start: currentStart.Format(time.RFC3339),
+			End:   currentEnd.Format(time.RFC3339),
+		},
+		feeds: &stubFeedClient{
+			getCryptoPriceFn: func(_ context.Context, startTime, endTime string) (openPricePtr *float64, closePricePtr *float64, err error) {
+				callCount++
+				expectedStart := currentEnd.Format(time.RFC3339)
+				expectedEnd := currentEnd.Add(5 * time.Minute).Format(time.RFC3339)
+				if startTime != expectedStart || endTime != expectedEnd {
+					t.Fatalf("expected prewarm window %s -> %s, got %s -> %s", expectedStart, expectedEnd, startTime, endTime)
+				}
+				return &openPrice, &closePrice, nil
+			},
+		},
+	}
+
+	svc.prewarmNextPTBIfNeeded(context.Background())
+	if callCount != 1 {
+		t.Fatalf("expected prewarm to fetch once, got %d", callCount)
+	}
+	expectedSlug := "btc-updown-5m-" + strconv.FormatInt(currentEnd.Unix(), 10)
+	if svc.nextPTB.slug != expectedSlug {
+		t.Fatalf("expected cached next slug %s, got %s", expectedSlug, svc.nextPTB.slug)
+	}
+	if got := derefFloat(svc.nextPTB.target); math.Abs(got-openPrice) > 1e-9 {
+		t.Fatalf("expected cached target %.2f, got %.2f", openPrice, got)
+	}
+	if got := derefFloat(svc.nextPTB.display); math.Abs(got-closePrice) > 1e-9 {
+		t.Fatalf("expected cached display %.2f, got %.2f", closePrice, got)
+	}
+}
+
+func TestUpdateActiveMarketUsesPrewarmedPTBImmediately(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	currentEnd := now.Add(30 * time.Second)
+	nextSlug := "btc-updown-5m-" + strconv.FormatInt(currentEnd.Unix(), 10)
+	target := 66800.10
+	display := 66843.00
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			MarketSymbol:       "BTC",
+			MarketIntervalSec:  300,
+			MarketSlugPrefix:   "btc-updown",
+			MarketSlugInterval: "5m",
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:  "btc-updown-5m-current",
+			Start: now.Add(-4 * time.Minute).Format(time.RFC3339),
+			End:   currentEnd.Format(time.RFC3339),
+		},
+	}
+	svc.nextPTB.slug = nextSlug
+	svc.nextPTB.target = &target
+	svc.nextPTB.display = &display
+	svc.nextPTB.fetchedAt = time.Now()
+
+	nextMarket := &entity.ActiveMarket{
+		Slug:  nextSlug,
+		Start: currentEnd.Format(time.RFC3339),
+		End:   currentEnd.Add(5 * time.Minute).Format(time.RFC3339),
+	}
+
+	svc.updateActiveMarket(context.Background(), nextMarket)
+	if got := derefFloat(svc.price.ptb); math.Abs(got-target) > 1e-9 {
+		t.Fatalf("expected immediate strategy PTB %.2f after switch, got %.2f", target, got)
+	}
+	if got := derefFloat(svc.price.ptbDisplay); math.Abs(got-display) > 1e-9 {
+		t.Fatalf("expected immediate display PTB %.2f after switch, got %.2f", display, got)
 	}
 }
 
@@ -1054,6 +1286,142 @@ func TestBuildAutoBuyDecisionPrefersPostOnlyMakerOnFirstAttempt(t *testing.T) {
 	}
 }
 
+func TestBuildAutoBuyDecisionRespectsMainStrategyDisabled(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.86
+	upBid := 0.84
+	upDisplay := 0.85
+	downAsk := 0.14
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:              true,
+			MainStrategyEnabled:    false,
+			MainStrategyConfigured: true,
+			TradeAmount:            5,
+			MarketDataMaxLagSec:    5,
+			PreferPostOnly:         true,
+			PostOnlyTTLSec:         2,
+			MinNetEdgeBps:          0,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		client:      &stubPolymarketSDK{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+			UpPrice: &upDisplay,
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.upBid = &upBid
+	svc.price.upPrice = &upDisplay
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+
+	svc.mu.Lock()
+	decision := svc.buildAutoBuyDecisionLocked()
+	svc.mu.Unlock()
+
+	if decision.ok {
+		t.Fatalf("expected main strategy disabled worker to reject auto buy, got %+v", decision)
+	}
+	if !strings.Contains(decision.reason, "主策略已关闭") {
+		t.Fatalf("expected disabled reason to mention main strategy shutdown, got %+v", decision)
+	}
+}
+
+func TestUpdateActiveMarketIgnoresLateTicksFromPreviousRound(t *testing.T) {
+	callbacks := map[string]func(assetID string, bid, ask, mid float64){}
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			MainStrategyEnabled: true,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		client: &stubPolymarketSDK{
+			subscribeMarketFn: func(_ context.Context, upToken, downToken string, onUpdate func(assetID string, bid, ask, mid float64)) error {
+				callbacks[upToken] = onUpdate
+				return nil
+			},
+		},
+	}
+
+	first := &entity.ActiveMarket{
+		Slug:      "btc-updown-5m-old",
+		Start:     time.Now().Add(-2 * time.Minute).Format(time.RFC3339),
+		End:       time.Now().Add(2 * time.Minute).Format(time.RFC3339),
+		UpToken:   "old-up-token",
+		DownToken: "old-down-token",
+	}
+	second := &entity.ActiveMarket{
+		Slug:      "btc-updown-5m-new",
+		Start:     time.Now().Add(-10 * time.Second).Format(time.RFC3339),
+		End:       time.Now().Add(4 * time.Minute).Format(time.RFC3339),
+		UpToken:   "new-up-token",
+		DownToken: "new-down-token",
+	}
+
+	svc.updateActiveMarket(context.Background(), first)
+	svc.updateActiveMarket(context.Background(), second)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for len(callbacks) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(callbacks) != 2 {
+		t.Fatalf("expected two subscription callbacks, got %d", len(callbacks))
+	}
+
+	// 先喂给新市场一笔真实盘口。
+	newCallback, ok := callbacks["new-up-token"]
+	if !ok {
+		t.Fatalf("expected callback for new-up-token, got %+v", callbacks)
+	}
+	newCallback("new-up-token", 0.52, 0.53, 0.525)
+	svc.mu.RLock()
+	if got := derefFloat(svc.price.upPrice); math.Abs(got-0.525) > 1e-9 {
+		svc.mu.RUnlock()
+		t.Fatalf("expected new market price to be applied first, got %.4f", got)
+	}
+	svc.mu.RUnlock()
+
+	// 再模拟旧市场 websocket 晚到一笔极端价格，确认不会污染当前轮次。
+	oldCallback, ok := callbacks["old-up-token"]
+	if !ok {
+		t.Fatalf("expected callback for old-up-token, got %+v", callbacks)
+	}
+	oldCallback("old-up-token", 0.96, 0.97, 0.965)
+	svc.mu.RLock()
+	got := derefFloat(svc.price.upPrice)
+	activeSlug := ""
+	if svc.activeMarket != nil {
+		activeSlug = svc.activeMarket.Slug
+	}
+	svc.mu.RUnlock()
+
+	if activeSlug != second.Slug {
+		t.Fatalf("expected active market to stay on second round, got %s", activeSlug)
+	}
+	if math.Abs(got-0.525) > 1e-9 {
+		t.Fatalf("expected stale callback to be ignored, got up price %.4f", got)
+	}
+}
+
 func TestEvaluateAutoTradeFallsBackWhenPostOnlyCrossesBook(t *testing.T) {
 	referencePrice := 100.0
 	ptb := 99.4
@@ -1140,6 +1508,345 @@ func TestEvaluateAutoTradeFallsBackWhenPostOnlyCrossesBook(t *testing.T) {
 	}
 	if !foundWarn {
 		t.Fatalf("expected fallback warning activity, got %+v", svc.dashboard.Activity)
+	}
+}
+
+func TestProcessPendingBuyFallsBackAfterMakerTimeout(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	binancePrice := 99.5
+	upAsk := 0.85
+	upBid := 0.849
+	upDisplay := 0.8495
+	downAsk := 0.15
+	cancelCount := 0
+	placeCount := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			OrderTimeoutSec:     1,
+			MarketDataMaxLagSec: 5,
+			MinNetEdgeBps:       0,
+			SlippageThreshold:   0.02,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:      "btc-updown-15m",
+			End:       time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken:   "up-token-1",
+			DownToken: "down-token-1",
+			UpPrice:   &upDisplay,
+		},
+		client: &stubPolymarketSDK{
+			getOrderStatusFn: func(_ context.Context, orderID string) (*polymarket.OrderStatus, error) {
+				if orderID != "maker-order-1" {
+					t.Fatalf("unexpected order status query: %s", orderID)
+				}
+				return &polymarket.OrderStatus{
+					Status:       "LIVE",
+					OriginalSize: 5 / upBid,
+					SizeMatched:  0,
+					Filled:       false,
+				}, nil
+			},
+			cancelOrderFn: func(_ context.Context, orderID string) error {
+				cancelCount++
+				if orderID != "maker-order-1" {
+					t.Fatalf("unexpected cancel order id: %s", orderID)
+				}
+				return nil
+			},
+			placeLimitOrderWithOpts: func(_ context.Context, tokenID string, action string, price float64, sizeShares float64, opts polymarket.PlaceOrderOptions) (string, float64, error) {
+				placeCount++
+				if tokenID != "up-token-1" || action != "BUY" {
+					t.Fatalf("unexpected fallback order payload: token=%s action=%s", tokenID, action)
+				}
+				if math.Abs(price-upAsk) > 1e-9 {
+					t.Fatalf("expected timeout fallback price %.4f, got %.4f", upAsk, price)
+				}
+				if opts.PostOnly || opts.OrderType != "GTC" {
+					t.Fatalf("expected timeout fallback to use plain GTC, got %+v", opts)
+				}
+				return "fallback-timeout-1", sizeShares, nil
+			},
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.binance = &binancePrice
+	svc.price.upAsk = &upAsk
+	svc.price.upBid = &upBid
+	svc.price.upPrice = &upDisplay
+	svc.price.downAsk = &downAsk
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.price.downUpdateTS = time.Now()
+	svc.state.PendingOrder = &entity.PendingOrder{
+		OrderID:     "maker-order-1",
+		Time:        time.Now().Add(-10 * time.Second).Format(time.RFC3339),
+		Slug:        "btc-updown-15m",
+		Side:        "UP",
+		Action:      "BUY",
+		Reason:      "条件1: 剩余≤120s 且价差满足阈值(20.00 bps)",
+		Price:       upBid,
+		Size:        5 / upBid,
+		Amount:      5,
+		WindowSec:   120,
+		StrategyKey: "BTC_15M|slot-1|120s|UP",
+		Execution:   "maker_gtd",
+		PostOnly:    true,
+	}
+	svc.state.LastOrder = &entity.LastOrder{
+		Key:        "btc-updown-15m|slot-1|UP",
+		Time:       time.Now().Add(-10 * time.Second).Format(time.RFC3339),
+		RetryCount: 1,
+		LastPrice:  upBid,
+	}
+
+	svc.processPendingBuy(context.Background())
+
+	if cancelCount != 1 {
+		t.Fatalf("expected exactly one cancel before timeout fallback, got %d", cancelCount)
+	}
+	if placeCount != 1 {
+		t.Fatalf("expected exactly one timeout fallback submission, got %d", placeCount)
+	}
+	if svc.state.PendingOrder == nil {
+		t.Fatalf("expected fallback order to become new pending order")
+	}
+	if svc.state.PendingOrder.OrderID != "fallback-timeout-1" {
+		t.Fatalf("unexpected fallback order id: %+v", svc.state.PendingOrder)
+	}
+	if svc.state.PendingOrder.Execution != "maker_timeout_fallback" || svc.state.PendingOrder.PostOnly {
+		t.Fatalf("expected timeout fallback execution to be recorded, got %+v", svc.state.PendingOrder)
+	}
+}
+
+func TestProcessPendingBuyPreservesPartialFill(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.4
+	upAsk := 0.85
+	upBid := 0.84
+	upDisplay := 0.845
+	cancelCount := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:           true,
+			TradeAmount:         5,
+			OrderTimeoutSec:     1,
+			MarketDataMaxLagSec: 5,
+			MinNetEdgeBps:       0,
+			SlippageThreshold:   0.02,
+			Conditions: []polymarket.ConditionConfig{
+				{Slot: 1, Time: 120, DiffBps: 20, MinProb: 0.80, MaxProb: 0.95},
+			},
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:      "btc-updown-15m",
+			End:       time.Now().Add(30 * time.Second).Format(time.RFC3339),
+			UpToken:   "up-token-1",
+			DownToken: "down-token-1",
+			UpPrice:   &upDisplay,
+		},
+		client: &stubPolymarketSDK{
+			getOrderStatusFn: func(_ context.Context, orderID string) (*polymarket.OrderStatus, error) {
+				if orderID != "maker-order-partial" {
+					t.Fatalf("unexpected order status query: %s", orderID)
+				}
+				return &polymarket.OrderStatus{
+					Status:       "LIVE",
+					OriginalSize: 5 / upBid,
+					SizeMatched:  2.5,
+					Filled:       false,
+				}, nil
+			},
+			cancelOrderFn: func(_ context.Context, orderID string) error {
+				cancelCount++
+				if orderID != "maker-order-partial" {
+					t.Fatalf("unexpected cancel order id: %s", orderID)
+				}
+				return nil
+			},
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.upAsk = &upAsk
+	svc.price.upBid = &upBid
+	svc.price.upPrice = &upDisplay
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.upUpdateTS = time.Now()
+	svc.state.PendingOrder = &entity.PendingOrder{
+		OrderID:     "maker-order-partial",
+		Time:        time.Now().Add(-10 * time.Second).Format(time.RFC3339),
+		Slug:        "btc-updown-15m",
+		Side:        "UP",
+		Action:      "BUY",
+		Reason:      "条件1: 剩余≤120s 且价差满足阈值(20.00 bps)",
+		Price:       upBid,
+		Size:        5 / upBid,
+		Amount:      5,
+		WindowSec:   120,
+		StrategyKey: "BTC_15M|slot-1|120s|UP",
+		Execution:   "maker_gtd",
+		PostOnly:    true,
+	}
+
+	svc.processPendingBuy(context.Background())
+
+	if cancelCount != 1 {
+		t.Fatalf("expected partial fill path to cancel the remaining maker order, got %d", cancelCount)
+	}
+	if svc.state.PendingOrder != nil {
+		t.Fatalf("expected pending order to be cleared after partial fill, got %+v", svc.state.PendingOrder)
+	}
+	if svc.state.Position == nil {
+		t.Fatalf("expected partial fill to produce a local position")
+	}
+	if math.Abs(svc.state.Position.Size-2.5) > 1e-9 {
+		t.Fatalf("unexpected partial fill size: %+v", svc.state.Position)
+	}
+	if len(svc.state.TradeHistory) == 0 || svc.state.TradeHistory[len(svc.state.TradeHistory)-1].Status != "partial_filled" {
+		t.Fatalf("expected partial fill history to be recorded, got %+v", svc.state.TradeHistory)
+	}
+}
+
+func TestEvaluateTailSweepSubmitsIndependentTailOrder(t *testing.T) {
+	referencePrice := 100.0
+	ptb := 99.7
+	binancePrice := 99.82
+	upAsk := 0.85
+	upBid := 0.849
+	callCount := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:               true,
+			TradeAmount:             5,
+			TailSweepEnabled:        true,
+			TailSweepAllowed:        true,
+			TailSweepFinalSec:       20,
+			TailSweepMinDiffBps:     9,
+			TailSweepMinProb:        0.84,
+			TailSweepMaxProb:        0.94,
+			TailSweepMaxPrice:       0.94,
+			TailSweepRequireBinance: true,
+			TailSweepMaxLagSec:      1.0,
+			TailSweepMaxSpread:      0.02,
+			TailSweepSizeRatio:      0.4,
+			MinNetEdgeBps:           0,
+			BinanceConfirmMinBps:    1.5,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			End:     time.Now().Add(15 * time.Second).Format(time.RFC3339),
+			UpToken: "up-token-1",
+		},
+		client: &stubPolymarketSDK{
+			placeLimitOrderWithOpts: func(_ context.Context, tokenID string, action string, price float64, sizeShares float64, opts polymarket.PlaceOrderOptions) (string, float64, error) {
+				callCount++
+				if tokenID != "up-token-1" || action != "BUY" {
+					t.Fatalf("unexpected tail sweep payload: token=%s action=%s", tokenID, action)
+				}
+				if opts.PostOnly || opts.OrderType != "GTC" {
+					t.Fatalf("expected tail sweep to use plain GTC, got %+v", opts)
+				}
+				if math.Abs(price-upAsk) > 1e-9 {
+					t.Fatalf("expected tail sweep price %.4f, got %.4f", upAsk, price)
+				}
+				if math.Abs(sizeShares-5) > 1e-9 {
+					t.Fatalf("expected tail sweep size 5 shares, got %.4f", sizeShares)
+				}
+				return "tail-order-1", sizeShares, nil
+			},
+		},
+	}
+	svc.price.btc = &referencePrice
+	svc.price.ptb = &ptb
+	svc.price.binance = &binancePrice
+	svc.price.upAsk = &upAsk
+	svc.price.upBid = &upBid
+	svc.price.upUpdateTS = time.Now()
+	svc.price.btcUpdateTS = time.Now()
+	svc.price.binanceUpdateTS = time.Now()
+
+	svc.evaluateTailSweep(context.Background())
+
+	if callCount != 1 {
+		t.Fatalf("expected one tail sweep order attempt, got %d", callCount)
+	}
+	if svc.state.PendingOrder == nil {
+		t.Fatalf("expected tail sweep pending order to be recorded")
+	}
+	if !strings.Contains(svc.state.PendingOrder.StrategyKey, "|tail-sweep|") {
+		t.Fatalf("expected tail sweep strategy key, got %+v", svc.state.PendingOrder)
+	}
+	if svc.state.PendingOrder.Execution != "tail_sweep_limit" {
+		t.Fatalf("expected tail sweep execution marker, got %+v", svc.state.PendingOrder)
+	}
+}
+
+func TestManagePositionSkipsTailSweepWhenConfiguredToHoldSettlement(t *testing.T) {
+	currentProb := 0.69
+	bestBid := 0.68
+	placeCalls := 0
+
+	svc := &PolymarketService{
+		cfg: polymarket.Config{
+			AutoTrade:                 true,
+			StopLossProbPct:           0.12,
+			TailSweepHoldToSettlement: true,
+		},
+		repo:        noopStateRepo{},
+		logger:      discardLogger(),
+		dashboard:   entity.NewDashboardState(),
+		subscribers: map[int]chan entity.DashboardState{},
+		activeMarket: &entity.ActiveMarket{
+			Slug:    "btc-updown-15m",
+			UpToken: "up-token-1",
+		},
+		client: &stubPolymarketSDK{
+			placeLimitOrderFn: func(_ context.Context, _ string, _ string, _ float64, _ float64) (string, float64, error) {
+				placeCalls++
+				return "unexpected-tail-exit", 0, nil
+			},
+		},
+		state: entity.PolymarketState{
+			Position: &entity.Position{
+				Slug:        "btc-updown-15m",
+				Side:        "UP",
+				EntryPrice:  0.80,
+				Size:        5,
+				Amount:      4.25,
+				WindowSec:   20,
+				StrategyKey: "btc-15m|tail-sweep|20s|UP",
+			},
+		},
+	}
+	svc.price.upPrice = &currentProb
+	svc.price.upBid = &bestBid
+
+	svc.managePosition(context.Background())
+
+	if placeCalls != 0 {
+		t.Fatalf("expected tail sweep position to skip normal exits, got %d sell attempts", placeCalls)
 	}
 }
 

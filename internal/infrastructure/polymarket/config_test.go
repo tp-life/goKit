@@ -65,6 +65,16 @@ func TestCloneForTargetDerivesBinanceWSURL(t *testing.T) {
 	}
 }
 
+// TestDefaultCryptoPriceVariantByInterval 确认 5 分钟和 15 分钟市场都显式使用官网对应的 PTB 变体名。
+func TestDefaultCryptoPriceVariantByInterval(t *testing.T) {
+	if got := defaultCryptoPriceVariant(300); got != "fiveminute" {
+		t.Fatalf("expected 300s crypto-price variant fiveminute, got %q", got)
+	}
+	if got := defaultCryptoPriceVariant(900); got != "fifteen" {
+		t.Fatalf("expected 900s crypto-price variant fifteen, got %q", got)
+	}
+}
+
 // TestCloneForTargetAppliesMarketOverrides 确认单市场 worker 能按 watchlist 键名读取独立策略覆盖。
 func TestCloneForTargetAppliesMarketOverrides(t *testing.T) {
 	t.Setenv("MARKET_ETH_15M_TRADE_AMOUNT", "3")
@@ -106,5 +116,121 @@ func TestCloneForTargetAppliesMarketOverrides(t *testing.T) {
 	}
 	if child.Conditions[2].Time != 0 {
 		t.Fatalf("expected condition 3 to be disabled, got %+v", child.Conditions[2])
+	}
+}
+
+// TestCloneForTargetResolvesTailSweepAllowance 确认尾盘扫尾巴策略可按市场白名单启用到单市场 worker。
+func TestCloneForTargetResolvesTailSweepAllowance(t *testing.T) {
+	cfg := Config{
+		TailSweepEnabled: true,
+		TailSweepTargets: []MarketTargetConfig{
+			{Key: "btc-15m", Label: "BTC 15m", Symbol: "BTC", IntervalSec: 900},
+		},
+	}
+
+	btcChild := cfg.CloneForTarget(MarketTargetConfig{
+		Key:         "btc-15m",
+		Label:       "BTC 15m",
+		Symbol:      "BTC",
+		IntervalSec: 900,
+	}, 0, true)
+	if !btcChild.TailSweepAllowed {
+		t.Fatalf("expected BTC worker to allow tail sweep")
+	}
+
+	ethChild := cfg.CloneForTarget(MarketTargetConfig{
+		Key:         "eth-15m",
+		Label:       "ETH 15m",
+		Symbol:      "ETH",
+		IntervalSec: 900,
+	}, 1, false)
+	if ethChild.TailSweepAllowed {
+		t.Fatalf("expected ETH worker to reject tail sweep")
+	}
+}
+
+// TestResolvedMarketTargetsMergesTailSweepTargets 确认尾盘白名单市场会自动并入实际 watchlist，便于展示价格与切换焦点。
+func TestResolvedMarketTargetsMergesTailSweepTargets(t *testing.T) {
+	cfg := Config{
+		MarketSymbol:      "BTC",
+		MarketIntervalSec: 900,
+		MarketTargets: []MarketTargetConfig{
+			{Key: "btc-15m", Label: "BTC 15m", Symbol: "BTC", IntervalSec: 900},
+		},
+		TailSweepTargets: []MarketTargetConfig{
+			{Key: "eth-15m", Label: "ETH 15m", Symbol: "ETH", IntervalSec: 900},
+			{Key: "btc-15m", Label: "BTC 15m", Symbol: "BTC", IntervalSec: 900},
+		},
+	}
+
+	targets := cfg.ResolvedMarketTargets()
+	if len(targets) != 2 {
+		t.Fatalf("expected merged watchlist to contain 2 unique targets, got %d: %+v", len(targets), targets)
+	}
+	if targets[0].Key != "btc-15m" || targets[1].Key != "eth-15m" {
+		t.Fatalf("unexpected merged watchlist order: %+v", targets)
+	}
+}
+
+// TestResolvedMarketTargetsSupportsTailSweepOnlyWatchlist 确认只配置尾盘市场时，也会启动对应 worker 并展示价格。
+func TestResolvedMarketTargetsSupportsTailSweepOnlyWatchlist(t *testing.T) {
+	cfg := Config{
+		MarketSymbol:      "BTC",
+		MarketIntervalSec: 900,
+		TailSweepTargets: []MarketTargetConfig{
+			{Key: "sol-5m", Label: "SOL 5m", Symbol: "SOL", IntervalSec: 300},
+		},
+	}
+
+	targets := cfg.ResolvedMarketTargets()
+	if len(targets) != 1 {
+		t.Fatalf("expected tail sweep only config to produce one watchlist target, got %d: %+v", len(targets), targets)
+	}
+	if targets[0].Key != "sol-5m" || targets[0].Symbol != "SOL" || targets[0].IntervalSec != 300 {
+		t.Fatalf("unexpected tail sweep only target: %+v", targets[0])
+	}
+}
+
+// TestCloneForTargetCanDisableMainStrategy 确认某个市场可以只保留尾盘/价格观察，而不参与主策略。
+func TestCloneForTargetCanDisableMainStrategy(t *testing.T) {
+	t.Setenv("MARKET_SOL_5M_MAIN_STRATEGY_ENABLED", "false")
+
+	cfg := Config{
+		MainStrategyEnabled: true,
+	}
+
+	child := cfg.CloneForTarget(MarketTargetConfig{
+		Key:         "sol-5m",
+		Label:       "SOL 5m",
+		Symbol:      "SOL",
+		IntervalSec: 300,
+	}, 1, false)
+
+	if child.MainStrategyEnabled {
+		t.Fatalf("expected SOL 5m child to disable main strategy")
+	}
+}
+
+// TestCloneForTargetDisablesMainStrategyForTailOnlyMarket 确认仅存在于尾盘白名单的市场默认不跑主策略。
+func TestCloneForTargetDisablesMainStrategyForTailOnlyMarket(t *testing.T) {
+	cfg := Config{
+		MainStrategyEnabled: true,
+		MarketTargets: []MarketTargetConfig{
+			{Key: "btc-15m", Label: "BTC 15m", Symbol: "BTC", IntervalSec: 900},
+		},
+		TailSweepTargets: []MarketTargetConfig{
+			{Key: "eth-5m", Label: "ETH 5m", Symbol: "ETH", IntervalSec: 300},
+		},
+	}
+
+	child := cfg.CloneForTarget(MarketTargetConfig{
+		Key:         "eth-5m",
+		Label:       "ETH 5m",
+		Symbol:      "ETH",
+		IntervalSec: 300,
+	}, 1, false)
+
+	if child.MainStrategyEnabled {
+		t.Fatalf("expected tail-only market to disable main strategy by default")
 	}
 }

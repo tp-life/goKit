@@ -71,6 +71,7 @@ type PolymarketState struct {
 	LastRedeemAt    string             `json:"last_redeem_at,omitempty"`
 	TradeHistory    []TradeHistoryItem `json:"trade_history,omitempty"`
 	PTB             *float64           `json:"ptb,omitempty"`
+	PTBTarget       *float64           `json:"ptb_target,omitempty"`
 	Chainlink       *float64           `json:"chainlink,omitempty"`
 	Binance         *float64           `json:"binance,omitempty"`
 	UpPrice         *float64           `json:"up_price,omitempty"`
@@ -110,6 +111,7 @@ type DashboardMarket struct {
 // DashboardPrices 表示 dashboard 上展示的一组实时价格。
 type DashboardPrices struct {
 	PTB          *float64 `json:"ptb,omitempty"`
+	TargetPrice  *float64 `json:"target_price,omitempty"`
 	ChainlinkBTC *float64 `json:"chainlink_btc,omitempty"`
 	BinanceBTC   *float64 `json:"binance_btc,omitempty"`
 	UpPrice      *float64 `json:"up_price,omitempty"`
@@ -226,6 +228,7 @@ type AutoTradeConditionView struct {
 
 // AutoTradeConfigView 表示当前市场实际生效的自动交易配置摘要。
 type AutoTradeConfigView struct {
+	MainStrategyEnabled        bool                     `json:"main_strategy_enabled,omitempty"`
 	TradeAmount                float64                  `json:"trade_amount,omitempty"`
 	ConfirmSec                 float64                  `json:"confirm_sec,omitempty"`
 	MarketDataMaxLagSec        float64                  `json:"market_data_max_lag_sec,omitempty"`
@@ -240,6 +243,20 @@ type AutoTradeConfigView struct {
 	BinanceRequireAlign        bool                     `json:"binance_require_alignment,omitempty"`
 	BinanceConfirmMinBps       float64                  `json:"binance_confirm_min_bps,omitempty"`
 	BinanceVetoMaxDevBps       float64                  `json:"binance_veto_max_dev_bps,omitempty"`
+	TailSweepEnabled           bool                     `json:"tail_sweep_enabled,omitempty"`
+	TailSweepAllowed           bool                     `json:"tail_sweep_allowed,omitempty"`
+	TailSweepFinalSec          int                      `json:"tail_sweep_final_sec,omitempty"`
+	TailSweepMinDiffBps        float64                  `json:"tail_sweep_min_diff_bps,omitempty"`
+	TailSweepMinProb           float64                  `json:"tail_sweep_min_prob,omitempty"`
+	TailSweepMaxProb           float64                  `json:"tail_sweep_max_prob,omitempty"`
+	TailSweepMaxPrice          float64                  `json:"tail_sweep_max_price,omitempty"`
+	TailSweepRequireBinance    bool                     `json:"tail_sweep_require_binance,omitempty"`
+	TailSweepMaxLagSec         float64                  `json:"tail_sweep_max_lag_sec,omitempty"`
+	TailSweepMaxSpread         float64                  `json:"tail_sweep_max_spread,omitempty"`
+	TailSweepSizeRatio         float64                  `json:"tail_sweep_size_ratio,omitempty"`
+	TailSweepMaxTradesPerHour  int                      `json:"tail_sweep_max_trades_per_hour,omitempty"`
+	TailSweepLossStreakLimit   int                      `json:"tail_sweep_loss_streak_limit,omitempty"`
+	TailSweepHoldToSettlement  bool                     `json:"tail_sweep_hold_to_settlement,omitempty"`
 	Conditions                 []AutoTradeConditionView `json:"conditions,omitempty"`
 }
 
@@ -248,6 +265,7 @@ type StrategyPerformance struct {
 	StrategyKey   string  `json:"strategy_key"`
 	MarketKey     string  `json:"market_key"`
 	MarketSlug    string  `json:"market_slug,omitempty"`
+	Mode          string  `json:"mode,omitempty"`
 	Side          string  `json:"side,omitempty"`
 	WindowSec     int     `json:"window_sec,omitempty"`
 	Trades        int     `json:"trades"`

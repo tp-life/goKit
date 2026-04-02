@@ -538,7 +538,11 @@ func (m *model) recordSnapshot(next entity.DashboardState) {
 	m.updateFlash("ptb", m.state.Prices.PTB, next.Prices.PTB, now)
 	m.updateFlash("diff", m.state.Prices.Diff, next.Prices.Diff, now)
 	m.updateFlash("up", m.state.Prices.UpPrice, next.Prices.UpPrice, now)
+	m.updateFlash("up_bid", m.state.Prices.UpBid, next.Prices.UpBid, now)
+	m.updateFlash("up_ask", m.state.Prices.UpAsk, next.Prices.UpAsk, now)
 	m.updateFlash("down", m.state.Prices.DownPrice, next.Prices.DownPrice, now)
+	m.updateFlash("down_bid", m.state.Prices.DownBid, next.Prices.DownBid, now)
+	m.updateFlash("down_ask", m.state.Prices.DownAsk, next.Prices.DownAsk, now)
 	m.updateTrackedMarketFlashes(m.state.Markets, next.Markets, now)
 
 	m.series.chainlink = appendValue(m.series.chainlink, next.Prices.ChainlinkBTC, priceHistoryLimit)
@@ -579,7 +583,11 @@ func (m *model) updateTrackedMarketFlashes(prevItems, nextItems []entity.Tracked
 		m.updateFlash(trackedFlashKey(key, "ptb"), prev.Prices.PTB, item.Prices.PTB, changedAt)
 		m.updateFlash(trackedFlashKey(key, "diff"), prev.Prices.Diff, item.Prices.Diff, changedAt)
 		m.updateFlash(trackedFlashKey(key, "up"), prev.Prices.UpPrice, item.Prices.UpPrice, changedAt)
+		m.updateFlash(trackedFlashKey(key, "up_bid"), prev.Prices.UpBid, item.Prices.UpBid, changedAt)
+		m.updateFlash(trackedFlashKey(key, "up_ask"), prev.Prices.UpAsk, item.Prices.UpAsk, changedAt)
 		m.updateFlash(trackedFlashKey(key, "down"), prev.Prices.DownPrice, item.Prices.DownPrice, changedAt)
+		m.updateFlash(trackedFlashKey(key, "down_bid"), prev.Prices.DownBid, item.Prices.DownBid, changedAt)
+		m.updateFlash(trackedFlashKey(key, "down_ask"), prev.Prices.DownAsk, item.Prices.DownAsk, changedAt)
 	}
 }
 
@@ -848,7 +856,8 @@ func (m model) renderOverviewTab() string {
 	topRight := m.renderPanel("市场列表（并行监控，仅切换焦点）", m.renderTrackedMarketsLines())
 	conditions := m.renderWidePanel("当前条件", m.renderAutoTradeConfigLines())
 	diagnostics := m.renderWidePanel("自动交易诊断", m.renderAutoTradeDiagnosticsLines())
-	performance := m.renderWidePanel("策略收益榜", m.renderStrategyPerformanceLines())
+	mainPerformance := m.renderWidePanel("主策略收益榜", m.renderStrategyPerformanceLinesByMode("main"))
+	tailPerformance := m.renderWidePanel("尾盘策略收益榜", m.renderStrategyPerformanceLinesByMode("tail-sweep"))
 	bottomLeft := m.renderPanel("价格趋势", m.renderPriceTrendLines())
 	bottomRight := m.renderPanel("轮次结果", renderRoundResults(m.state.RoundResults, 6))
 	logs := m.renderWidePanel("最新日志", renderLogs(m.state.Activity, 8))
@@ -858,7 +867,8 @@ func (m model) renderOverviewTab() string {
 		lipgloss.JoinHorizontal(lipgloss.Top, topLeft, topRight),
 		conditions,
 		diagnostics,
-		performance,
+		mainPerformance,
+		tailPerformance,
 		lipgloss.JoinHorizontal(lipgloss.Top, bottomLeft, bottomRight),
 		logs,
 	)
@@ -1105,18 +1115,46 @@ func (m model) renderAutoTradeDiagnosticsLines() []string {
 	return lines
 }
 
-// renderStrategyPerformanceLines 输出最近本地闭环交易的收益榜，便于快速识别该停掉哪些市场窗口。
-func (m model) renderStrategyPerformanceLines() []string {
+// renderStrategyPerformanceLinesByMode 按策略模式拆分收益榜，避免主策略与尾盘策略混在一起观察。
+func (m model) renderStrategyPerformanceLinesByMode(mode string) []string {
 	if len(m.state.StrategyPerformance) == 0 {
-		return []string{"暂无本地闭环策略收益数据"}
+		if mode == "tail-sweep" {
+			return []string{"暂无尾盘策略闭环收益数据"}
+		}
+		return []string{"暂无主策略闭环收益数据"}
 	}
 
-	limit := minInt(6, len(m.state.StrategyPerformance))
+	targetMode := strings.TrimSpace(mode)
+	filtered := make([]entity.StrategyPerformance, 0, len(m.state.StrategyPerformance))
+	for _, item := range m.state.StrategyPerformance {
+		itemMode := strings.TrimSpace(item.Mode)
+		if itemMode == "" {
+			itemMode = "main"
+		}
+		if itemMode != targetMode {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+
+	if len(filtered) == 0 {
+		if targetMode == "tail-sweep" {
+			return []string{"暂无尾盘策略闭环收益数据"}
+		}
+		return []string{"暂无主策略闭环收益数据"}
+	}
+
+	limit := minInt(6, len(filtered))
 	lines := make([]string, 0, limit)
-	for _, item := range m.state.StrategyPerformance[:limit] {
+	for _, item := range filtered[:limit] {
+		itemMode := strings.TrimSpace(item.Mode)
+		if itemMode == "" {
+			itemMode = "main"
+		}
 		line := fmt.Sprintf(
-			"%s | %ds | %s | trades=%d | win=%.1f%% | pnl=%.4f | avg=%.4f",
+			"%s | %s | %ds | %s | trades=%d | win=%.1f%% | pnl=%.4f | avg=%.4f",
 			emptyFallback(item.MarketKey, "-"),
+			itemMode,
 			item.WindowSec,
 			emptyFallback(item.Side, "-"),
 			item.Trades,
@@ -1153,7 +1191,7 @@ func (m model) renderTrackedMarketsLines() []string {
 			positionText = fmt.Sprintf("%s %.4f", emptyFallback(item.Position.Side, "-"), item.Position.Size)
 		}
 		line := fmt.Sprintf(
-			"%s%s | %s | UP=%s DOWN=%s Diff=%s | 持仓=%s",
+			"%s%s | %s | UP=%s | DOWN=%s | Diff=%s | 持仓=%s",
 			focus,
 			emptyFallback(item.Label, item.Key),
 			stateText,
@@ -1172,8 +1210,9 @@ func (m model) renderAutoTradeConfigLines() []string {
 	config, prices, label := m.focusedAutoTradeConfig()
 	lines := []string{
 		fmt.Sprintf(
-			"焦点市场: %s | 基础仓位=%.2f | 确认=%.1fs | 数据延迟<=%.1fs | 净边际>=%.2fbps | maker优先=%s",
+			"焦点市场: %s | 主策略=%s | 基础仓位=%.2f | 确认=%.1fs | 数据延迟<=%.1fs | 净边际>=%.2fbps | maker优先=%s",
 			label,
+			onOffText(config.MainStrategyEnabled),
 			config.TradeAmount,
 			config.ConfirmSec,
 			config.MarketDataMaxLagSec,
@@ -1192,17 +1231,20 @@ func (m model) renderAutoTradeConfigLines() []string {
 			config.BinanceConfirmMinBps,
 			config.BinanceVetoMaxDevBps,
 		),
+		renderTailSweepConfigLine(config),
+		renderTailSweepRuntimeLine(config, m.state.Market, prices, m.state.Position, m.state.PendingOrder),
 	}
 	if diff, diffBps, ok := deriveCurrentDiff(prices); ok {
 		lines = append(lines, fmt.Sprintf(
-			"当前差值: %s | 当前强度: %s | 参考价=%s | PTB=%s",
+			"当前差值(策略): %s | 当前强度: %s | 参考价=%s | PTB页=%s | Target=%s",
 			formatSignedFloat(diff, 2),
 			formatSignedBps(diffBps),
 			formatFloatPtr(prices.ChainlinkBTC),
 			formatFloatPtr(prices.PTB),
+			formatFloatPtr(prices.TargetPrice),
 		))
 	} else {
-		lines = append(lines, "当前差值: 未就绪 | 当前强度: 未就绪 | 参考价或 PTB 尚未到位")
+		lines = append(lines, "当前差值(策略): 未就绪 | 当前强度: 未就绪 | 参考价或策略 Target 尚未到位")
 	}
 	for _, condition := range config.Conditions {
 		lines = append(lines, renderAutoTradeConditionLine(condition, prices))
@@ -1763,7 +1805,7 @@ func renderAutoTradeConditionLine(condition entity.AutoTradeConditionView, price
 
 // conditionThresholdValues 计算一条条件在当前参考价格级别下对应的金额阈值与 bps 阈值。
 func conditionThresholdValues(condition entity.AutoTradeConditionView, prices entity.DashboardPrices) (float64, float64) {
-	base := maxAbsFloatPtr(prices.ChainlinkBTC, prices.PTB)
+	base := maxAbsFloatPtr(prices.ChainlinkBTC, prices.TargetPrice)
 	if base > 0 {
 		return base * condition.DiffBps / 10000, condition.DiffBps
 	}
@@ -1784,6 +1826,69 @@ func renderStopLossHoldSummary(config entity.AutoTradeConfigView) string {
 	)
 }
 
+// renderTailSweepConfigLine 输出尾盘扫尾巴策略的静态配置摘要。
+func renderTailSweepConfigLine(config entity.AutoTradeConfigView) string {
+	if !config.TailSweepEnabled {
+		return "尾盘扫尾: 关闭"
+	}
+	return fmt.Sprintf(
+		"尾盘扫尾: 全局=%s | 当前市场允许=%s | 窗口<=%ds | 阈值>=%.2fbps | 价格=%.2f%%~%.2f%% | 硬上限=%.2f%% | spread<=%.2f%% | 仓位系数=%.2f | 持有到结算=%s",
+		onOffText(config.TailSweepEnabled),
+		onOffText(config.TailSweepAllowed),
+		config.TailSweepFinalSec,
+		config.TailSweepMinDiffBps,
+		config.TailSweepMinProb*100,
+		config.TailSweepMaxProb*100,
+		config.TailSweepMaxPrice*100,
+		config.TailSweepMaxSpread*100,
+		config.TailSweepSizeRatio,
+		onOffText(config.TailSweepHoldToSettlement),
+	)
+}
+
+// renderTailSweepRuntimeLine 输出当前焦点市场相对于尾盘扫尾巴策略的即时状态。
+func renderTailSweepRuntimeLine(config entity.AutoTradeConfigView, market entity.DashboardMarket, prices entity.DashboardPrices, position *entity.Position, pending *entity.PendingOrder) string {
+	if !config.TailSweepEnabled {
+		return "尾盘扫尾状态: 已关闭"
+	}
+	if !config.TailSweepAllowed {
+		return "尾盘扫尾状态: 全局已开启，但当前焦点市场不在 TAIL_SWEEP_MARKETS 中"
+	}
+	if position != nil || pending != nil {
+		return "尾盘扫尾状态: 已有持仓或挂单，当前不参与"
+	}
+	if market.Remaining <= 0 {
+		return "尾盘扫尾状态: 当前市场已结束"
+	}
+	if market.Remaining > config.TailSweepFinalSec {
+		return fmt.Sprintf("尾盘扫尾状态: 未到窗口，剩余 %ds / 需 <= %ds", market.Remaining, config.TailSweepFinalSec)
+	}
+	currentDiff, currentDiffBps, ready := deriveCurrentDiff(prices)
+	if !ready {
+		return "尾盘扫尾状态: 参考价或策略 Target 未就绪"
+	}
+	if math.Abs(currentDiffBps) < config.TailSweepMinDiffBps {
+		return fmt.Sprintf("尾盘扫尾状态: 差值不足，当前=%s / 阈值=%.2fbps", formatSignedBps(currentDiffBps), config.TailSweepMinDiffBps)
+	}
+	side := resolveOutcomeFromDiff(currentDiff)
+	price := currentProbabilityBySide(side, prices)
+	if price <= 0 {
+		return "尾盘扫尾状态: 对应方向盘口未就绪"
+	}
+	maxProb := config.TailSweepMaxProb
+	if config.TailSweepMaxPrice > 0 && (maxProb <= 0 || config.TailSweepMaxPrice < maxProb) {
+		maxProb = config.TailSweepMaxPrice
+	}
+	if price < config.TailSweepMinProb || (maxProb > 0 && price > maxProb) {
+		return fmt.Sprintf("尾盘扫尾状态: 价格越界，当前=%.2f%%", price*100)
+	}
+	spread := currentSpreadBySide(side, prices)
+	if spread > config.TailSweepMaxSpread {
+		return fmt.Sprintf("尾盘扫尾状态: 盘口过宽，当前=%.2f%% / 上限=%.2f%%", spread*100, config.TailSweepMaxSpread*100)
+	}
+	return fmt.Sprintf("尾盘扫尾状态: 已进入窗口 | 方向=%s | 当前=%s | 价格=%.2f%%", side, formatSignedBps(currentDiffBps), price*100)
+}
+
 // onOffText 把布尔值转换成更容易扫读的中文状态。
 func onOffText(enabled bool) string {
 	if enabled {
@@ -1792,13 +1897,13 @@ func onOffText(enabled bool) string {
 	return "关"
 }
 
-// deriveCurrentDiff 计算当前参考价与 PTB 的签名价差及其 bps。
+// deriveCurrentDiff 计算当前参考价与策略 Target 的签名价差及其 bps。
 func deriveCurrentDiff(prices entity.DashboardPrices) (float64, float64, bool) {
-	if prices.ChainlinkBTC == nil || prices.PTB == nil {
+	if prices.ChainlinkBTC == nil || prices.TargetPrice == nil {
 		return 0, 0, false
 	}
 	referencePrice := *prices.ChainlinkBTC
-	ptb := *prices.PTB
+	ptb := *prices.TargetPrice
 	denominator := math.Max(math.Abs(referencePrice), math.Abs(ptb))
 	if denominator <= 0 {
 		return 0, 0, false
@@ -1816,6 +1921,36 @@ func currentProbabilityForSide(side string, prices entity.DashboardPrices) *floa
 		return prices.DownPrice
 	default:
 		return nil
+	}
+}
+
+// currentProbabilityBySide 返回指定方向当前正在展示的概率值。
+func currentProbabilityBySide(side string, prices entity.DashboardPrices) float64 {
+	ptr := currentProbabilityForSide(side, prices)
+	return derefFloatPtr(ptr)
+}
+
+// currentSpreadBySide 返回指定方向当前盘口的 ask-bid 宽度。
+func currentSpreadBySide(side string, prices entity.DashboardPrices) float64 {
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "UP":
+		return maxFloat(0, derefFloatPtr(prices.UpAsk)-derefFloatPtr(prices.UpBid))
+	case "DOWN":
+		return maxFloat(0, derefFloatPtr(prices.DownAsk)-derefFloatPtr(prices.DownBid))
+	default:
+		return 0
+	}
+}
+
+// resolveOutcomeFromDiff 根据当前 signed diff 推导本次应交易的方向。
+func resolveOutcomeFromDiff(diff float64) string {
+	switch {
+	case diff > 0:
+		return "UP"
+	case diff < 0:
+		return "DOWN"
+	default:
+		return ""
 	}
 }
 
@@ -1993,4 +2128,20 @@ func minInt(left, right int) int {
 		return left
 	}
 	return right
+}
+
+// maxFloat 返回两个浮点数中的较大值。
+func maxFloat(left, right float64) float64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+// derefFloatPtr 返回浮点指针的值；空指针时回退到 0。
+func derefFloatPtr(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }

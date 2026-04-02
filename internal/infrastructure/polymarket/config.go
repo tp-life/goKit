@@ -59,6 +59,8 @@ type Config struct {
 	SignatureType              int
 	PolygonRPCURL              string
 	AutoTrade                  bool
+	MainStrategyEnabled        bool
+	MainStrategyConfigured     bool
 	AutoRedeem                 bool
 	AutoRedeemHourLocal        int
 	AutoRedeemMaxRetry         int
@@ -106,6 +108,22 @@ type Config struct {
 	BinanceRequireAlign        bool
 	BinanceConfirmMinBps       float64
 	BinanceVetoMaxDevBps       float64
+	TailSweepEnabled           bool
+	TailSweepAllowed           bool
+	TailSweepFinalSec          int
+	TailSweepMinDiffBps        float64
+	TailSweepMinProb           float64
+	TailSweepMaxProb           float64
+	TailSweepMaxPrice          float64
+	TailSweepRequireBinance    bool
+	TailSweepMaxLagSec         float64
+	TailSweepMaxSpread         float64
+	TailSweepSizeRatio         float64
+	TailSweepMaxTradesPerHour  int
+	TailSweepLossStreakLimit   int
+	TailSweepDisableLookback   int
+	TailSweepDisableMinProfit  float64
+	TailSweepHoldToSettlement  bool
 	BinanceSymbol              string
 	BinanceWSURL               string
 	BinancePriceURL            string
@@ -113,6 +131,7 @@ type Config struct {
 	DashboardStaticDir         string
 	Conditions                 []ConditionConfig
 	MarketTargets              []MarketTargetConfig
+	TailSweepTargets           []MarketTargetConfig
 	EnableBalancePolling       bool
 	EnableAccountPolling       bool
 	EnableAutoRedeemer         bool
@@ -155,6 +174,8 @@ func LoadConfig() (Config, error) {
 		SignatureType:              getEnvInt("SIGNATURE_TYPE", 2),
 		PolygonRPCURL:              strings.TrimSpace(getEnv("POLYGON_RPC_URL", "")),
 		AutoTrade:                  getEnvBool("AUTO_TRADE", false),
+		MainStrategyEnabled:        getEnvBool("MAIN_STRATEGY_ENABLED", true),
+		MainStrategyConfigured:     true,
 		AutoRedeem:                 getEnvBool("AUTO_REDEEM", false),
 		AutoRedeemHourLocal:        getEnvInt("AUTO_REDEEM_HOUR_LOCAL", 3),
 		AutoRedeemMaxRetry:         getEnvInt("AUTO_REDEEM_MAX_RETRY", 2),
@@ -202,6 +223,21 @@ func LoadConfig() (Config, error) {
 		BinanceRequireAlign:        getEnvBool("BINANCE_REQUIRE_ALIGNMENT", false),
 		BinanceConfirmMinBps:       getEnvFloat("BINANCE_CONFIRM_MIN_DIFF_BPS", 0),
 		BinanceVetoMaxDevBps:       getEnvFloat("BINANCE_VETO_MAX_DEVIATION_BPS", 0),
+		TailSweepEnabled:           getEnvBool("TAIL_SWEEP_ENABLED", false),
+		TailSweepFinalSec:          getEnvInt("TAIL_SWEEP_FINAL_SEC", 20),
+		TailSweepMinDiffBps:        getEnvFloat("TAIL_SWEEP_MIN_DIFF_BPS", 9),
+		TailSweepMinProb:           getEnvFloat("TAIL_SWEEP_MIN_PROB", 0.84),
+		TailSweepMaxProb:           getEnvFloat("TAIL_SWEEP_MAX_PROB", 0.94),
+		TailSweepMaxPrice:          getEnvFloat("TAIL_SWEEP_MAX_PRICE", 0.94),
+		TailSweepRequireBinance:    getEnvBool("TAIL_SWEEP_REQUIRE_BINANCE_ALIGNMENT", true),
+		TailSweepMaxLagSec:         getEnvFloat("TAIL_SWEEP_MAX_LAG_SEC", 0.8),
+		TailSweepMaxSpread:         getEnvFloat("TAIL_SWEEP_MAX_SPREAD", 0.02),
+		TailSweepSizeRatio:         getEnvFloat("TAIL_SWEEP_SIZE_RATIO", 0.4),
+		TailSweepMaxTradesPerHour:  getEnvInt("TAIL_SWEEP_MAX_TRADES_PER_HOUR", 2),
+		TailSweepLossStreakLimit:   getEnvInt("TAIL_SWEEP_LOSS_STREAK_LIMIT", 2),
+		TailSweepDisableLookback:   getEnvInt("TAIL_SWEEP_DISABLE_LOOKBACK_TRADES", 4),
+		TailSweepDisableMinProfit:  getEnvFloat("TAIL_SWEEP_DISABLE_MIN_TOTAL_PNL", -0.5),
+		TailSweepHoldToSettlement:  getEnvBool("TAIL_SWEEP_HOLD_TO_SETTLEMENT", true),
 		BinanceSymbol:              getEnv("BINANCE_SYMBOL", defaultBinanceSymbol(marketSymbol)),
 		BinanceWSURL:               getEnv("BINANCE_WS_URL", ""),
 		BinancePriceURL:            getEnv("BINANCE_PRICE_URL", "https://api.binance.com/api/v3/ticker/price"),
@@ -244,6 +280,7 @@ func LoadConfig() (Config, error) {
 		},
 	}
 	cfg.MarketTargets = parseMarketTargets(getEnv("POLYMARKET_MARKETS", ""), cfg.MarketSymbol, cfg.MarketIntervalSec)
+	cfg.TailSweepTargets = parseMarketTargets(getEnv("TAIL_SWEEP_MARKETS", ""), cfg.MarketSymbol, cfg.MarketIntervalSec)
 
 	if cfg.PriceRefreshSec <= 0 {
 		// 防御非法配置，避免轮询协程因为错误输入而停止工作。
@@ -339,6 +376,42 @@ func LoadConfig() (Config, error) {
 	if cfg.BinanceVetoMaxDevBps < 0 {
 		cfg.BinanceVetoMaxDevBps = 0
 	}
+	if cfg.TailSweepFinalSec < 0 {
+		cfg.TailSweepFinalSec = 0
+	}
+	if cfg.TailSweepMinDiffBps < 0 {
+		cfg.TailSweepMinDiffBps = 0
+	}
+	if cfg.TailSweepMinProb < 0 {
+		cfg.TailSweepMinProb = 0
+	}
+	if cfg.TailSweepMaxProb <= 0 {
+		cfg.TailSweepMaxProb = 0.94
+	}
+	if cfg.TailSweepMaxPrice <= 0 {
+		cfg.TailSweepMaxPrice = cfg.TailSweepMaxProb
+	}
+	if cfg.TailSweepMaxProb > 0 && cfg.TailSweepMaxPrice > cfg.TailSweepMaxProb {
+		cfg.TailSweepMaxPrice = cfg.TailSweepMaxProb
+	}
+	if cfg.TailSweepMaxLagSec <= 0 {
+		cfg.TailSweepMaxLagSec = 0.8
+	}
+	if cfg.TailSweepMaxSpread <= 0 {
+		cfg.TailSweepMaxSpread = 0.02
+	}
+	if cfg.TailSweepSizeRatio <= 0 {
+		cfg.TailSweepSizeRatio = 0.4
+	}
+	if cfg.TailSweepMaxTradesPerHour < 0 {
+		cfg.TailSweepMaxTradesPerHour = 0
+	}
+	if cfg.TailSweepLossStreakLimit < 0 {
+		cfg.TailSweepLossStreakLimit = 0
+	}
+	if cfg.TailSweepDisableLookback < 0 {
+		cfg.TailSweepDisableLookback = 0
+	}
 	for idx := range cfg.Conditions {
 		if cfg.Conditions[idx].DiffBps < 0 {
 			cfg.Conditions[idx].DiffBps = 0
@@ -368,7 +441,7 @@ func LoadConfig() (Config, error) {
 	if strings.TrimSpace(cfg.BinanceSymbol) == "" {
 		cfg.BinanceSymbol = defaultBinanceSymbol(cfg.MarketSymbol)
 	}
-	if len(cfg.MarketTargets) == 0 {
+	if len(cfg.MarketTargets) == 0 && len(cfg.TailSweepTargets) == 0 {
 		cfg.MarketTargets = []MarketTargetConfig{
 			{
 				Key:         buildMarketTargetKey(cfg.MarketSymbol, cfg.MarketIntervalSec),
@@ -378,6 +451,7 @@ func LoadConfig() (Config, error) {
 			},
 		}
 	}
+	cfg.TailSweepAllowed = cfg.tailSweepAllowedForKey(buildMarketTargetKey(cfg.MarketSymbol, cfg.ResolvedMarketIntervalSec()))
 
 	if absPath, err := filepath.Abs(cfg.StateFile); err == nil {
 		cfg.StateFile = absPath
@@ -391,7 +465,7 @@ func LoadConfig() (Config, error) {
 
 // ResolvedMarketTargets 返回当前配置最终生效的市场 watchlist。
 func (c Config) ResolvedMarketTargets() []MarketTargetConfig {
-	if len(c.MarketTargets) == 0 {
+	if len(c.MarketTargets) == 0 && len(c.TailSweepTargets) == 0 {
 		return []MarketTargetConfig{
 			{
 				Key:         buildMarketTargetKey(c.MarketSymbol, c.MarketIntervalSec),
@@ -401,20 +475,13 @@ func (c Config) ResolvedMarketTargets() []MarketTargetConfig {
 			},
 		}
 	}
-	out := make([]MarketTargetConfig, 0, len(c.MarketTargets))
+	out := make([]MarketTargetConfig, 0, len(c.MarketTargets)+len(c.TailSweepTargets))
+	seen := make(map[string]struct{}, len(c.MarketTargets)+len(c.TailSweepTargets))
 	for _, item := range c.MarketTargets {
-		normalized := item
-		normalized.Symbol = normalizeMarketSymbol(item.Symbol)
-		if normalized.IntervalSec <= 0 {
-			normalized.IntervalSec = c.ResolvedMarketIntervalSec()
-		}
-		if strings.TrimSpace(normalized.Key) == "" {
-			normalized.Key = buildMarketTargetKey(normalized.Symbol, normalized.IntervalSec)
-		}
-		if strings.TrimSpace(normalized.Label) == "" {
-			normalized.Label = buildMarketTargetLabel(normalized.Symbol, normalized.IntervalSec)
-		}
-		out = append(out, normalized)
+		out = appendNormalizedMarketTarget(out, seen, item, c.ResolvedMarketIntervalSec())
+	}
+	for _, item := range c.TailSweepTargets {
+		out = appendNormalizedMarketTarget(out, seen, item, c.ResolvedMarketIntervalSec())
 	}
 	return out
 }
@@ -435,6 +502,8 @@ func (c Config) CloneForTarget(target MarketTargetConfig, workerIndex int, enabl
 	out.CryptoPriceSymbol = out.MarketSymbol
 	out.CryptoPriceVariant = defaultCryptoPriceVariant(out.MarketIntervalSec)
 	out.BinanceSymbol = defaultBinanceSymbol(out.MarketSymbol)
+	out.MainStrategyEnabled = out.mainStrategyAllowedForKey(target.Key)
+	out.MainStrategyConfigured = true
 	applyMarketOverrides(target, &out)
 	// 多市场模式下，如果 BINANCE_WS_URL 只是沿用了基础市场的默认值，
 	// 这里清空后让子 worker 按各自 symbol 重新派生 websocket 地址。
@@ -445,6 +514,7 @@ func (c Config) CloneForTarget(target MarketTargetConfig, workerIndex int, enabl
 	out.EnableBalancePolling = enableSharedTasks
 	out.EnableAccountPolling = enableSharedTasks
 	out.EnableAutoRedeemer = enableSharedTasks
+	out.TailSweepAllowed = out.tailSweepAllowedForKey(target.Key)
 
 	// 多市场模式下为每个 worker 分配独立状态文件，避免相互覆盖。
 	if len(c.ResolvedMarketTargets()) > 1 {
@@ -471,6 +541,12 @@ func applyMarketOverrides(target MarketTargetConfig, cfg *Config) {
 	overrideString(prefix+"BINANCE_SYMBOL", &cfg.BinanceSymbol)
 	overrideString(prefix+"BINANCE_WS_URL", &cfg.BinanceWSURL)
 
+	if raw := strings.TrimSpace(os.Getenv(prefix + "MAIN_STRATEGY_ENABLED")); raw != "" {
+		if value, err := strconv.ParseBool(raw); err == nil {
+			cfg.MainStrategyEnabled = value
+			cfg.MainStrategyConfigured = true
+		}
+	}
 	overrideFloat(prefix+"TRADE_AMOUNT", &cfg.TradeAmount)
 	overrideInt(prefix+"ORDER_TIMEOUT_SEC", &cfg.OrderTimeoutSec)
 	overrideFloat(prefix+"SLIPPAGE_THRESHOLD", &cfg.SlippageThreshold)
@@ -498,6 +574,21 @@ func applyMarketOverrides(target MarketTargetConfig, cfg *Config) {
 	overrideBool(prefix+"BINANCE_REQUIRE_ALIGNMENT", &cfg.BinanceRequireAlign)
 	overrideFloat(prefix+"BINANCE_CONFIRM_MIN_DIFF_BPS", &cfg.BinanceConfirmMinBps)
 	overrideFloat(prefix+"BINANCE_VETO_MAX_DEVIATION_BPS", &cfg.BinanceVetoMaxDevBps)
+	overrideBool(prefix+"TAIL_SWEEP_ENABLED", &cfg.TailSweepEnabled)
+	overrideInt(prefix+"TAIL_SWEEP_FINAL_SEC", &cfg.TailSweepFinalSec)
+	overrideFloat(prefix+"TAIL_SWEEP_MIN_DIFF_BPS", &cfg.TailSweepMinDiffBps)
+	overrideFloat(prefix+"TAIL_SWEEP_MIN_PROB", &cfg.TailSweepMinProb)
+	overrideFloat(prefix+"TAIL_SWEEP_MAX_PROB", &cfg.TailSweepMaxProb)
+	overrideFloat(prefix+"TAIL_SWEEP_MAX_PRICE", &cfg.TailSweepMaxPrice)
+	overrideBool(prefix+"TAIL_SWEEP_REQUIRE_BINANCE_ALIGNMENT", &cfg.TailSweepRequireBinance)
+	overrideFloat(prefix+"TAIL_SWEEP_MAX_LAG_SEC", &cfg.TailSweepMaxLagSec)
+	overrideFloat(prefix+"TAIL_SWEEP_MAX_SPREAD", &cfg.TailSweepMaxSpread)
+	overrideFloat(prefix+"TAIL_SWEEP_SIZE_RATIO", &cfg.TailSweepSizeRatio)
+	overrideInt(prefix+"TAIL_SWEEP_MAX_TRADES_PER_HOUR", &cfg.TailSweepMaxTradesPerHour)
+	overrideInt(prefix+"TAIL_SWEEP_LOSS_STREAK_LIMIT", &cfg.TailSweepLossStreakLimit)
+	overrideInt(prefix+"TAIL_SWEEP_DISABLE_LOOKBACK_TRADES", &cfg.TailSweepDisableLookback)
+	overrideFloat(prefix+"TAIL_SWEEP_DISABLE_MIN_TOTAL_PNL", &cfg.TailSweepDisableMinProfit)
+	overrideBool(prefix+"TAIL_SWEEP_HOLD_TO_SETTLEMENT", &cfg.TailSweepHoldToSettlement)
 
 	for idx := range cfg.Conditions {
 		overrideInt(fmt.Sprintf("%sCONDITION_%d_TIME", prefix, idx+1), &cfg.Conditions[idx].Time)
@@ -547,7 +638,9 @@ func (c Config) ResolvedCryptoPriceSymbol() string {
 	return normalizeMarketSymbol(c.MarketSymbol)
 }
 
-// ResolvedCryptoPriceVariant 返回 PTB 接口使用的周期变体；15 分钟默认是 fifteen。
+// ResolvedCryptoPriceVariant 返回 PTB 接口使用的周期变体。
+// 当前把 5 分钟和 15 分钟都显式映射成官网前端内部对应的周期名称，
+// 避免不同市场落到“有的显式带 variant、有的留空走默认”的不一致分支。
 func (c Config) ResolvedCryptoPriceVariant() string {
 	if value := strings.TrimSpace(c.CryptoPriceVariant); value != "" {
 		return value
@@ -634,8 +727,13 @@ func defaultBinanceSymbol(symbol string) string {
 }
 
 // defaultCryptoPriceVariant 为常见市场周期提供 PTB 变体默认值。
+// 这里对齐官网前端内部的 market type 命名：
+// - 300s  -> fiveminute
+// - 900s  -> fifteen
 func defaultCryptoPriceVariant(intervalSec int) string {
 	switch intervalSec {
+	case 300:
+		return "fiveminute"
 	case 900:
 		return "fifteen"
 	default:
@@ -736,6 +834,27 @@ func buildMarketTargetLabel(symbol string, intervalSec int) string {
 	return normalizeMarketSymbol(symbol) + " " + defaultMarketSlugInterval(intervalSec)
 }
 
+// appendNormalizedMarketTarget 把市场项标准化后追加到 watchlist，并自动去重。
+func appendNormalizedMarketTarget(out []MarketTargetConfig, seen map[string]struct{}, item MarketTargetConfig, fallbackIntervalSec int) []MarketTargetConfig {
+	normalized := item
+	normalized.Symbol = normalizeMarketSymbol(item.Symbol)
+	if normalized.IntervalSec <= 0 {
+		normalized.IntervalSec = fallbackIntervalSec
+	}
+	if strings.TrimSpace(normalized.Key) == "" {
+		normalized.Key = buildMarketTargetKey(normalized.Symbol, normalized.IntervalSec)
+	}
+	normalized.Key = strings.ToLower(strings.TrimSpace(normalized.Key))
+	if strings.TrimSpace(normalized.Label) == "" {
+		normalized.Label = buildMarketTargetLabel(normalized.Symbol, normalized.IntervalSec)
+	}
+	if _, exists := seen[normalized.Key]; exists {
+		return out
+	}
+	seen[normalized.Key] = struct{}{}
+	return append(out, normalized)
+}
+
 // marketOverridePrefix 生成市场级别覆盖前缀，例如 `MARKET_BTC_15M_`。
 func marketOverridePrefix(target MarketTargetConfig) string {
 	if strings.TrimSpace(target.Symbol) == "" || target.IntervalSec <= 0 {
@@ -754,6 +873,49 @@ func targetStateFilePath(basePath string, target MarketTargetConfig) string {
 	}
 	suffix := strings.ReplaceAll(strings.ToLower(target.Key), "-", "_")
 	return filepath.Join(dir, name+"_"+suffix+ext)
+}
+
+// tailSweepAllowedForKey 判断某个市场键名是否允许启用尾盘扫尾巴策略。
+func (c Config) tailSweepAllowedForKey(key string) bool {
+	if !c.TailSweepEnabled {
+		return false
+	}
+	normalized := strings.TrimSpace(strings.ToLower(key))
+	if normalized == "" {
+		return false
+	}
+	if len(c.TailSweepTargets) == 0 {
+		return true
+	}
+	for _, item := range c.TailSweepTargets {
+		if strings.EqualFold(strings.TrimSpace(item.Key), normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+// mainStrategyAllowedForKey 判断某个市场键名是否默认允许运行主策略。
+func (c Config) mainStrategyAllowedForKey(key string) bool {
+	if !c.MainStrategyEnabled {
+		return false
+	}
+	normalized := strings.TrimSpace(strings.ToLower(key))
+	if normalized == "" {
+		return false
+	}
+	if len(c.MarketTargets) == 0 {
+		// 没有显式主 watchlist 时：
+		// 1. 若只有尾盘白名单，则默认把这些市场当成“只看价格/尾盘专用”。
+		// 2. 若连尾盘白名单也没有，则退回到默认单市场模式，继续允许运行主策略。
+		return len(c.TailSweepTargets) == 0
+	}
+	for _, item := range c.MarketTargets {
+		if strings.EqualFold(strings.TrimSpace(item.Key), normalized) {
+			return true
+		}
+	}
+	return false
 }
 
 // getFirstEnv 返回多个候选环境变量里第一个非空值。

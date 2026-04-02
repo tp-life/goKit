@@ -397,6 +397,7 @@ func (m *PolymarketManager) rebuildSnapshotLocked() {
 func (m *PolymarketManager) buildStrategyPerformanceLocked() []entity.StrategyPerformance {
 	return buildStrategyPerformanceFromHistory(
 		m.mergeTradeHistoryLocked(),
+		cloneLiveTrades(m.snapshot.LiveTrades),
 		m.cfg.AutoDisableLookback,
 		m.cfg.AutoDisableMinProfit,
 		m.cfg.AutoDisableNegative,
@@ -512,6 +513,7 @@ func (m *PolymarketManager) publishLocked() {
 func clonePrices(in entity.DashboardPrices) entity.DashboardPrices {
 	out := in
 	out.PTB = cloneFloatPtr(in.PTB)
+	out.TargetPrice = cloneFloatPtr(in.TargetPrice)
 	out.ChainlinkBTC = cloneFloatPtr(in.ChainlinkBTC)
 	out.BinanceBTC = cloneFloatPtr(in.BinanceBTC)
 	out.UpPrice = cloneFloatPtr(in.UpPrice)

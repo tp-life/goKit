@@ -44,6 +44,7 @@ const (
 )
 
 const minPolymarketBuyShares = 5.0
+const strategyModeTailSweep = "tail-sweep"
 
 // autoTradeDecision 表示一次自动交易评估的结果与归因。
 type autoTradeDecision struct {
@@ -67,20 +68,22 @@ type PolymarketService struct {
 	autoTrade    entity.AutoTradeDiagnostics
 
 	price struct {
-		btc       *float64
-		binance   *float64
-		ptb       *float64
-		upPrice   *float64
-		downPrice *float64
-		upBid     *float64
-		upAsk     *float64
-		downBid   *float64
-		downAsk   *float64
+		btc        *float64
+		binance    *float64
+		ptb        *float64
+		ptbDisplay *float64
+		upPrice    *float64
+		downPrice  *float64
+		upBid      *float64
+		upAsk      *float64
+		downBid    *float64
+		downAsk    *float64
 
-		btcUpdateTS     time.Time
-		binanceUpdateTS time.Time
-		upUpdateTS      time.Time
-		downUpdateTS    time.Time
+		btcUpdateTS        time.Time
+		binanceUpdateTS    time.Time
+		ptbDisplayUpdateTS time.Time
+		upUpdateTS         time.Time
+		downUpdateTS       time.Time
 	}
 
 	marketFeeRateBps int
@@ -96,6 +99,13 @@ type PolymarketService struct {
 
 	signalConfirmKey   string
 	signalConfirmSince time.Time
+
+	nextPTB struct {
+		slug      string
+		target    *float64
+		display   *float64
+		fetchedAt time.Time
+	}
 }
 
 // NewPolymarketService 创建机器人服务，并让编排层只依赖基建设施接口。
@@ -644,10 +654,12 @@ func (s *PolymarketService) runEngine(ctx context.Context) {
 			lastMarketFetch = now
 		}
 
+		s.prewarmNextPTBIfNeeded(ctx)
 		s.refreshPTBIfNeeded(ctx)
 		s.processPendingBuy(ctx)
 		s.processTakeProfitOrder(ctx)
 		s.evaluateAutoTrade(ctx)
+		s.evaluateTailSweep(ctx)
 		s.managePosition(ctx)
 
 		s.mu.Lock()
@@ -693,15 +705,33 @@ func (s *PolymarketService) updateActiveMarket(ctx context.Context, market *enti
 
 	// 市场切换后，上一轮价格与仓位上下文都必须清空，避免跨市场污染。
 	s.price.ptb = nil
+	s.price.ptbDisplay = nil
 	s.price.upPrice = nil
 	s.price.downPrice = nil
 	s.price.upBid = nil
 	s.price.upAsk = nil
 	s.price.downBid = nil
 	s.price.downAsk = nil
+	s.price.ptbDisplayUpdateTS = time.Time{}
 	s.price.upUpdateTS = time.Time{}
 	s.price.downUpdateTS = time.Time{}
 	s.marketFeeRateBps = 0
+
+	// 如果上一轮已经预热到下一轮 PTB，这里在切盘瞬间直接接管，
+	// 避免新轮次开始后的前几十秒一直空着等待外部接口就绪。
+	if market != nil && strings.EqualFold(strings.TrimSpace(s.nextPTB.slug), strings.TrimSpace(newSlug)) {
+		s.price.ptb = cloneFloatPtr(s.nextPTB.target)
+		s.price.ptbDisplay = cloneFloatPtr(s.nextPTB.display)
+		if s.price.ptbDisplay != nil || s.price.ptb != nil {
+			s.price.ptbDisplayUpdateTS = time.Now()
+		}
+	}
+	if market == nil || !strings.EqualFold(strings.TrimSpace(s.nextPTB.slug), strings.TrimSpace(newSlug)) {
+		s.nextPTB.slug = ""
+		s.nextPTB.target = nil
+		s.nextPTB.display = nil
+		s.nextPTB.fetchedAt = time.Time{}
+	}
 	s.state.Position = nil
 	s.state.LastOrder = nil
 	s.state.TakeProfitOrder = nil
@@ -733,6 +763,13 @@ func (s *PolymarketService) updateActiveMarket(ctx context.Context, market *enti
 				s.mu.Unlock()
 				return
 			}
+			// 市场切换后，旧 websocket 回调可能会晚到一步。
+			// 这里强校验当前活跃市场的 token，避免上一轮盘口把新一轮状态覆盖掉。
+			if !strings.EqualFold(strings.TrimSpace(s.activeMarket.UpToken), strings.TrimSpace(upToken)) ||
+				!strings.EqualFold(strings.TrimSpace(s.activeMarket.DownToken), strings.TrimSpace(downToken)) {
+				s.mu.Unlock()
+				return
+			}
 			if assetID == upToken {
 				s.price.upBid = cloneFloatPtr(&bid)
 				s.price.upAsk = cloneFloatPtr(&ask)
@@ -753,13 +790,20 @@ func (s *PolymarketService) updateActiveMarket(ctx context.Context, market *enti
 	}(market.UpToken, market.DownToken)
 }
 
-// refreshPTBIfNeeded 在当前轮首次拿到市场元数据后，补齐 PTB 价格。
+// refreshPTBIfNeeded 刷新当前市场的两类参考价。
+// 1. `ptb` 只保存该轮固定的策略目标价，对应 crypto-price 的 openPrice。
+// 2. `ptbDisplay` 保存页面当前参考价，对应 crypto-price 的 closePrice，用于展示层对齐官网。
 func (s *PolymarketService) refreshPTBIfNeeded(ctx context.Context) {
 	s.mu.RLock()
 	market := cloneActiveMarket(s.activeMarket)
-	hasPTB := s.price.ptb != nil
+	hasTarget := s.price.ptb != nil
+	lastDisplayUpdate := s.price.ptbDisplayUpdateTS
 	s.mu.RUnlock()
-	if market == nil || hasPTB {
+	if market == nil {
+		return
+	}
+	displayFresh := !lastDisplayUpdate.IsZero() && time.Since(lastDisplayUpdate) < time.Duration(s.cfg.PriceRefreshSec)*time.Second
+	if hasTarget && displayFresh {
 		return
 	}
 
@@ -769,14 +813,72 @@ func (s *PolymarketService) refreshPTBIfNeeded(ctx context.Context) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.price.ptb != nil {
+	// 外部请求返回时，市场可能已经切到下一轮；这里再次校验 slug，避免旧结果写回新市场。
+	if s.activeMarket == nil || !strings.EqualFold(strings.TrimSpace(s.activeMarket.Slug), strings.TrimSpace(market.Slug)) {
 		return
 	}
-	if openPrice != nil {
+	if s.price.ptb == nil && openPrice != nil {
 		s.price.ptb = cloneFloatPtr(openPrice)
-	} else if closePrice != nil {
-		s.price.ptb = cloneFloatPtr(closePrice)
 	}
+	if closePrice != nil {
+		s.price.ptbDisplay = cloneFloatPtr(closePrice)
+		s.price.ptbDisplayUpdateTS = time.Now()
+		return
+	}
+	// 某些轮次接口可能暂时拿不到 closePrice；此时展示层退回到 openPrice，避免空值。
+	if s.price.ptbDisplay == nil && openPrice != nil {
+		s.price.ptbDisplay = cloneFloatPtr(openPrice)
+		s.price.ptbDisplayUpdateTS = time.Now()
+	}
+}
+
+// prewarmNextPTBIfNeeded 在当前轮还未结束时提前预热下一轮 PTB，
+// 避免切盘后还要等待 Gamma / crypto-price 同步完成才出现参考价。
+func (s *PolymarketService) prewarmNextPTBIfNeeded(ctx context.Context) {
+	s.mu.RLock()
+	market := cloneActiveMarket(s.activeMarket)
+	cachedSlug := strings.TrimSpace(s.nextPTB.slug)
+	lastFetch := s.nextPTB.fetchedAt
+	s.mu.RUnlock()
+	if market == nil {
+		return
+	}
+
+	remaining := remainingSeconds(market.End)
+	if remaining <= 0 || remaining > nextPTBPrewarmLeadSec(s.cfg.ResolvedMarketIntervalSec()) {
+		return
+	}
+
+	endAt, ok := parseRFC3339Loose(market.End)
+	if !ok {
+		return
+	}
+
+	intervalSec := s.cfg.ResolvedMarketIntervalSec()
+	nextStart := endAt.UTC()
+	nextEnd := nextStart.Add(time.Duration(intervalSec) * time.Second)
+	nextSlug := fmt.Sprintf("%s-%s-%d", s.cfg.ResolvedMarketSlugPrefix(), s.cfg.ResolvedMarketSlugInterval(), nextStart.Unix())
+	if strings.EqualFold(cachedSlug, nextSlug) && !lastFetch.IsZero() && time.Since(lastFetch) < time.Duration(s.cfg.PriceRefreshSec)*time.Second {
+		return
+	}
+
+	openPrice, closePrice, err := s.feeds.GetCryptoPrice(ctx, nextStart.Format(time.RFC3339), nextEnd.Format(time.RFC3339))
+	if err != nil {
+		return
+	}
+
+	displayPrice := closePrice
+	if displayPrice == nil {
+		displayPrice = openPrice
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 只保留下一轮的预热值，避免旧轮次结果覆盖当前计划切换目标。
+	s.nextPTB.slug = nextSlug
+	s.nextPTB.target = cloneFloatPtr(openPrice)
+	s.nextPTB.display = cloneFloatPtr(displayPrice)
+	s.nextPTB.fetchedAt = time.Now()
 }
 
 // processPendingBuy 检查超时未完成的买单，并决定确认成交或撤单。
@@ -842,19 +944,96 @@ func (s *PolymarketService) processPendingBuy(ctx context.Context) {
 		})
 		logLevel = "TRADE"
 		logMessage = fmt.Sprintf("买单已成交: %s @ %.2f%%", pending.Side, pending.Price*100)
-	} else {
-		_ = s.client.CancelOrder(ctx, pending.OrderID)
-		s.state.PendingOrder = nil
-		logLevel = "WARN"
-		logMessage = fmt.Sprintf("买单超时未成交，已撤单: %s", pending.OrderID)
+		s.syncDashboardLocked()
+		s.persistLocked(context.Background())
+		s.publishLocked()
+		s.mu.Unlock()
+		if logMessage != "" {
+			s.addLog(logLevel, logMessage)
+		}
+		return
 	}
-	s.syncDashboardLocked()
-	s.persistLocked(context.Background())
-	s.publishLocked()
 	s.mu.Unlock()
-	if logMessage != "" {
-		s.addLog(logLevel, logMessage)
+
+	// 部分成交的买单要先撤掉剩余部分，再把已成交仓位收口到本地状态。
+	if status.SizeMatched > 0 {
+		if err := s.client.CancelOrder(ctx, pending.OrderID); err != nil {
+			s.addLog("WARN", fmt.Sprintf("买单部分成交后撤余单失败: %s: %v", pending.OrderID, err))
+			return
+		}
+
+		s.mu.Lock()
+		if s.state.PendingOrder == nil || s.state.PendingOrder.OrderID != pending.OrderID {
+			s.mu.Unlock()
+			return
+		}
+
+		filledAmount := pending.Price * status.SizeMatched
+		s.state.Position = &entity.Position{
+			Slug:        pending.Slug,
+			Side:        pending.Side,
+			EntryPrice:  pending.Price,
+			EntryDiff:   absFloat(diff),
+			Size:        status.SizeMatched,
+			Amount:      filledAmount,
+			WindowSec:   pending.WindowSec,
+			StrategyKey: pending.StrategyKey,
+			Execution:   pending.Execution,
+		}
+		s.state.PendingOrder = nil
+		s.appendHistoryLocked(entity.TradeHistoryItem{
+			Time:        time.Now().Format("2006-01-02 15:04:05"),
+			Slug:        pending.Slug,
+			Action:      "BUY",
+			Side:        pending.Side,
+			Price:       pending.Price,
+			Amount:      filledAmount,
+			Size:        status.SizeMatched,
+			OrderID:     pending.OrderID,
+			Status:      "partial_filled",
+			Reason:      pending.Reason,
+			Diff:        floatPtr(diff),
+			WindowSec:   pending.WindowSec,
+			StrategyKey: pending.StrategyKey,
+			Execution:   pending.Execution,
+			PostOnly:    pending.PostOnly,
+		})
+		s.syncDashboardLocked()
+		s.persistLocked(context.Background())
+		s.publishLocked()
+		s.mu.Unlock()
+		s.addLog("TRADE", fmt.Sprintf("买单部分成交，剩余已撤单: %s @ %.2f%% | size=%.4f", pending.Side, pending.Price*100, status.SizeMatched))
+		return
 	}
+
+	if err := s.client.CancelOrder(ctx, pending.OrderID); err != nil {
+		s.addLog("WARN", fmt.Sprintf("买单超时后撤单失败: %s: %v", pending.OrderID, err))
+		return
+	}
+
+	s.mu.Lock()
+	if s.state.PendingOrder == nil || s.state.PendingOrder.OrderID != pending.OrderID {
+		s.mu.Unlock()
+		return
+	}
+	fallbackPlan, fallbackMarket, fallbackReason, canFallback := s.buildMakerTimeoutFallbackPlanLocked(pending)
+	s.state.PendingOrder = nil
+	if !canFallback {
+		s.syncDashboardLocked()
+		s.persistLocked(context.Background())
+		s.publishLocked()
+		s.mu.Unlock()
+		if strings.TrimSpace(fallbackReason) != "" {
+			s.addLog("WARN", fmt.Sprintf("买单超时未成交，已撤单: %s | %s", pending.OrderID, fallbackReason))
+		} else {
+			s.addLog("WARN", fmt.Sprintf("买单超时未成交，已撤单: %s", pending.OrderID))
+		}
+		return
+	}
+
+	s.mu.Unlock()
+	s.addLog("WARN", fmt.Sprintf("maker 买单超时未成交，已自动回退为普通限价单: %s @ %.2f%%", fallbackPlan.side, fallbackPlan.price*100))
+	s.executeBuyPlan(ctx, fallbackMarket, fallbackPlan, "maker 超时回退下单失败", "maker 超时回退买单已提交")
 }
 
 // processTakeProfitOrder 检查当前卖出挂单状态，并在成交后清理仓位。
@@ -958,6 +1137,59 @@ func (s *PolymarketService) evaluateAutoTrade(ctx context.Context) {
 		return
 	}
 
+	s.executeBuyPlan(ctx, market, plan, "自动下单失败", "自动买单已提交")
+}
+
+// evaluateTailSweep 在尾盘窗口内尝试执行独立的扫尾巴策略。
+func (s *PolymarketService) evaluateTailSweep(ctx context.Context) {
+	s.mu.Lock()
+	market := cloneActiveMarket(s.activeMarket)
+	decision := s.buildTailSweepDecisionLocked()
+	s.mu.Unlock()
+
+	if !decision.ok || market == nil {
+		return
+	}
+	if !s.cfg.AutoTrade {
+		plan := decision.plan
+		s.addLog("TRADE", fmt.Sprintf("提醒模式: 建议尾盘扫尾买入 %s @ %.2f%%", plan.side, plan.price*100))
+		s.mu.Lock()
+		s.state.LastOrder = &entity.LastOrder{
+			Key:        plan.orderKey,
+			Time:       time.Now().Format(time.RFC3339),
+			RetryCount: plan.retryCount + 1,
+			LastPrice:  plan.price,
+			Error:      "",
+		}
+		s.syncDashboardLocked()
+		s.persistLocked(context.Background())
+		s.publishLocked()
+		s.mu.Unlock()
+		return
+	}
+	s.executeBuyPlan(ctx, market, decision.plan, "尾盘扫尾下单失败", "尾盘扫尾买单已提交")
+}
+
+type autoBuyPlan struct {
+	side         string
+	tokenID      string
+	price        float64
+	reason       string
+	orderKey     string
+	retryCount   int
+	tradeAmount  float64
+	diff         float64
+	windowSec    int
+	strategyKey  string
+	execution    string
+	postOnly     bool
+	orderType    string
+	expirationTS int64
+	netEdgeBps   float64
+}
+
+// executeBuyPlan 统一提交自动买入计划，并把结果回写到本地状态与 dashboard。
+func (s *PolymarketService) executeBuyPlan(ctx context.Context, market *entity.ActiveMarket, plan autoBuyPlan, failPrefix, successPrefix string) {
 	submittedPlan, orderID, normalizedSize, err := s.submitAutoBuyPlan(ctx, plan)
 	s.mu.Lock()
 	if err != nil {
@@ -990,7 +1222,7 @@ func (s *PolymarketService) evaluateAutoTrade(ctx context.Context) {
 		s.persistLocked(context.Background())
 		s.publishLocked()
 		s.mu.Unlock()
-		s.addLog("ERR", fmt.Sprintf("自动下单失败: %v", err))
+		s.addLog("ERR", fmt.Sprintf("%s: %v", failPrefix, err))
 		return
 	}
 
@@ -1041,25 +1273,7 @@ func (s *PolymarketService) evaluateAutoTrade(ctx context.Context) {
 	if plan.postOnly && !submittedPlan.postOnly {
 		s.addLog("WARN", fmt.Sprintf("maker 入场穿价，已自动回退为普通限价单: %s @ %.2f%%", submittedPlan.side, submittedPlan.price*100))
 	}
-	s.addLog("TRADE", fmt.Sprintf("自动买单已提交: %s @ %.2f%% [%s]", submittedPlan.side, submittedPlan.price*100, submittedPlan.execution))
-}
-
-type autoBuyPlan struct {
-	side         string
-	tokenID      string
-	price        float64
-	reason       string
-	orderKey     string
-	retryCount   int
-	tradeAmount  float64
-	diff         float64
-	windowSec    int
-	strategyKey  string
-	execution    string
-	postOnly     bool
-	orderType    string
-	expirationTS int64
-	netEdgeBps   float64
+	s.addLog("TRADE", fmt.Sprintf("%s: %s @ %.2f%% [%s]", successPrefix, submittedPlan.side, submittedPlan.price*100, submittedPlan.execution))
 }
 
 // submitAutoBuyPlan 负责提交自动开仓计划，并在 maker post-only 穿价时自动回退成普通限价单。
@@ -1108,6 +1322,155 @@ func (s *PolymarketService) submitAutoBuyPlan(ctx context.Context, plan autoBuyP
 	return fallback, orderID, normalizedSize, nil
 }
 
+// buildMakerTimeoutFallbackPlanLocked 在 maker 挂单超时后，判断是否还能安全回退成普通限价单。
+func (s *PolymarketService) buildMakerTimeoutFallbackPlanLocked(pending *entity.PendingOrder) (autoBuyPlan, *entity.ActiveMarket, string, bool) {
+	if pending == nil {
+		return autoBuyPlan{}, nil, "挂单上下文缺失", false
+	}
+	if !pending.PostOnly && !strings.EqualFold(strings.TrimSpace(pending.Execution), "maker_gtd") {
+		return autoBuyPlan{}, nil, "", false
+	}
+	if s.activeMarket == nil {
+		return autoBuyPlan{}, nil, "当前没有活跃市场，已放弃回退追单", false
+	}
+	if remainingSeconds(s.activeMarket.End) <= 0 {
+		return autoBuyPlan{}, nil, "当前市场已进入结算，已放弃回退追单", false
+	}
+
+	referencePrice := derefFloat(s.price.btc)
+	ptb := derefFloat(s.price.ptb)
+	if referencePrice <= 0 || ptb <= 0 {
+		return autoBuyPlan{}, nil, "外部参考价或 PTB 未就绪，已放弃回退追单", false
+	}
+	diff := referencePrice - ptb
+	side := strings.ToUpper(strings.TrimSpace(pending.Side))
+	if resolveAutoTradeConditionSide(diff) != side {
+		return autoBuyPlan{}, nil, "超时后外部信号方向已反转，已放弃回退追单", false
+	}
+
+	var (
+		price        float64
+		bestBid      float64
+		bestAsk      float64
+		displayPrice float64
+		tokenID      string
+		lastUpdate   time.Time
+	)
+	switch side {
+	case "UP":
+		price = firstPositive(s.price.upAsk, s.price.upPrice, s.activeMarket.UpPrice)
+		bestBid = derefFloat(s.price.upBid)
+		bestAsk = derefFloat(s.price.upAsk)
+		displayPrice = firstPositive(s.price.upPrice, s.activeMarket.UpPrice)
+		tokenID = s.activeMarket.UpToken
+		lastUpdate = s.price.upUpdateTS
+	case "DOWN":
+		price = firstPositive(s.price.downAsk, s.price.downPrice, s.activeMarket.DownPrice)
+		bestBid = derefFloat(s.price.downBid)
+		bestAsk = derefFloat(s.price.downAsk)
+		displayPrice = firstPositive(s.price.downPrice, s.activeMarket.DownPrice)
+		tokenID = s.activeMarket.DownToken
+		lastUpdate = s.price.downUpdateTS
+	default:
+		return autoBuyPlan{}, nil, "挂单方向无效，已放弃回退追单", false
+	}
+	if price <= 0 || tokenID == "" {
+		return autoBuyPlan{}, nil, "当前盘口价格未就绪，已放弃回退追单", false
+	}
+
+	if lastUpdate.IsZero() {
+		lastUpdate = time.Now()
+	}
+	referenceUpdate := s.price.btcUpdateTS
+	if referenceUpdate.IsZero() {
+		referenceUpdate = time.Now()
+	}
+	sideAge := time.Since(lastUpdate).Seconds()
+	referenceAge := time.Since(referenceUpdate).Seconds()
+	if sideAge > s.cfg.MarketDataMaxLagSec || referenceAge > s.cfg.MarketDataMaxLagSec {
+		return autoBuyPlan{}, nil, fmt.Sprintf(
+			"超时后盘口延迟 %.2fs / 参考价延迟 %.2fs，已放弃回退追单",
+			sideAge,
+			referenceAge,
+		), false
+	}
+
+	diffBps := calcRelativeDiffBps(referencePrice, ptb)
+	condition, ok := s.resolveFallbackConditionLocked(pending.WindowSec, price, diffBps)
+	if !ok {
+		return autoBuyPlan{}, nil, "超时后当前信号已不再满足原窗口条件，已放弃回退追单", false
+	}
+	if slippage := entryPriceSlippage(price, displayPrice); slippage > s.cfg.SlippageThreshold {
+		return autoBuyPlan{}, nil, fmt.Sprintf(
+			"超时后候选价格滑点 %.4f 超过阈值 %.4f，已放弃回退追单",
+			slippage,
+			s.cfg.SlippageThreshold,
+		), false
+	}
+	if ok, reason := s.validateBinanceEntryLocked(side, referencePrice, derefFloat(s.price.binance), ptb); !ok {
+		return autoBuyPlan{}, nil, reason, false
+	}
+
+	thresholdBps := autoTradeThresholdBps(condition, referencePrice, ptb)
+	netEdgeBps := estimateNetEdgeBps(
+		math.Abs(diffBps),
+		thresholdBps,
+		price,
+		displayPrice,
+		bestBid,
+		bestAsk,
+		s.marketFeeRateBps,
+		false,
+	)
+	if netEdgeBps < s.cfg.MinNetEdgeBps {
+		return autoBuyPlan{}, nil, fmt.Sprintf(
+			"超时后净边际 %.2fbps 低于阈值 %.2fbps，已放弃回退追单",
+			netEdgeBps,
+			s.cfg.MinNetEdgeBps,
+		), false
+	}
+
+	tradeAmount := pending.Amount
+	if tradeAmount <= 0 && pending.Size > 0 && pending.Price > 0 {
+		tradeAmount = pending.Size * pending.Price
+	}
+	if tradeAmount <= 0 {
+		tradeAmount = s.cfg.TradeAmount
+	}
+	if err := validateMinimumBuyShares(tradeAmount, price); err != nil {
+		return autoBuyPlan{}, nil, err.Error(), false
+	}
+
+	orderKey := ""
+	retryCount := 0
+	if s.state.LastOrder != nil {
+		orderKey = strings.TrimSpace(s.state.LastOrder.Key)
+		retryCount = s.state.LastOrder.RetryCount
+	}
+	if orderKey == "" {
+		orderKey = fmt.Sprintf("%s|timeout-fallback|%s", strings.TrimSpace(pending.Slug), side)
+	}
+
+	plan := autoBuyPlan{
+		side:         side,
+		tokenID:      tokenID,
+		price:        price,
+		reason:       fmt.Sprintf("maker 超时回退: 剩余≤%ds 且价差满足阈值(%s)", pending.WindowSec, formatConditionDiffThreshold(condition)),
+		orderKey:     orderKey,
+		retryCount:   retryCount,
+		tradeAmount:  tradeAmount,
+		diff:         diff,
+		windowSec:    pending.WindowSec,
+		strategyKey:  pending.StrategyKey,
+		execution:    "maker_timeout_fallback",
+		postOnly:     false,
+		orderType:    "GTC",
+		expirationTS: 0,
+		netEdgeBps:   netEdgeBps,
+	}
+	return plan, cloneActiveMarket(s.activeMarket), "", true
+}
+
 // buildAutoBuyDecisionLocked 在持锁状态下评估本轮是否满足自动买入条件。
 func (s *PolymarketService) buildAutoBuyDecisionLocked() autoTradeDecision {
 	decision := autoTradeDecision{
@@ -1116,6 +1479,12 @@ func (s *PolymarketService) buildAutoBuyDecisionLocked() autoTradeDecision {
 	}
 	if s.activeMarket == nil {
 		s.resetSignalConfirmationLocked()
+		return decision
+	}
+	if s.cfg.MainStrategyConfigured && !s.cfg.MainStrategyEnabled {
+		s.resetSignalConfirmationLocked()
+		decision.reasonCode = autoTradeRejectBlockedByState
+		decision.reason = "当前市场主策略已关闭，仅观察价格或等待尾盘策略"
 		return decision
 	}
 	remaining := remainingSeconds(s.activeMarket.End)
@@ -1401,6 +1770,174 @@ func (s *PolymarketService) buildAutoBuyDecisionLocked() autoTradeDecision {
 	return decision
 }
 
+// buildTailSweepDecisionLocked 在尾盘窗口内评估是否触发独立的扫尾巴策略。
+func (s *PolymarketService) buildTailSweepDecisionLocked() autoTradeDecision {
+	decision := autoTradeDecision{
+		reasonCode: autoTradeRejectNoMarket,
+		reason:     "尾盘扫尾策略未命中",
+	}
+	if !s.cfg.TailSweepEnabled || !s.cfg.TailSweepAllowed {
+		return decision
+	}
+	if s.activeMarket == nil {
+		return decision
+	}
+
+	remaining := remainingSeconds(s.activeMarket.End)
+	if remaining <= 0 || s.cfg.TailSweepFinalSec <= 0 || remaining > s.cfg.TailSweepFinalSec {
+		return decision
+	}
+	if s.state.PendingOrder != nil || s.state.Position != nil {
+		return decision
+	}
+
+	referencePrice := derefFloat(s.price.btc)
+	ptb := derefFloat(s.price.ptb)
+	binancePrice := derefFloat(s.price.binance)
+	if referencePrice <= 0 || ptb <= 0 {
+		return decision
+	}
+
+	diff := referencePrice - ptb
+	diffBps := math.Abs(calcRelativeDiffBps(referencePrice, ptb))
+	if diffBps < s.cfg.TailSweepMinDiffBps {
+		return decision
+	}
+	side := resolveAutoTradeConditionSide(diff)
+	if side == "" {
+		return decision
+	}
+
+	var price float64
+	var bestBid float64
+	var bestAsk float64
+	var lastUpdate time.Time
+	tokenID := s.activeMarket.UpToken
+	switch side {
+	case "UP":
+		price = firstPositive(s.price.upAsk, s.price.upPrice, s.activeMarket.UpPrice)
+		bestBid = derefFloat(s.price.upBid)
+		bestAsk = derefFloat(s.price.upAsk)
+		lastUpdate = s.price.upUpdateTS
+	case "DOWN":
+		price = firstPositive(s.price.downAsk, s.price.downPrice, s.activeMarket.DownPrice)
+		bestBid = derefFloat(s.price.downBid)
+		bestAsk = derefFloat(s.price.downAsk)
+		lastUpdate = s.price.downUpdateTS
+		tokenID = s.activeMarket.DownToken
+	}
+	if price <= 0 || bestBid <= 0 || bestAsk <= 0 || tokenID == "" {
+		return decision
+	}
+
+	maxProb := s.cfg.TailSweepMaxProb
+	if s.cfg.TailSweepMaxPrice > 0 && (maxProb <= 0 || s.cfg.TailSweepMaxPrice < maxProb) {
+		maxProb = s.cfg.TailSweepMaxPrice
+	}
+	if price < s.cfg.TailSweepMinProb || (maxProb > 0 && price > maxProb) {
+		return decision
+	}
+	if bestAsk-bestBid > s.cfg.TailSweepMaxSpread {
+		return decision
+	}
+
+	referenceUpdate := s.price.btcUpdateTS
+	if referenceUpdate.IsZero() {
+		referenceUpdate = time.Now()
+	}
+	if lastUpdate.IsZero() {
+		lastUpdate = time.Now()
+	}
+	if time.Since(referenceUpdate).Seconds() > s.cfg.TailSweepMaxLagSec || time.Since(lastUpdate).Seconds() > s.cfg.TailSweepMaxLagSec {
+		return decision
+	}
+	if ok, _ := validateBinanceEntry(
+		side,
+		referencePrice,
+		binancePrice,
+		ptb,
+		s.cfg.TailSweepRequireBinance,
+		s.cfg.BinanceConfirmMinBps,
+		s.cfg.BinanceVetoMaxDevBps,
+	); !ok {
+		return decision
+	}
+
+	strategyKey := buildTailSweepStrategyKey(s.cfg.ResolvedMarketKey(), s.cfg.TailSweepFinalSec, side)
+	orderKey := fmt.Sprintf("%s|tail-sweep|%ds|%s", s.activeMarket.Slug, s.cfg.TailSweepFinalSec, side)
+	retryCount := 0
+	if s.state.LastOrder != nil && s.state.LastOrder.Key == orderKey {
+		retryCount = s.state.LastOrder.RetryCount
+		if retryCount >= s.cfg.MaxRetryPerMarket {
+			return decision
+		}
+	}
+	if s.cfg.TailSweepMaxTradesPerHour > 0 && s.countRecentTailSweepEntriesLocked(time.Now().Add(-1*time.Hour)) >= s.cfg.TailSweepMaxTradesPerHour {
+		return decision
+	}
+
+	tradeAmount := s.cfg.TradeAmount * s.cfg.TailSweepSizeRatio
+	minRequiredAmount := price * minPolymarketBuyShares
+	if tradeAmount < minRequiredAmount {
+		tradeAmount = minRequiredAmount
+	}
+	if err := validateMinimumBuyShares(tradeAmount, price); err != nil {
+		return decision
+	}
+	netEdgeBps := estimateNetEdgeBps(
+		diffBps,
+		s.cfg.TailSweepMinDiffBps,
+		price,
+		price,
+		bestBid,
+		bestAsk,
+		s.marketFeeRateBps,
+		false,
+	)
+	if netEdgeBps < s.cfg.MinNetEdgeBps {
+		return decision
+	}
+	if s.autoTradeGuard != nil {
+		if err := s.autoTradeGuard(autoTradeRiskRequest{
+			MarketSlug:       s.activeMarket.Slug,
+			MarketKey:        s.cfg.ResolvedMarketKey(),
+			StrategyMode:     strategyModeTailSweep,
+			Side:             side,
+			TradeAmount:      tradeAmount,
+			CurrentPrice:     price,
+			WindowSec:        s.cfg.TailSweepFinalSec,
+			StrategyKey:      strategyKey,
+			LossStreakLimit:  s.cfg.TailSweepLossStreakLimit,
+			DisableLookback:  s.cfg.TailSweepDisableLookback,
+			DisableMinProfit: s.cfg.TailSweepDisableMinProfit,
+		}); err != nil {
+			return decision
+		}
+	}
+
+	decision.ok = true
+	decision.reasonCode = autoTradeRejectNone
+	decision.reason = ""
+	decision.plan = autoBuyPlan{
+		side:         side,
+		tokenID:      tokenID,
+		price:        price,
+		reason:       fmt.Sprintf("尾盘扫尾: 剩余≤%ds 且 价差>=%.2fbps", s.cfg.TailSweepFinalSec, s.cfg.TailSweepMinDiffBps),
+		orderKey:     orderKey,
+		retryCount:   retryCount,
+		tradeAmount:  tradeAmount,
+		diff:         diff,
+		windowSec:    s.cfg.TailSweepFinalSec,
+		strategyKey:  strategyKey,
+		execution:    "tail_sweep_limit",
+		postOnly:     false,
+		orderType:    "GTC",
+		expirationTS: 0,
+		netEdgeBps:   netEdgeBps,
+	}
+	return decision
+}
+
 // managePosition 负责已开仓位的止盈与止损逻辑。
 func (s *PolymarketService) managePosition(ctx context.Context) {
 	s.mu.RLock()
@@ -1415,6 +1952,9 @@ func (s *PolymarketService) managePosition(ctx context.Context) {
 	s.mu.RUnlock()
 
 	if market == nil || position == nil || position.Slug != market.Slug {
+		return
+	}
+	if s.cfg.TailSweepHoldToSettlement && isTailSweepStrategyKey(position.StrategyKey) {
 		return
 	}
 
@@ -1691,10 +2231,20 @@ func (s *PolymarketService) shouldHoldStopLoss(side string, remaining int) bool 
 	return true
 }
 
-// currentDiffLocked 返回当前外部参考价与 PTB 的绝对价差。
+// currentDiffLocked 返回当前外部参考价与策略目标价的绝对价差。
 func (s *PolymarketService) currentDiffLocked() float64 {
 	btc := derefFloat(s.price.btc)
 	ptb := derefFloat(s.price.ptb)
+	if btc <= 0 || ptb <= 0 {
+		return 0
+	}
+	return btc - ptb
+}
+
+// currentDisplayDiffLocked 返回当前外部参考价与展示 PTB 的绝对价差。
+func (s *PolymarketService) currentDisplayDiffLocked() float64 {
+	btc := derefFloat(s.price.btc)
+	ptb := derefFloat(firstFloatPtr(s.price.ptbDisplay, s.price.ptb))
 	if btc <= 0 || ptb <= 0 {
 		return 0
 	}
@@ -1749,6 +2299,21 @@ func buildStrategyKey(marketKey string, slot int, windowSec int, side string) st
 	)
 }
 
+// buildTailSweepStrategyKey 为尾盘扫尾巴策略生成独立的策略键。
+func buildTailSweepStrategyKey(marketKey string, windowSec int, side string) string {
+	return fmt.Sprintf(
+		"%s|tail-sweep|%ds|%s",
+		strings.TrimSpace(marketKey),
+		windowSec,
+		strings.ToUpper(strings.TrimSpace(side)),
+	)
+}
+
+// isTailSweepStrategyKey 判断某条策略键是否属于尾盘扫尾巴策略。
+func isTailSweepStrategyKey(strategyKey string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(strategyKey)), "|tail-sweep|")
+}
+
 // entryPriceSlippage 计算候选买价相对展示价/参考价的实际偏离，用于拦截宽价差下的坏成交。
 func entryPriceSlippage(candidatePrice, referencePrice float64) float64 {
 	if candidatePrice <= 0 || referencePrice <= 0 {
@@ -1768,6 +2333,23 @@ func matchesAutoTradeDiff(condition infraPolymarket.ConditionConfig, diffBps flo
 	return math.Abs(diffBps) >= condition.DiffBps
 }
 
+// resolveFallbackConditionLocked 在 maker 超时回退时，确认当前价格仍然满足原始窗口档位。
+func (s *PolymarketService) resolveFallbackConditionLocked(windowSec int, price, diffBps float64) (infraPolymarket.ConditionConfig, bool) {
+	for _, condition := range orderedAutoTradeConditions(s.cfg.Conditions) {
+		if condition.Time <= 0 || condition.Time != windowSec {
+			continue
+		}
+		if !matchesAutoTradeDiff(condition, diffBps) {
+			continue
+		}
+		if price < condition.MinProb || price > condition.MaxProb {
+			continue
+		}
+		return condition, true
+	}
+	return infraPolymarket.ConditionConfig{}, false
+}
+
 // resolveAutoTradeConditionSide 根据当前差值正负，自动得出本次应买的方向。
 func resolveAutoTradeConditionSide(diff float64) string {
 	switch {
@@ -1782,30 +2364,39 @@ func resolveAutoTradeConditionSide(diff float64) string {
 
 // validateBinanceEntryLocked 使用 Binance 作为第二数据源做方向确认和异常偏差否决。
 func (s *PolymarketService) validateBinanceEntryLocked(side string, referencePrice, binancePrice, ptb float64) (bool, string) {
-	needsBinance := s.cfg.BinanceRequireAlign || s.cfg.BinanceConfirmMinBps > 0 || s.cfg.BinanceVetoMaxDevBps > 0
+	return validateBinanceEntry(
+		side,
+		referencePrice,
+		binancePrice,
+		ptb,
+		s.cfg.BinanceRequireAlign,
+		s.cfg.BinanceConfirmMinBps,
+		s.cfg.BinanceVetoMaxDevBps,
+	)
+}
+
+// validateBinanceEntry 使用 Binance 作为第二数据源做方向确认和异常偏差否决。
+func validateBinanceEntry(side string, referencePrice, binancePrice, ptb float64, requireAlign bool, confirmBps, maxDevBps float64) (bool, string) {
+	needsBinance := requireAlign || confirmBps > 0 || maxDevBps > 0
 	if !needsBinance {
 		return true, ""
 	}
 	if binancePrice <= 0 {
 		return false, "Binance 参考价未就绪，已开启双源确认"
 	}
-
-	// 先拦截双源之间过大的瞬时偏差，避免单一数据源异常触发开仓。
-	if s.cfg.BinanceVetoMaxDevBps > 0 {
+	if maxDevBps > 0 {
 		sourceDeviation := math.Abs(calcRelativeDiffBps(referencePrice, binancePrice))
-		if sourceDeviation > s.cfg.BinanceVetoMaxDevBps {
+		if sourceDeviation > maxDevBps {
 			return false, fmt.Sprintf(
 				"Chainlink 与 Binance 偏差 %.2fbps，超过 %.2fbps",
 				sourceDeviation,
-				s.cfg.BinanceVetoMaxDevBps,
+				maxDevBps,
 			)
 		}
 	}
 
-	// 再要求 Binance 与 PTB 的偏离方向至少和主信号一致，避免只靠单一数据源冲动下单。
 	binanceDiff := binancePrice - ptb
 	binanceDiffBps := math.Abs(calcRelativeDiffBps(binancePrice, ptb))
-	confirmBps := s.cfg.BinanceConfirmMinBps
 	switch strings.ToUpper(strings.TrimSpace(side)) {
 	case "UP":
 		if binanceDiff <= 0 || binanceDiffBps < confirmBps {
@@ -1888,6 +2479,28 @@ func validateMinimumBuyShares(amount, price float64) error {
 	)
 }
 
+// countRecentTailSweepEntriesLocked 统计最近窗口期内已经提交过多少次尾盘扫尾买单。
+func (s *PolymarketService) countRecentTailSweepEntriesLocked(since time.Time) int {
+	count := 0
+	for _, item := range s.state.TradeHistory {
+		if !strings.EqualFold(strings.TrimSpace(item.Action), "BUY") {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(item.Status), "submitted") {
+			continue
+		}
+		if !isTailSweepStrategyKey(item.StrategyKey) {
+			continue
+		}
+		parsed, err := time.Parse("2006-01-02 15:04:05", item.Time)
+		if err == nil && parsed.Before(since) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 // orderedAutoTradeConditions 按时间窗口从近到远排序条件，避免编号顺序影响实际匹配优先级。
 func orderedAutoTradeConditions(in []infraPolymarket.ConditionConfig) []infraPolymarket.ConditionConfig {
 	out := append([]infraPolymarket.ConditionConfig(nil), in...)
@@ -1948,16 +2561,18 @@ func (s *PolymarketService) syncDashboardLocked() {
 		}
 	}
 
-	diff := s.currentDiffLocked()
-	diffAbs := absFloat(diff)
+	displayDiff := s.currentDisplayDiffLocked()
+	displayDiffAbs := absFloat(displayDiff)
 	var diffPtr *float64
 	var diffAbsPtr *float64
-	if diff != 0 {
-		diffPtr = floatPtr(diff)
-		diffAbsPtr = floatPtr(diffAbs)
+	if displayDiff != 0 {
+		diffPtr = floatPtr(displayDiff)
+		diffAbsPtr = floatPtr(displayDiffAbs)
 	}
+	strategyTarget := cloneFloatPtr(s.price.ptb)
 	s.dashboard.Prices = entity.DashboardPrices{
-		PTB:          cloneFloatPtr(s.price.ptb),
+		PTB:          cloneFloatPtr(firstFloatPtr(s.price.ptbDisplay, s.price.ptb)),
+		TargetPrice:  strategyTarget,
 		ChainlinkBTC: cloneFloatPtr(s.price.btc),
 		BinanceBTC:   cloneFloatPtr(s.price.binance),
 		UpPrice:      cloneFloatPtr(firstFloatPtr(s.price.upPrice, s.activeMarketPriceLocked("UP"))),
@@ -1981,7 +2596,7 @@ func (s *PolymarketService) syncDashboardLocked() {
 		s.activeMarket,
 		s.state.Position,
 		s.state.PendingOrder,
-		diff,
+		s.currentDiffLocked(),
 	)
 }
 
@@ -2062,7 +2677,8 @@ func (s *PolymarketService) recordAutoTradeDecisionLocked(decision autoTradeDeci
 // persistLocked 把当前交易状态持久化到本地仓储。
 func (s *PolymarketService) persistLocked(ctx context.Context) {
 	stateCopy := s.state
-	stateCopy.PTB = cloneFloatPtr(s.price.ptb)
+	stateCopy.PTB = cloneFloatPtr(firstFloatPtr(s.price.ptbDisplay, s.price.ptb))
+	stateCopy.PTBTarget = cloneFloatPtr(s.price.ptb)
 	stateCopy.Chainlink = cloneFloatPtr(s.price.btc)
 	stateCopy.Binance = cloneFloatPtr(s.price.binance)
 	stateCopy.UpPrice = cloneFloatPtr(firstFloatPtr(s.price.upPrice, s.activeMarketPriceLocked("UP")))
@@ -2152,6 +2768,7 @@ func cloneDashboard(in entity.DashboardState) entity.DashboardState {
 	out.Markets = cloneTrackedMarkets(in.Markets)
 	out.StrategyPerformance = cloneStrategyPerformance(in.StrategyPerformance)
 	out.Prices.PTB = cloneFloatPtr(in.Prices.PTB)
+	out.Prices.TargetPrice = cloneFloatPtr(in.Prices.TargetPrice)
 	out.Prices.ChainlinkBTC = cloneFloatPtr(in.Prices.ChainlinkBTC)
 	out.Prices.BinanceBTC = cloneFloatPtr(in.Prices.BinanceBTC)
 	out.Prices.UpPrice = cloneFloatPtr(in.Prices.UpPrice)
@@ -2199,6 +2816,7 @@ func cloneAutoTradeConfigView(in entity.AutoTradeConfigView) entity.AutoTradeCon
 // buildAutoTradeConfigView 把当前 worker 的配置转换成前端更容易观察的只读摘要。
 func buildAutoTradeConfigView(cfg infraPolymarket.Config) entity.AutoTradeConfigView {
 	out := entity.AutoTradeConfigView{
+		MainStrategyEnabled:        cfg.MainStrategyEnabled,
 		TradeAmount:                cfg.TradeAmount,
 		ConfirmSec:                 cfg.AutoTradeConfirmSec,
 		MarketDataMaxLagSec:        cfg.MarketDataMaxLagSec,
@@ -2213,6 +2831,20 @@ func buildAutoTradeConfigView(cfg infraPolymarket.Config) entity.AutoTradeConfig
 		BinanceRequireAlign:        cfg.BinanceRequireAlign,
 		BinanceConfirmMinBps:       cfg.BinanceConfirmMinBps,
 		BinanceVetoMaxDevBps:       cfg.BinanceVetoMaxDevBps,
+		TailSweepEnabled:           cfg.TailSweepEnabled,
+		TailSweepAllowed:           cfg.TailSweepAllowed,
+		TailSweepFinalSec:          cfg.TailSweepFinalSec,
+		TailSweepMinDiffBps:        cfg.TailSweepMinDiffBps,
+		TailSweepMinProb:           cfg.TailSweepMinProb,
+		TailSweepMaxProb:           cfg.TailSweepMaxProb,
+		TailSweepMaxPrice:          cfg.TailSweepMaxPrice,
+		TailSweepRequireBinance:    cfg.TailSweepRequireBinance,
+		TailSweepMaxLagSec:         cfg.TailSweepMaxLagSec,
+		TailSweepMaxSpread:         cfg.TailSweepMaxSpread,
+		TailSweepSizeRatio:         cfg.TailSweepSizeRatio,
+		TailSweepMaxTradesPerHour:  cfg.TailSweepMaxTradesPerHour,
+		TailSweepLossStreakLimit:   cfg.TailSweepLossStreakLimit,
+		TailSweepHoldToSettlement:  cfg.TailSweepHoldToSettlement,
 		Conditions:                 make([]entity.AutoTradeConditionView, 0, len(cfg.Conditions)),
 	}
 	for _, condition := range orderedAutoTradeConditions(cfg.Conditions) {
@@ -2667,14 +3299,35 @@ func adjustedSellSizeFromError(err error, requestedSize float64) (float64, bool)
 
 // remainingSeconds 计算距离市场结束还剩多少秒。
 func remainingSeconds(endAt string) int {
-	if strings.TrimSpace(endAt) == "" {
-		return 0
-	}
-	t, err := time.Parse(time.RFC3339, strings.Replace(endAt, "Z", "+00:00", 1))
-	if err != nil {
+	t, ok := parseRFC3339Loose(endAt)
+	if !ok {
 		return 0
 	}
 	return int(time.Until(t).Seconds())
+}
+
+// parseRFC3339Loose 兼容 `Z` 和显式偏移两种 RFC3339 时间格式。
+func parseRFC3339Loose(raw string) (time.Time, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, strings.Replace(raw, "Z", "+00:00", 1))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// nextPTBPrewarmLeadSec 返回提前预热下一轮 PTB 的时间窗口。
+// 这里固定在“切盘前最多 120 秒”内开始预热，避免 5m/15m 新轮次刚开始时长时间空白。
+func nextPTBPrewarmLeadSec(intervalSec int) int {
+	if intervalSec <= 0 {
+		return 120
+	}
+	if intervalSec < 120 {
+		return intervalSec
+	}
+	return 120
 }
 
 // statusText 根据成功与否返回两个候选状态文本之一。

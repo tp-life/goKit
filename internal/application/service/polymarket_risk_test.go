@@ -115,7 +115,7 @@ func TestBuildStrategyPerformanceFromHistory(t *testing.T) {
 		},
 	}
 
-	out := buildStrategyPerformanceFromHistory(rows, 4, 0, false)
+	out := buildStrategyPerformanceFromHistory(rows, nil, 4, 0, false)
 	if len(out) != 1 {
 		t.Fatalf("expected one strategy row, got %d", len(out))
 	}
@@ -124,6 +124,50 @@ func TestBuildStrategyPerformanceFromHistory(t *testing.T) {
 	}
 	if out[0].Trades != 1 || out[0].Wins != 1 || out[0].Profit <= 0 {
 		t.Fatalf("unexpected strategy profit summary: %+v", out[0])
+	}
+}
+
+// TestBuildStrategyPerformanceFromHistoryUsesClosedLiveTradesForTailSweep 确认持有到结算的尾盘策略也能进入收益榜。
+func TestBuildStrategyPerformanceFromHistoryUsesClosedLiveTradesForTailSweep(t *testing.T) {
+	rows := []entity.TradeHistoryItem{
+		{
+			Time:        "2026-04-01 10:14:50",
+			Slug:        "btc-updown-15m-1",
+			Action:      "BUY",
+			Side:        "UP",
+			Price:       0.85,
+			Amount:      4.25,
+			Size:        5,
+			OrderID:     "tail-buy-1",
+			Status:      "filled",
+			Reason:      "尾盘扫尾: 剩余≤20s 且 价差>=9.00bps",
+			WindowSec:   20,
+			StrategyKey: "btc-15m|tail-sweep|20s|UP",
+			Execution:   "tail_sweep_limit",
+		},
+	}
+	liveTrades := []entity.LiveTradeSummary{
+		{
+			ID:         "agg-btc-tail-1",
+			Slug:       "btc-updown-15m-1",
+			Direction:  "UP",
+			OrderTime:  "2026-04-01T10:14:50Z",
+			SettleTime: "2026-04-01T10:15:00Z",
+			Profit:     0.75,
+			Result:     "CLOSED",
+			Status:     "resolved",
+		},
+	}
+
+	out := buildStrategyPerformanceFromHistory(rows, liveTrades, 4, 0, false)
+	if len(out) != 1 {
+		t.Fatalf("expected one strategy row, got %d", len(out))
+	}
+	if out[0].Mode != "tail-sweep" {
+		t.Fatalf("expected tail-sweep mode, got %+v", out[0])
+	}
+	if out[0].Trades != 1 || out[0].Profit <= 0 {
+		t.Fatalf("expected closed tail sweep trade to contribute profit, got %+v", out[0])
 	}
 }
 

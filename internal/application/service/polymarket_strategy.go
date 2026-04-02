@@ -23,6 +23,7 @@ type strategyClosedTrade struct {
 	StrategyKey string
 	MarketKey   string
 	MarketSlug  string
+	Mode        string
 	Side        string
 	WindowSec   int
 	Profit      float64
@@ -30,8 +31,8 @@ type strategyClosedTrade struct {
 }
 
 // buildStrategyPerformanceFromHistory 从本地闭环成交历史中恢复策略收益榜。
-func buildStrategyPerformanceFromHistory(history []entity.TradeHistoryItem, lookback int, minProfit float64, autoDisable bool) []entity.StrategyPerformance {
-	closedTrades := buildClosedStrategyTrades(history)
+func buildStrategyPerformanceFromHistory(history []entity.TradeHistoryItem, liveTrades []entity.LiveTradeSummary, lookback int, minProfit float64, autoDisable bool) []entity.StrategyPerformance {
+	closedTrades := buildClosedStrategyTrades(history, liveTrades)
 	if len(closedTrades) == 0 {
 		return []entity.StrategyPerformance{}
 	}
@@ -70,6 +71,7 @@ func buildStrategyPerformanceFromHistory(history []entity.TradeHistoryItem, look
 			StrategyKey:  effective[0].StrategyKey,
 			MarketKey:    effective[0].MarketKey,
 			MarketSlug:   effective[0].MarketSlug,
+			Mode:         effective[0].Mode,
 			Side:         effective[0].Side,
 			WindowSec:    effective[0].WindowSec,
 			Trades:       len(effective),
@@ -100,7 +102,7 @@ func buildStrategyPerformanceFromHistory(history []entity.TradeHistoryItem, look
 }
 
 // buildClosedStrategyTrades 把本地买卖成交流水恢复成闭环收益记录。
-func buildClosedStrategyTrades(history []entity.TradeHistoryItem) []strategyClosedTrade {
+func buildClosedStrategyTrades(history []entity.TradeHistoryItem, liveTrades []entity.LiveTradeSummary) []strategyClosedTrade {
 	sorted := cloneHistory(history)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].Time < sorted[j].Time
@@ -148,6 +150,7 @@ func buildClosedStrategyTrades(history []entity.TradeHistoryItem) []strategyClos
 				StrategyKey: entry.StrategyKey,
 				MarketKey:   entry.MarketKey,
 				MarketSlug:  entry.MarketSlug,
+				Mode:        strategyModeFromKey(entry.StrategyKey),
 				Side:        entry.Side,
 				WindowSec:   entry.WindowSec,
 				Profit:      proceeds - entry.Cost,
@@ -155,6 +158,39 @@ func buildClosedStrategyTrades(history []entity.TradeHistoryItem) []strategyClos
 			})
 			delete(openEntries, slotKey)
 		}
+	}
+
+	// 对于“持有到结算”的策略，本地历史里可能没有 SELL，
+	// 这里用账户聚合后的 closed live trades 为未闭合的本地买单补一条闭环记录。
+	sortedLive := cloneLiveTrades(liveTrades)
+	sort.SliceStable(sortedLive, func(i, j int) bool {
+		return firstPresentString(sortedLive[i].SettleTime, sortedLive[i].OrderTime, sortedLive[i].ID) <
+			firstPresentString(sortedLive[j].SettleTime, sortedLive[j].OrderTime, sortedLive[j].ID)
+	})
+	for _, row := range sortedLive {
+		if !strings.EqualFold(strings.TrimSpace(row.Result), "CLOSED") {
+			continue
+		}
+		side := strings.ToUpper(strings.TrimSpace(normalizeOutcomeLabel(row.Direction)))
+		if side == "" || side == "-" || strings.EqualFold(side, "MIX") {
+			continue
+		}
+		slotKey := strings.ToLower(strings.TrimSpace(row.Slug)) + "|" + side
+		entry, ok := openEntries[slotKey]
+		if !ok {
+			continue
+		}
+		out = append(out, strategyClosedTrade{
+			StrategyKey: entry.StrategyKey,
+			MarketKey:   entry.MarketKey,
+			MarketSlug:  entry.MarketSlug,
+			Mode:        strategyModeFromKey(entry.StrategyKey),
+			Side:        entry.Side,
+			WindowSec:   entry.WindowSec,
+			Profit:      row.Profit,
+			ClosedAt:    firstPresentString(row.SettleTime, row.OrderTime, row.ID),
+		})
+		delete(openEntries, slotKey)
 	}
 	return out
 }
@@ -181,6 +217,15 @@ func enrichStrategyHistoryItem(item entity.TradeHistoryItem, submitted entity.Tr
 		out.StrategyKey = buildStrategyKey(extractMarketKey(out), 0, out.WindowSec, out.Side)
 	}
 	return out
+}
+
+// strategyModeFromKey 从策略键中提取策略模式，便于把主策略与尾盘策略分开统计。
+func strategyModeFromKey(key string) string {
+	parts := strings.Split(strings.TrimSpace(key), "|")
+	if len(parts) >= 2 && strings.EqualFold(strings.TrimSpace(parts[1]), "tail-sweep") {
+		return "tail-sweep"
+	}
+	return "main"
 }
 
 // extractMarketKey 优先从 strategy key 还原市场键，否则按 slug 退化生成。
@@ -229,10 +274,17 @@ func parseWindowSecFromReason(reason string) int {
 
 // negativeStrategyBlockReasonLocked 根据最近闭环表现决定是否临时停用某个策略桶。
 func (m *PolymarketManager) negativeStrategyBlockReasonLocked(req autoTradeRiskRequest) string {
+	lookback := m.cfg.AutoDisableLookback
+	minProfit := m.cfg.AutoDisableMinProfit
+	if req.DisableLookback > 0 {
+		lookback = req.DisableLookback
+		minProfit = req.DisableMinProfit
+	}
 	leaderboard := buildStrategyPerformanceFromHistory(
 		m.mergeTradeHistoryLocked(),
-		m.cfg.AutoDisableLookback,
-		m.cfg.AutoDisableMinProfit,
+		cloneLiveTrades(m.snapshot.LiveTrades),
+		lookback,
+		minProfit,
 		true,
 	)
 	for _, item := range leaderboard {
@@ -243,6 +295,22 @@ func (m *PolymarketManager) negativeStrategyBlockReasonLocked(req autoTradeRiskR
 			return "策略已自动停用: " + item.DisableReason
 		}
 		return ""
+	}
+	return ""
+}
+
+// strategyLossStreakBlockReasonLocked 根据最近连续亏损结果，决定是否临时停用指定策略桶。
+func (m *PolymarketManager) strategyLossStreakBlockReasonLocked(req autoTradeRiskRequest) string {
+	if req.LossStreakLimit <= 0 || strings.TrimSpace(req.StrategyKey) == "" {
+		return ""
+	}
+	streak := computeStrategyLossStreak(
+		m.mergeTradeHistoryLocked(),
+		cloneLiveTrades(m.snapshot.LiveTrades),
+		req.StrategyKey,
+	)
+	if streak >= req.LossStreakLimit {
+		return fmt.Sprintf("策略连续亏损 %d 笔，达到上限 %d", streak, req.LossStreakLimit)
 	}
 	return ""
 }
@@ -260,6 +328,7 @@ func (m *PolymarketManager) recommendAutoTradeAmount(req autoTradeSizeRequest) f
 	m.mu.RLock()
 	leaderboard := buildStrategyPerformanceFromHistory(
 		m.mergeTradeHistoryLocked(),
+		cloneLiveTrades(m.snapshot.LiveTrades),
 		m.cfg.AutoSizeLookback,
 		m.cfg.AutoDisableMinProfit,
 		false,
@@ -297,4 +366,32 @@ func (m *PolymarketManager) recommendAutoTradeAmount(req autoTradeSizeRequest) f
 		return base * multiplier
 	}
 	return base
+}
+
+// computeStrategyLossStreak 统计某个策略桶最近连续闭环交易中的亏损次数。
+func computeStrategyLossStreak(history []entity.TradeHistoryItem, liveTrades []entity.LiveTradeSummary, strategyKey string) int {
+	key := strings.TrimSpace(strategyKey)
+	if key == "" {
+		return 0
+	}
+	rows := buildClosedStrategyTrades(history, liveTrades)
+	filtered := make([]strategyClosedTrade, 0, len(rows))
+	for _, row := range rows {
+		if strings.TrimSpace(row.StrategyKey) != key {
+			continue
+		}
+		filtered = append(filtered, row)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return filtered[i].ClosedAt > filtered[j].ClosedAt
+	})
+	streak := 0
+	for _, row := range filtered {
+		if row.Profit < -1e-9 {
+			streak++
+			continue
+		}
+		break
+	}
+	return streak
 }
