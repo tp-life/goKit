@@ -490,6 +490,15 @@ func TestUpdateActiveMarketUsesPrewarmedPTBImmediately(t *testing.T) {
 	}
 }
 
+func TestBuildPostOnlyExpirationTSAddsSecurityThresholdAndSafetyBuffer(t *testing.T) {
+	now := time.Unix(1_775_123_000, 0)
+	got := buildPostOnlyExpirationTS(now, 2)
+	want := now.Add(time.Duration(clobGTDExpirationSecurityThresholdSec+clobGTDLocalSafetyBufferSec+2) * time.Second).Unix()
+	if got != want {
+		t.Fatalf("expected GTD expiration %d, got %d", want, got)
+	}
+}
+
 func TestBuildRoundResultsAddsResolvedAndActiveRows(t *testing.T) {
 	now := time.Now()
 	results := buildRoundResults(

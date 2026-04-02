@@ -855,9 +855,8 @@ func (m model) renderOverviewTab() string {
 
 	topRight := m.renderPanel("市场列表（并行监控，仅切换焦点）", m.renderTrackedMarketsLines())
 	conditions := m.renderWidePanel("当前条件", m.renderAutoTradeConfigLines())
-	diagnostics := m.renderWidePanel("自动交易诊断", m.renderAutoTradeDiagnosticsLines())
-	mainPerformance := m.renderWidePanel("主策略收益榜", m.renderStrategyPerformanceLinesByMode("main"))
-	tailPerformance := m.renderWidePanel("尾盘策略收益榜", m.renderStrategyPerformanceLinesByMode("tail-sweep"))
+	mainPerformance := m.renderPanel("主策略收益榜", m.renderStrategyPerformanceLinesByMode("main"))
+	tailPerformance := m.renderPanel("尾盘策略收益榜", m.renderStrategyPerformanceLinesByMode("tail-sweep"))
 	bottomLeft := m.renderPanel("价格趋势", m.renderPriceTrendLines())
 	bottomRight := m.renderPanel("轮次结果", renderRoundResults(m.state.RoundResults, 6))
 	logs := m.renderWidePanel("最新日志", renderLogs(m.state.Activity, 8))
@@ -866,9 +865,7 @@ func (m model) renderOverviewTab() string {
 		lipgloss.Left,
 		lipgloss.JoinHorizontal(lipgloss.Top, topLeft, topRight),
 		conditions,
-		diagnostics,
-		mainPerformance,
-		tailPerformance,
+		lipgloss.JoinHorizontal(lipgloss.Top, mainPerformance, tailPerformance),
 		lipgloss.JoinHorizontal(lipgloss.Top, bottomLeft, bottomRight),
 		logs,
 	)
@@ -1001,6 +998,7 @@ func (m model) renderTradeTab() string {
 			m.renderPanel("盘口参考", referenceLines),
 		),
 		m.renderPanel("操作说明", helpLines),
+		m.renderWidePanel("自动交易诊断", m.renderAutoTradeDiagnosticsLines()),
 	)
 }
 

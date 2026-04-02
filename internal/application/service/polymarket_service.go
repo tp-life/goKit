@@ -45,6 +45,8 @@ const (
 
 const minPolymarketBuyShares = 5.0
 const strategyModeTailSweep = "tail-sweep"
+const clobGTDExpirationSecurityThresholdSec = 60
+const clobGTDLocalSafetyBufferSec = 5
 
 // autoTradeDecision 表示一次自动交易评估的结果与归因。
 type autoTradeDecision struct {
@@ -1630,8 +1632,9 @@ func (s *PolymarketService) buildAutoBuyDecisionLocked() autoTradeDecision {
 			executionMode = "maker_gtd"
 			orderType = "GTD"
 			postOnly = true
-			// GTD 订单至少多留几十秒缓冲，避免刚发出就接近到期。
-			expirationTS = time.Now().Add(time.Duration(60+s.cfg.PostOnlyTTLSec) * time.Second).Unix()
+			// GTD 过期时间除了官方要求的 60 秒安全阈值外，
+			// 还额外留一点本地缓冲，吸收机器时钟偏差与网络排队抖动。
+			expirationTS = buildPostOnlyExpirationTS(time.Now(), s.cfg.PostOnlyTTLSec)
 		}
 		slippage := entryPriceSlippage(price, referenceOutcomePrice)
 		if slippage > s.cfg.SlippageThreshold {
@@ -3328,6 +3331,16 @@ func nextPTBPrewarmLeadSec(intervalSec int) int {
 		return intervalSec
 	}
 	return 120
+}
+
+// buildPostOnlyExpirationTS 生成给 GTD post-only 订单使用的过期时间。
+// Polymarket 会要求 expiration 至少比“当前服务器时间 + 60 秒”更靠后，
+// 这里再额外加一个本地安全缓冲，避免时钟偏差或网络延迟导致偶发 400。
+func buildPostOnlyExpirationTS(now time.Time, ttlSec int) int64 {
+	if ttlSec < 1 {
+		ttlSec = 1
+	}
+	return now.Add(time.Duration(clobGTDExpirationSecurityThresholdSec+clobGTDLocalSafetyBufferSec+ttlSec) * time.Second).Unix()
 }
 
 // statusText 根据成功与否返回两个候选状态文本之一。
