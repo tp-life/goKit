@@ -830,6 +830,39 @@ select {
     align-items: flex-end;
     gap: 6px;
 }
+.detail-tab-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+.detail-tab-btn {
+    appearance: none;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--muted);
+    border-radius: 999px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: 160ms ease;
+}
+.detail-tab-btn:hover {
+    color: var(--text);
+    border-color: rgba(110, 168, 254, 0.32);
+    background: rgba(110, 168, 254, 0.08);
+}
+.detail-tab-btn.active {
+    color: var(--text);
+    border-color: rgba(110, 168, 254, 0.42);
+    background: rgba(110, 168, 254, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0.14);
+}
+.detail-tab-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
 .detail-metric-grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -883,6 +916,22 @@ select {
 .detail-v {
     font-size: 13px;
     text-align: right;
+}
+.detail-diagnostic-grid {
+    margin-bottom: 0;
+}
+.detail-bullet-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.detail-bullet {
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 13px;
+    line-height: 1.65;
 }
 .total-row {
     border-color: rgba(110, 168, 254, 0.25);

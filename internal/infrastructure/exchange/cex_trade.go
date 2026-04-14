@@ -230,6 +230,20 @@ func (c *CEXTradeClient) PlaceOrder(ctx context.Context, req TradeOrderRequest) 
 	if req.ReduceOnly {
 		params.Set("reduceOnly", "true")
 	}
+	if requiresStopPrice(orderType) {
+		if req.StopPrice <= 0 {
+			return TradeOrderResult{}, fmt.Errorf("%s stop order missing stop price", c.name)
+		}
+		params.Set("stopPrice", formatFloat(req.StopPrice, 8))
+		workingType := strings.ToUpper(strings.TrimSpace(req.WorkingType))
+		if workingType == "" {
+			workingType = "MARK_PRICE"
+		}
+		params.Set("workingType", workingType)
+		if req.PriceProtect {
+			params.Set("priceProtect", "TRUE")
+		}
+	}
 	var respPayload map[string]any
 	raw, err := c.signedPOST(ctx, c.orderPath, params, &respPayload)
 	if err != nil {
@@ -246,6 +260,16 @@ func (c *CEXTradeClient) PlaceOrder(ctx context.Context, req TradeOrderRequest) 
 		AveragePrice:    parseNullableFloat(respPayload["avgPrice"]),
 		RawResponse:     raw,
 	}, nil
+}
+
+func (c *CEXTradeClient) PlaceProtectiveStop(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error) {
+	req.OrderType = "STOP_MARKET"
+	req.ReduceOnly = true
+	if strings.TrimSpace(req.WorkingType) == "" {
+		req.WorkingType = "MARK_PRICE"
+	}
+	req.PriceProtect = true
+	return c.PlaceOrder(ctx, req)
 }
 
 func (c *CEXTradeClient) ClosePosition(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error) {
@@ -346,13 +370,14 @@ func (c *CEXTradeClient) GetPosition(ctx context.Context, canonicalSymbol, venue
 			continue
 		}
 		return Position{
-			Exchange:      c.name,
-			Symbol:        canonicalSymbol,
-			VenueSymbol:   venueSymbol,
-			Quantity:      parseNullableFloat(item["positionAmt"]),
-			EntryPrice:    parseNullableFloat(item["entryPrice"]),
-			MarkPrice:     parseNullableFloat(item["markPrice"]),
-			UnrealizedPnL: parseNullableFloat(item["unRealizedProfit"]),
+			Exchange:         c.name,
+			Symbol:           canonicalSymbol,
+			VenueSymbol:      venueSymbol,
+			Quantity:         parseNullableFloat(item["positionAmt"]),
+			EntryPrice:       parseNullableFloat(item["entryPrice"]),
+			MarkPrice:        parseNullableFloat(item["markPrice"]),
+			LiquidationPrice: parseNullableFloat(item["liquidationPrice"]),
+			UnrealizedPnL:    parseNullableFloat(item["unRealizedProfit"]),
 		}, nil
 	}
 	return Position{Exchange: c.name, Symbol: canonicalSymbol, VenueSymbol: venueSymbol}, nil
@@ -888,4 +913,13 @@ func formatFloat(v float64, decimals int) string {
 		return "0"
 	}
 	return text
+}
+
+func requiresStopPrice(orderType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(orderType)) {
+	case "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET":
+		return true
+	default:
+		return false
+	}
 }

@@ -57,15 +57,48 @@ type ExecutionPlan struct {
 	NetExpectedPNLBps      float64 `json:"net_expected_pnl_bps"`
 	Score                  float64 `gorm:"index:idx_plan_score" json:"score"`
 
-	EarliestFundingTimeMs        int64   `json:"earliest_funding_time_ms"`
-	LatestFundingTimeMs          int64   `json:"latest_funding_time_ms"`
-	ProjectedFundingTimeMs       int64   `json:"projected_funding_time_ms"`
-	RequiredEntryByFundingTimeMs int64   `json:"required_entry_by_funding_time_ms"`
-	LongFundingEventCount        int     `json:"long_funding_event_count"`
-	ShortFundingEventCount       int     `json:"short_funding_event_count"`
-	FundingWindowHours           float64 `json:"funding_window_hours"`
-	StrategyMode                 string  `gorm:"size:64" json:"strategy_mode"`
-	FundingComputationMode       string  `gorm:"size:64" json:"funding_computation_mode"`
+	EarliestFundingTimeMs                        int64   `json:"earliest_funding_time_ms"`
+	LatestFundingTimeMs                          int64   `json:"latest_funding_time_ms"`
+	ProjectedFundingTimeMs                       int64   `json:"projected_funding_time_ms"`
+	RequiredEntryByFundingTimeMs                 int64   `json:"required_entry_by_funding_time_ms"`
+	LongFundingEventCount                        int     `json:"long_funding_event_count"`
+	ShortFundingEventCount                       int     `json:"short_funding_event_count"`
+	FundingWindowHours                           float64 `json:"funding_window_hours"`
+	ArbitrageMode                                string  `gorm:"size:64" json:"arbitrage_mode"`
+	StrategyMode                                 string  `gorm:"size:64" json:"strategy_mode"`
+	FundingComputationMode                       string  `gorm:"size:64" json:"funding_computation_mode"`
+	PerpFundingRank                              int     `json:"perp_funding_rank,omitempty"`
+	PerpFundingRankTotal                         int     `json:"perp_funding_rank_total,omitempty"`
+	PerpFundingRankPercentile                    float64 `json:"perp_funding_rank_percentile,omitempty"`
+	PerpFundingHistorySampleCount                int     `json:"perp_funding_history_sample_count,omitempty"`
+	PerpFundingHistoryMeanRate                   float64 `json:"perp_funding_history_mean_rate,omitempty"`
+	PerpFundingHistoryNegativeRatio              float64 `json:"perp_funding_history_negative_ratio,omitempty"`
+	PerpFundingHistoryPositiveRatio              float64 `json:"perp_funding_history_positive_ratio,omitempty"`
+	PerpFundingHistoricalSupportRatio            float64 `json:"perp_funding_historical_support_ratio,omitempty"`
+	PerpFundingCurrentHistoricalPercentile       float64 `json:"perp_funding_current_historical_percentile,omitempty"`
+	PerpFundingEstimatedEventRate                float64 `json:"perp_funding_estimated_event_rate,omitempty"`
+	PerpFundingEstimatedAnnualizedCarryRate      float64 `json:"perp_funding_estimated_annualized_carry_rate,omitempty"`
+	PerpFundingEstimatedAnnualizedNetRate        float64 `json:"perp_funding_estimated_annualized_net_rate,omitempty"`
+	SameExchangeLongHoldEligible                 bool    `json:"same_exchange_long_hold_eligible,omitempty"`
+	SameExchangeLongHoldReason                   string  `gorm:"size:64" json:"same_exchange_long_hold_reason,omitempty"`
+	SameExchangeLongHoldUsingHistoryEstimate     bool    `json:"same_exchange_long_hold_using_history_estimate,omitempty"`
+	SameExchangeLongHoldSuggestedFundingEvents   int     `json:"same_exchange_long_hold_suggested_funding_events,omitempty"`
+	SameExchangeLongHoldSuggestedHoldHours       float64 `json:"same_exchange_long_hold_suggested_hold_hours,omitempty"`
+	SameExchangeLongHoldSuggestedFundingTimeMs   int64   `json:"same_exchange_long_hold_suggested_funding_time_ms,omitempty"`
+	SameExchangeLongHoldSuggestedGrossFundingPNL float64 `json:"same_exchange_long_hold_suggested_gross_funding_pnl,omitempty"`
+	SameExchangeLongHoldSuggestedNetPNL          float64 `json:"same_exchange_long_hold_suggested_net_pnl,omitempty"`
+	SameExchangePriceRiskAllowed                 bool    `json:"same_exchange_price_risk_allowed"`
+	SameExchangePriceRiskReason                  string  `gorm:"size:64" json:"same_exchange_price_risk_reason,omitempty"`
+	SameExchangePriceShockCurrentMarkPrice       float64 `json:"same_exchange_price_shock_current_mark_price"`
+	SameExchangePriceShockBaselineMarkPrice      float64 `json:"same_exchange_price_shock_baseline_mark_price"`
+	SameExchangePriceShockRatio                  float64 `json:"same_exchange_price_shock_ratio"`
+	SameExchangeBasisUsesPaybackModel            bool    `json:"same_exchange_basis_uses_payback_model"`
+	SameExchangeBasisCostBps                     float64 `json:"same_exchange_basis_cost_bps"`
+	SameExchangeBasisCarryPerEventBps            float64 `json:"same_exchange_basis_carry_per_event_bps"`
+	SameExchangeBasisPaybackFundingEvents        float64 `json:"same_exchange_basis_payback_funding_events"`
+	SameExchangeBasisAllowed                     bool    `json:"same_exchange_basis_allowed"`
+	SameExchangeBasisReason                      string  `gorm:"size:64" json:"same_exchange_basis_reason,omitempty"`
+	SameExchangeBasisRiskSizeMultiplier          float64 `json:"same_exchange_basis_risk_size_multiplier"`
 	// NextReviewTimeMs 是 rolling 模式下“下一次必须重新判断续持/翻仓”的最早时点。
 	//
 	// legacy 模式仍主要依赖固定的 ProjectedFundingTimeMs / TargetCloseTimeMs；

@@ -19,6 +19,7 @@ type LivePositionInspection struct {
 	InSync        int                     `json:"in_sync"`
 	AwaitingFill  int                     `json:"awaiting_fill"`
 	SingleLeg     int                     `json:"single_leg"`
+	SizeMismatch  int                     `json:"size_mismatch"`
 	Flat          int                     `json:"flat"`
 	SideMismatch  int                     `json:"side_mismatch"`
 	Errors        int                     `json:"errors"`
@@ -26,24 +27,52 @@ type LivePositionInspection struct {
 }
 
 type LivePositionCandidate struct {
-	Execution  entity.ExecutionRecord    `json:"execution"`
-	Plan       *entity.ExecutionPlan     `json:"plan,omitempty"`
-	LongLeg    LivePositionLegInspection `json:"long_leg"`
-	ShortLeg   LivePositionLegInspection `json:"short_leg"`
-	SyncStatus string                    `json:"sync_status"`
-	Summary    string                    `json:"summary"`
+	Execution  entity.ExecutionRecord         `json:"execution"`
+	Plan       *entity.ExecutionPlan          `json:"plan,omitempty"`
+	LongLeg    LivePositionLegInspection      `json:"long_leg"`
+	ShortLeg   LivePositionLegInspection      `json:"short_leg"`
+	Risk       SameExchangeLiveRiskInspection `json:"risk,omitempty"`
+	SyncStatus string                         `json:"sync_status"`
+	Summary    string                         `json:"summary"`
 }
 
 type LivePositionLegInspection struct {
-	Role         string            `json:"role"`
-	Exchange     string            `json:"exchange"`
-	VenueSymbol  string            `json:"venue_symbol"`
-	ExpectedSide string            `json:"expected_side"`
-	ExpectedQty  float64           `json:"expected_qty"`
-	Position     exchange.Position `json:"position"`
-	HasPosition  bool              `json:"has_position"`
-	DirectionOK  bool              `json:"direction_ok"`
-	Error        string            `json:"error,omitempty"`
+	Role          string            `json:"role"`
+	Exchange      string            `json:"exchange"`
+	VenueSymbol   string            `json:"venue_symbol"`
+	ExpectedSide  string            `json:"expected_side"`
+	ExpectedQty   float64           `json:"expected_qty"`
+	ObservedQty   float64           `json:"observed_qty"`
+	QtyDelta      float64           `json:"qty_delta"`
+	QtyDeltaRatio float64           `json:"qty_delta_ratio"`
+	Position      exchange.Position `json:"position"`
+	HasPosition   bool              `json:"has_position"`
+	DirectionOK   bool              `json:"direction_ok"`
+	SizeOK        bool              `json:"size_ok"`
+	Error         string            `json:"error,omitempty"`
+}
+
+type SameExchangeLiveRiskInspection struct {
+	Enabled                      bool    `json:"enabled"`
+	PriceShockAllowed            bool    `json:"price_shock_allowed"`
+	PriceShockReason             string  `json:"price_shock_reason,omitempty"`
+	PriceShockRatio              float64 `json:"price_shock_ratio"`
+	PriceShockThresholdRatio     float64 `json:"price_shock_threshold_ratio"`
+	PriceShockCurrentMarkPrice   float64 `json:"price_shock_current_mark_price"`
+	PriceShockBaselineMarkPrice  float64 `json:"price_shock_baseline_mark_price"`
+	LiquidationPrice             float64 `json:"liquidation_price"`
+	LiquidationDistanceRatio     float64 `json:"liquidation_distance_ratio"`
+	MinLiqDistanceRatio          float64 `json:"min_liq_distance_ratio"`
+	ReduceLiqDistanceRatio       float64 `json:"reduce_liq_distance_ratio"`
+	EmergencyLiqDistanceRatio    float64 `json:"emergency_liq_distance_ratio"`
+	ProtectiveOrderArmed         bool    `json:"protective_order_armed"`
+	ProtectiveOrderStatus        string  `json:"protective_order_status,omitempty"`
+	ProtectiveOrderStopPrice     float64 `json:"protective_order_stop_price"`
+	ProtectiveOrderExchange      string  `json:"protective_order_exchange,omitempty"`
+	ProtectiveOrderVenueSymbol   string  `json:"protective_order_venue_symbol,omitempty"`
+	ProtectiveOrderClientOrderID string  `json:"protective_order_client_order_id,omitempty"`
+	ProtectiveOrderUpdatedAtMs   int64   `json:"protective_order_updated_at_ms"`
+	ProtectiveOrderErrorMessage  string  `json:"protective_order_error_message,omitempty"`
 }
 
 func (s *ExecutionService) InspectLivePositions(ctx context.Context) (LivePositionInspection, error) {
@@ -67,44 +96,78 @@ func (s *ExecutionService) ReconcileLivePositions(ctx context.Context) (int, err
 	}
 	reconciled := 0
 	for _, candidate := range inspection.Candidates {
-		if !shouldReconcileFlatLivePosition(candidate) {
-			continue
-		}
-		rec := candidate.Execution
-		if err := applyExecutionEvent(&rec, executionEvent{
-			Name:         "external_positions_flat",
-			TargetStatus: executionStateClosed,
-			Reason:       buildExternalFlatPositionReason(candidate),
-			OccurredAtMs: inspection.EvaluatedAtMs,
-		}, externalFlatCloseTransitions); err != nil {
+		switch {
+		case shouldReconcileFlatLivePosition(candidate):
+			rec := candidate.Execution
+			if err := applyExecutionEvent(&rec, executionEvent{
+				Name:         "external_positions_flat",
+				TargetStatus: executionStateClosed,
+				Reason:       buildExternalFlatPositionReason(candidate),
+				OccurredAtMs: inspection.EvaluatedAtMs,
+			}, externalFlatCloseTransitions); err != nil {
+				if s.logger != nil {
+					s.logger.Error(
+						"execution_live_position_reconcile_failed",
+						slog.String("plan_key", rec.PlanKey),
+						slog.String("status", rec.Status),
+						slog.String("sync_status", candidate.SyncStatus),
+						slog.Any("err", err),
+					)
+				}
+				continue
+			}
+			if rec.ClosedAtMs == 0 {
+				rec.ClosedAtMs = inspection.EvaluatedAtMs
+			}
+			rec.LastError = ""
+			if err := s.execRepo.Upsert(ctx, &rec); err != nil {
+				return reconciled, err
+			}
+			reconciled++
 			if s.logger != nil {
-				s.logger.Error(
-					"execution_live_position_reconcile_failed",
+				s.logger.Info(
+					"execution_live_position_reconciled_closed",
 					slog.String("plan_key", rec.PlanKey),
-					slog.String("status", rec.Status),
+					slog.String("symbol", rec.Symbol),
+					slog.String("previous_status", candidate.Execution.Status),
 					slog.String("sync_status", candidate.SyncStatus),
-					slog.Any("err", err),
+					slog.String("reason", rec.StatusReason),
 				)
 			}
-			continue
-		}
-		if rec.ClosedAtMs == 0 {
-			rec.ClosedAtMs = inspection.EvaluatedAtMs
-		}
-		rec.LastError = ""
-		if err := s.execRepo.Upsert(ctx, &rec); err != nil {
-			return reconciled, err
-		}
-		reconciled++
-		if s.logger != nil {
-			s.logger.Info(
-				"execution_live_position_reconciled_closed",
-				slog.String("plan_key", rec.PlanKey),
-				slog.String("symbol", rec.Symbol),
-				slog.String("previous_status", candidate.Execution.Status),
-				slog.String("sync_status", candidate.SyncStatus),
-				slog.String("reason", rec.StatusReason),
-			)
+		case shouldForceCloseAbnormalLivePosition(s.cfg, candidate):
+			if candidate.Plan == nil || !candidate.Execution.LiveTrading || !candidate.Execution.AutoClose {
+				continue
+			}
+			closedRec, closeErr := s.closePlan(ctx, candidate.Plan, "live_position_monitor", candidate.Execution.LiveTrading)
+			if closeErr != nil {
+				if s.logger != nil {
+					s.logger.Error(
+						"execution_live_position_force_close_failed",
+						slog.String("plan_key", candidate.Execution.PlanKey),
+						slog.String("sync_status", candidate.SyncStatus),
+						slog.Any("err", closeErr),
+					)
+				}
+				continue
+			}
+			if closedRec == nil {
+				continue
+			}
+			closedRec.StatusReason = buildAbnormalLivePositionReason(candidate)
+			closedRec.LastError = ""
+			if err := s.execRepo.Upsert(ctx, closedRec); err != nil {
+				return reconciled, err
+			}
+			reconciled++
+			if s.logger != nil {
+				s.logger.Warn(
+					"execution_live_position_force_close_triggered",
+					slog.String("plan_key", candidate.Execution.PlanKey),
+					slog.String("symbol", candidate.Execution.Symbol),
+					slog.String("sync_status", candidate.SyncStatus),
+					slog.String("reason", closedRec.StatusReason),
+				)
+			}
 		}
 	}
 	return reconciled, nil
@@ -154,6 +217,7 @@ func (s *ExecutionService) evaluateLivePositionCandidate(ctx context.Context, re
 	candidate.Plan = plan
 	candidate.LongLeg = s.inspectLivePositionLeg(ctx, rec.Symbol, rec.LongExchange, plan.LongVenueSymbol, "LONG", plan.LongQty)
 	candidate.ShortLeg = s.inspectLivePositionLeg(ctx, rec.Symbol, rec.ShortExchange, plan.ShortVenueSymbol, "SHORT", plan.ShortQty)
+	candidate.Risk = s.inspectSameExchangeLiveRisk(ctx, rec, plan, candidate.LongLeg, candidate.ShortLeg)
 
 	switch {
 	case candidate.LongLeg.Error != "" || candidate.ShortLeg.Error != "":
@@ -168,12 +232,18 @@ func (s *ExecutionService) evaluateLivePositionCandidate(ctx context.Context, re
 	case candidate.LongLeg.HasPosition != candidate.ShortLeg.HasPosition:
 		candidate.SyncStatus = "single_leg"
 		candidate.Summary = "only one venue leg currently has live exposure"
+	case !candidate.LongLeg.DirectionOK || !candidate.ShortLeg.DirectionOK:
+		candidate.SyncStatus = "side_mismatch"
+		candidate.Summary = "venue exposure exists, but at least one leg direction differs from the expected side"
+	case !candidate.LongLeg.SizeOK || !candidate.ShortLeg.SizeOK:
+		candidate.SyncStatus = "size_mismatch"
+		candidate.Summary = "venue exposure exists, but at least one leg quantity deviates materially from the planned hedge size"
 	case candidate.LongLeg.DirectionOK && candidate.ShortLeg.DirectionOK:
 		candidate.SyncStatus = "in_sync"
 		candidate.Summary = "both venue legs have exposure matching the expected direction"
 	default:
-		candidate.SyncStatus = "side_mismatch"
-		candidate.Summary = "venue exposure exists, but at least one leg direction differs from the expected side"
+		candidate.SyncStatus = "error"
+		candidate.Summary = "live position state cannot be classified"
 	}
 	return candidate
 }
@@ -211,7 +281,14 @@ func (s *ExecutionService) inspectLivePositionLeg(ctx context.Context, canonical
 	}
 	leg.Position = pos
 	leg.HasPosition = math.Abs(pos.Quantity) > 1e-9
+	leg.ObservedQty = math.Abs(pos.Quantity)
 	leg.DirectionOK = !leg.HasPosition || positionMatchesExpectedDirection(expectedSide, pos.Quantity)
+	leg.SizeOK = true
+	if expectedQty > 0 {
+		leg.QtyDelta = math.Abs(leg.ObservedQty - expectedQty)
+		leg.QtyDeltaRatio = leg.QtyDelta / expectedQty
+		leg.SizeOK = leg.QtyDeltaRatio <= s.cfg.ExecutionPositionMonitorMaxQtyDeviationRatio+1e-9
+	}
 	return leg
 }
 
@@ -228,6 +305,19 @@ func shouldReconcileFlatLivePosition(candidate LivePositionCandidate) bool {
 	return strings.EqualFold(strings.TrimSpace(candidate.SyncStatus), "flat")
 }
 
+func shouldForceCloseAbnormalLivePosition(cfg Config, candidate LivePositionCandidate) bool {
+	switch strings.ToLower(strings.TrimSpace(candidate.SyncStatus)) {
+	case "single_leg":
+		return cfg.ExecutionPositionMonitorForceCloseOnSingleLeg
+	case "side_mismatch":
+		return cfg.ExecutionPositionMonitorForceCloseOnSideMismatch
+	case "size_mismatch":
+		return cfg.ExecutionPositionMonitorForceCloseOnSizeMismatch
+	default:
+		return false
+	}
+}
+
 func buildExternalFlatPositionReason(candidate LivePositionCandidate) string {
 	parts := []string{
 		"both venue legs are flat on exchange",
@@ -240,6 +330,20 @@ func buildExternalFlatPositionReason(candidate LivePositionCandidate) string {
 	}
 	parts = append(parts, "marking execution as externally closed")
 	return strings.Join(parts, "; ")
+}
+
+func buildAbnormalLivePositionReason(candidate LivePositionCandidate) string {
+	parts := []string{
+		fmt.Sprintf("live position monitor detected %s", strings.TrimSpace(candidate.SyncStatus)),
+		strings.TrimSpace(candidate.Summary),
+	}
+	if candidate.LongLeg.ExpectedQty > 0 && !candidate.LongLeg.SizeOK {
+		parts = append(parts, fmt.Sprintf("long qty deviation %.2f%%", candidate.LongLeg.QtyDeltaRatio*100))
+	}
+	if candidate.ShortLeg.ExpectedQty > 0 && !candidate.ShortLeg.SizeOK {
+		parts = append(parts, fmt.Sprintf("short qty deviation %.2f%%", candidate.ShortLeg.QtyDeltaRatio*100))
+	}
+	return joinLivePositionErrors(parts...)
 }
 
 func joinLivePositionErrors(values ...string) string {
@@ -268,6 +372,8 @@ func summarizeLivePositionInspection(now time.Time, candidates []LivePositionCan
 			out.AwaitingFill++
 		case "single_leg":
 			out.SingleLeg++
+		case "size_mismatch":
+			out.SizeMismatch++
 		case "flat":
 			out.Flat++
 		case "side_mismatch":
@@ -304,11 +410,13 @@ func livePositionSeverity(status string) int {
 		return 1
 	case "side_mismatch":
 		return 2
-	case "flat":
+	case "size_mismatch":
 		return 3
-	case "awaiting_fill":
+	case "flat":
 		return 4
-	default:
+	case "awaiting_fill":
 		return 5
+	default:
+		return 6
 	}
 }

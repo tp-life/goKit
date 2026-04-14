@@ -51,19 +51,21 @@ type exchangeFailureState struct {
 type ExecutionServiceParams struct {
 	fx.In
 
-	Cfg       Config
-	Logger    *slog.Logger
-	Store     *MarketStore
-	PlanRepo  repository.ExecutionPlanRepository
-	ExecRepo  repository.ExecutionRepository
-	OrderRepo repository.OrderRepository
-	Trades    []exchange.TradeAdapter `group:"trades"`
+	Cfg        Config
+	Logger     *slog.Logger
+	Store      *MarketStore
+	MarketRepo repository.MarketDataRepository
+	PlanRepo   repository.ExecutionPlanRepository
+	ExecRepo   repository.ExecutionRepository
+	OrderRepo  repository.OrderRepository
+	Trades     []exchange.TradeAdapter `group:"trades"`
 }
 
 type ExecutionService struct {
 	cfg             Config
 	logger          *slog.Logger
 	store           *MarketStore
+	marketRepo      repository.MarketDataRepository
 	planRepo        repository.ExecutionPlanRepository
 	execRepo        repository.ExecutionRepository
 	orderRepo       repository.OrderRepository
@@ -81,6 +83,7 @@ func NewExecutionService(p ExecutionServiceParams) *ExecutionService {
 		cfg:             p.Cfg.normalize(),
 		logger:          p.Logger,
 		store:           p.Store,
+		marketRepo:      p.MarketRepo,
 		planRepo:        p.PlanRepo,
 		execRepo:        p.ExecRepo,
 		orderRepo:       p.OrderRepo,
@@ -125,11 +128,14 @@ func (s *ExecutionService) loop(ctx context.Context) {
 			if _, err := s.ReconcileLivePositions(ctx); err != nil {
 				s.logger.Error("execution_live_position_reconcile_loop_failed", slog.Any("err", err))
 			}
+			if s.cfg.Execution.AutoClose {
+				s.runRollingMonitor(ctx)
+				s.runActiveReplacement(ctx)
+			}
 			if s.cfg.Execution.AutoEntry {
 				s.runAutoOpen(ctx)
 			}
 			if s.cfg.Execution.AutoClose {
-				s.runRollingMonitor(ctx)
 				s.runAutoClose(ctx)
 			}
 		}
@@ -585,6 +591,9 @@ func (s *ExecutionService) openPlan(ctx context.Context, plan *entity.ExecutionP
 	if err := s.execRepo.Upsert(ctx, rec); err != nil {
 		return nil, err
 	}
+	if finalStatus == executionStateOpened {
+		s.armSameExchangeProtection(ctx, plan, rec)
+	}
 	if errMsg != "" {
 		return rec, fmt.Errorf("%s", errMsg)
 	}
@@ -675,6 +684,9 @@ func (s *ExecutionService) closePlan(ctx context.Context, plan *entity.Execution
 	if err := s.execRepo.Upsert(ctx, rec); err != nil {
 		return nil, err
 	}
+	if finalStatus == executionStateClosed {
+		s.cancelSameExchangeProtection(ctx, plan)
+	}
 	if errMsg != "" {
 		return rec, fmt.Errorf("%s", errMsg)
 	}
@@ -706,6 +718,7 @@ func (s *ExecutionService) newExecutionRecord(plan *entity.ExecutionPlan, live b
 		Symbol:                plan.Symbol,
 		LongExchange:          plan.LongExchange,
 		ShortExchange:         plan.ShortExchange,
+		ArbitrageMode:         normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange)),
 		StrategyMode:          normalizedPlanStrategyMode(*plan),
 		LiveTrading:           live,
 		AutoClose:             s.cfg.Execution.AutoClose,
@@ -1192,15 +1205,18 @@ func (s *ExecutionService) enforceRiskControls(ctx context.Context, plan *entity
 	// 1. adapter/venue 当前不可用；
 	// 2. 账户权益或可用余额明显不足；
 	// 3. 这次开仓会让 symbol / exchange 暴露超过配置上限。
+	longMeta, _ := s.store.Symbol(plan.LongExchange, plan.Symbol)
+	shortMeta, _ := s.store.Symbol(plan.ShortExchange, plan.Symbol)
 	legs := []struct {
 		exchange string
 		venue    string
 		assetID  string
+		meta     entity.Symbol
 		qty      float64
 		price    float64
 	}{
-		{exchange: plan.LongExchange, venue: plan.LongVenueSymbol, qty: plan.LongQty, price: plan.LongEntryPrice},
-		{exchange: plan.ShortExchange, venue: plan.ShortVenueSymbol, qty: plan.ShortQty, price: plan.ShortEntryPrice},
+		{exchange: plan.LongExchange, venue: plan.LongVenueSymbol, assetID: longMeta.VenueAssetID, meta: longMeta, qty: plan.LongQty, price: plan.LongEntryPrice},
+		{exchange: plan.ShortExchange, venue: plan.ShortVenueSymbol, assetID: shortMeta.VenueAssetID, meta: shortMeta, qty: plan.ShortQty, price: plan.ShortEntryPrice},
 	}
 	var symbolExposure float64
 	exchangeExposure := map[string]float64{}
@@ -1219,17 +1235,30 @@ func (s *ExecutionService) enforceRiskControls(ctx context.Context, plan *entity
 		}
 		s.registerAPISuccess(leg.exchange)
 		notional := math.Abs(leg.qty * leg.price)
-		if s.cfg.Execution.MinAccountEquityUSDT > 0 && acct.Equity > 0 && acct.Equity < s.cfg.Execution.MinAccountEquityUSDT {
+		requiredCapital := notional / math.Max(effectivePlanLeverage(s.cfg, plan, leg.meta), 1)
+		if isSpotSymbol(leg.meta) {
+			requiredCapital = notional
+		}
+		if !isSpotSymbol(leg.meta) && s.cfg.Execution.MinAccountEquityUSDT > 0 && acct.Equity > 0 && acct.Equity < s.cfg.Execution.MinAccountEquityUSDT {
 			return fmt.Errorf("risk check: %s equity %.4f below minimum %.4f", leg.exchange, acct.Equity, s.cfg.Execution.MinAccountEquityUSDT)
 		}
-		if acct.Equity > 0 && acct.AvailableBalance/acct.Equity < s.cfg.Execution.MinAvailableBalanceRatio {
+		if !isSpotSymbol(leg.meta) && acct.Equity > 0 && acct.AvailableBalance/acct.Equity < s.cfg.Execution.MinAvailableBalanceRatio {
 			return fmt.Errorf("risk check: %s available ratio %.4f below minimum %.4f", leg.exchange, acct.AvailableBalance/acct.Equity, s.cfg.Execution.MinAvailableBalanceRatio)
 		}
-		if acct.AvailableBalance > 0 && acct.AvailableBalance < notional/math.Max(s.cfg.Leverage, 1) {
-			return fmt.Errorf("risk check: %s available balance %.4f below required margin %.4f", leg.exchange, acct.AvailableBalance, notional/math.Max(s.cfg.Leverage, 1))
+		if acct.AvailableBalance > 0 && acct.AvailableBalance < requiredCapital {
+			return fmt.Errorf("risk check: %s available balance %.4f below required capital %.4f", leg.exchange, acct.AvailableBalance, requiredCapital)
 		}
 		pos, err := adapter.GetPosition(ctx, plan.Symbol, leg.venue, leg.assetID)
 		if err == nil {
+			if normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange)) == ArbitrageModeSameExchangeSpotPerp &&
+				!isSpotSymbol(leg.meta) &&
+				s.cfg.SameExchangeMinLiqDistanceRatio > 0 &&
+				math.Abs(pos.Quantity) > 1e-9 &&
+				pos.LiquidationPrice > 0 {
+				if liqDistance := positionLiquidationDistanceRatio(pos); liqDistance > 0 && liqDistance < s.cfg.SameExchangeMinLiqDistanceRatio {
+					return fmt.Errorf("risk check: %s liquidation distance %.4f below minimum %.4f", leg.exchange, liqDistance, s.cfg.SameExchangeMinLiqDistanceRatio)
+				}
+			}
 			ref := firstPositiveFloat(pos.MarkPrice, pos.EntryPrice, leg.price)
 			existing := math.Abs(pos.Quantity * ref)
 			symbolExposure += existing + notional

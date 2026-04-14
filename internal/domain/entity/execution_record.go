@@ -10,6 +10,7 @@ type ExecutionRecord struct {
 	Symbol                string  `gorm:"size:64;index" json:"symbol"`
 	LongExchange          string  `gorm:"size:32" json:"long_exchange"`
 	ShortExchange         string  `gorm:"size:32" json:"short_exchange"`
+	ArbitrageMode         string  `gorm:"size:64" json:"arbitrage_mode"`
 	StrategyMode          string  `gorm:"size:64" json:"strategy_mode"`
 	Status                string  `gorm:"size:32;index" json:"status"`
 	LiveTrading           bool    `json:"live_trading"`

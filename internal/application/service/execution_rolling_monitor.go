@@ -181,11 +181,11 @@ func (s *ExecutionService) evaluateRollingMonitorDecision(ctx context.Context, n
 		return rollingMonitorDecision{Action: rollingMonitorActionNone}, nil
 	}
 
-	longFunding, okLong := s.store.LatestFunding(plan.LongExchange, plan.Symbol)
-	shortFunding, okShort := s.store.LatestFunding(plan.ShortExchange, plan.Symbol)
-	if !(okLong && okShort) {
+	snapshots, ok := loadPairFundingSnapshot(s.store, s.cfg, plan.Symbol, plan.LongExchange, plan.ShortExchange)
+	if !ok {
 		return s.rollingSnapshotWaitOrTimeoutDecision(now, rec, plan, "latest funding snapshot is missing"), nil
 	}
+	longFunding, shortFunding := snapshots.LongFunding, snapshots.ShortFunding
 
 	if !s.rollingReviewSnapshotsReady(now, rec, plan, longFunding, shortFunding) {
 		return s.rollingSnapshotWaitOrTimeoutDecision(now, rec, plan, "review funding snapshot is not fresh enough yet"), nil
@@ -214,18 +214,6 @@ func (s *ExecutionService) evaluateRollingMonitorDecision(ctx context.Context, n
 	)
 	sameProjection, sameOK := selectPrimaryFundingProjectionForConfig(s.cfg, samePlan.Projections)
 
-	reversePlan := buildDirectionalFundingPlanForConfig(
-		s.cfg,
-		now,
-		plan.ShortExchange,
-		shortFunding,
-		shortForecast,
-		plan.LongExchange,
-		longFunding,
-		longForecast,
-	)
-	reverseProjection, reverseOK := selectPrimaryFundingProjectionForConfig(s.cfg, reversePlan.Projections)
-
 	// review 阶段优先用当前 execution 实际占用的 notional 来比较净收益门槛。
 	// 这样 continue / flip 的门槛才和真实仓位规模对齐。
 	notional := firstPositiveFloat(rec.AllocatedNotionalUSDT, plan.RoundedNotionalUSDT, plan.TargetNotionalUSDT)
@@ -244,6 +232,29 @@ func (s *ExecutionService) evaluateRollingMonitorDecision(ctx context.Context, n
 			}, nil
 		}
 	}
+
+	if normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange)) == ArbitrageModeSameExchangeSpotPerp {
+		if s.cfg.RollingReviewCloseOnUnprofitable {
+			return rollingMonitorDecision{
+				Action:  rollingMonitorActionClose,
+				Trigger: "rolling_unprofitable",
+				Reason:  "spot-perp review no longer supports same-direction carry",
+			}, nil
+		}
+		return rollingMonitorDecision{Action: rollingMonitorActionNone}, nil
+	}
+
+	reversePlan := buildDirectionalFundingPlanForConfig(
+		s.cfg,
+		now,
+		plan.ShortExchange,
+		shortFunding,
+		shortForecast,
+		plan.LongExchange,
+		longFunding,
+		longForecast,
+	)
+	reverseProjection, reverseOK := selectPrimaryFundingProjectionForConfig(s.cfg, reversePlan.Projections)
 
 	if s.cfg.RollingFlipEnabled && reverseOK && reverseProjection.CarryRate > 0 {
 		flipNetPNL := rollingFlipNetPNL(notional, reverseProjection, plan, s.cfg)
@@ -471,15 +482,13 @@ func (s *ExecutionService) findRollingSuccessorPlan(ctx context.Context, rolling
 // - 但 review 点的翻仓是“旧仓刚平、方向必须立刻切换”的连续动作；
 // - 因此 successor 计划需要允许在普通 entry window 之外被即时构造。
 func (s *ExecutionService) buildRollingSuccessorPlan(now time.Time, rec entity.ExecutionRecord, currentPlan entity.ExecutionPlan, decision rollingMonitorDecision) (*entity.ExecutionPlan, error) {
-	longMeta, okLongMeta := s.store.Symbol(decision.DesiredLongExchange, currentPlan.Symbol)
-	shortMeta, okShortMeta := s.store.Symbol(decision.DesiredShortExchange, currentPlan.Symbol)
-	longBook, okLongBook := s.store.LatestBookTop(decision.DesiredLongExchange, currentPlan.Symbol)
-	shortBook, okShortBook := s.store.LatestBookTop(decision.DesiredShortExchange, currentPlan.Symbol)
-	longFunding, okLongFunding := s.store.LatestFunding(decision.DesiredLongExchange, currentPlan.Symbol)
-	shortFunding, okShortFunding := s.store.LatestFunding(decision.DesiredShortExchange, currentPlan.Symbol)
-	if !(okLongMeta && okShortMeta && okLongBook && okShortBook && okLongFunding && okShortFunding) {
+	snapshots, ok := loadPairMarketSnapshot(s.store, s.cfg, currentPlan.Symbol, decision.DesiredLongExchange, decision.DesiredShortExchange)
+	if !ok {
 		return nil, fmt.Errorf("build rolling successor plan: missing current market snapshots for %s %s/%s", currentPlan.Symbol, decision.DesiredLongExchange, decision.DesiredShortExchange)
 	}
+	longMeta, shortMeta := snapshots.LongMeta, snapshots.ShortMeta
+	longBook, shortBook := snapshots.LongBook, snapshots.ShortBook
+	longFunding, shortFunding := snapshots.LongFunding, snapshots.ShortFunding
 
 	// successor 默认尽量继承当前 live 仓位已经占用的名义。
 	// 这样 flip 更接近“方向切换”，而不是 review 点临时改变风险暴露大小。
@@ -497,66 +506,95 @@ func (s *ExecutionService) buildRollingSuccessorPlan(now time.Time, rec entity.E
 
 	batchID := fmt.Sprintf("rolling-flip-%d", now.UnixMilli())
 	plan := entity.ExecutionPlan{
-		BatchID:                      batchID,
-		OpportunityBatchID:           currentPlan.OpportunityBatchID,
-		Symbol:                       currentPlan.Symbol,
-		RollingGroupKey:              currentPlan.RollingGroupKey,
-		Status:                       "ready",
-		ReadyNow:                     true,
-		LongExchange:                 decision.DesiredLongExchange,
-		ShortExchange:                decision.DesiredShortExchange,
-		LongVenueSymbol:              longMeta.VenueSymbol,
-		ShortVenueSymbol:             shortMeta.VenueSymbol,
-		LongSide:                     "BUY",
-		ShortSide:                    "SELL",
-		EntryMode:                    currentPlan.EntryMode,
-		ExitMode:                     currentPlan.ExitMode,
-		TargetLeverage:               currentPlan.TargetLeverage,
-		CapitalAllocatedUSDT:         currentPlan.CapitalAllocatedUSDT,
-		TargetNotionalUSDT:           targetNotional,
-		RoundedNotionalUSDT:          targetNotional,
-		LongEntryPrice:               round6(longBook.AskPrice),
-		ShortEntryPrice:              round6(shortBook.BidPrice),
-		LongQty:                      round8(longQty),
-		ShortQty:                     round8(shortQty),
-		LongMinQty:                   parseFloat(longMeta.MinQty),
-		ShortMinQty:                  parseFloat(shortMeta.MinQty),
-		LongMinNotionalUSDT:          parseFloat(longMeta.MinNotional),
-		ShortMinNotionalUSDT:         parseFloat(shortMeta.MinNotional),
-		CrossVenueBasisBps:           round4(crossVenueBasisBps(longBook.AskPrice, shortBook.BidPrice)),
-		FundingCarryPNL:              round2(targetNotional * decision.ReverseDirectionProjection.CarryRate),
-		EntryFeePNL:                  currentPlan.EntryFeePNL,
-		ExitFeePNL:                   currentPlan.ExitFeePNL,
-		SlippagePNL:                  currentPlan.SlippagePNL,
-		SafetyBufferPNL:              currentPlan.SafetyBufferPNL,
-		EntryPenaltyBps:              currentPlan.EntryPenaltyBps,
-		ExitPenaltyBps:               currentPlan.ExitPenaltyBps,
-		HedgePenaltyBps:              currentPlan.HedgePenaltyBps,
-		ExecutionPenaltyBps:          currentPlan.ExecutionPenaltyBps,
-		ExecutionPenaltyModel:        currentPlan.ExecutionPenaltyModel,
-		ExecutionPenaltyBucket:       currentPlan.ExecutionPenaltyBucket,
-		NetExpectedPNL:               round2(targetNotional*decision.ReverseDirectionProjection.CarryRate - currentPlan.EntryFeePNL - currentPlan.ExitFeePNL - currentPlan.SlippagePNL - currentPlan.SafetyBufferPNL),
-		EarliestFundingTimeMs:        minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
-		LatestFundingTimeMs:          maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
-		ProjectedFundingTimeMs:       decision.ReverseDirectionProjection.ProjectedFundingTimeMs,
-		RequiredEntryByFundingTimeMs: now.UnixMilli(),
-		LongFundingEventCount:        decision.ReverseDirectionProjection.LongFundingEventCount,
-		ShortFundingEventCount:       decision.ReverseDirectionProjection.ShortFundingEventCount,
-		FundingWindowHours:           decision.ReverseDirectionProjection.FundingWindowHours,
-		StrategyMode:                 StrategyModeRollingCycleAligned,
-		FundingComputationMode:       decision.ReverseDirectionProjection.ComputationMode,
-		NextReviewTimeMs:             decision.NextReviewTimeMs,
-		SyncBoundaryTimeMs:           decision.SyncBoundaryTimeMs,
-		EntryPathSegmentCount:        decision.ReverseDirectionProjection.IncludedSegmentCount,
-		EntryPathStopReason:          decision.ReverseDirectionProjection.PathEndReason,
-		EntryWindowOpenMs:            now.Add(-time.Second).UnixMilli(),
-		EntryWindowCloseMs:           now.Add(time.Minute).UnixMilli(),
-		TargetCloseTimeMs:            decision.NextReviewTimeMs + s.cfg.RollingReviewSettleGracePeriod.Milliseconds(),
-		AsOfTimeMs:                   now.UnixMilli(),
+		BatchID:                                  batchID,
+		OpportunityBatchID:                       currentPlan.OpportunityBatchID,
+		Symbol:                                   currentPlan.Symbol,
+		RollingGroupKey:                          currentPlan.RollingGroupKey,
+		ArbitrageMode:                            currentPlan.ArbitrageMode,
+		Status:                                   "ready",
+		ReadyNow:                                 true,
+		LongExchange:                             decision.DesiredLongExchange,
+		ShortExchange:                            decision.DesiredShortExchange,
+		LongVenueSymbol:                          longMeta.VenueSymbol,
+		ShortVenueSymbol:                         shortMeta.VenueSymbol,
+		LongSide:                                 "BUY",
+		ShortSide:                                "SELL",
+		EntryMode:                                currentPlan.EntryMode,
+		ExitMode:                                 currentPlan.ExitMode,
+		TargetLeverage:                           currentPlan.TargetLeverage,
+		CapitalAllocatedUSDT:                     currentPlan.CapitalAllocatedUSDT,
+		TargetNotionalUSDT:                       targetNotional,
+		RoundedNotionalUSDT:                      targetNotional,
+		LongEntryPrice:                           round6(longBook.AskPrice),
+		ShortEntryPrice:                          round6(shortBook.BidPrice),
+		LongQty:                                  round8(longQty),
+		ShortQty:                                 round8(shortQty),
+		LongMinQty:                               parseFloat(longMeta.MinQty),
+		ShortMinQty:                              parseFloat(shortMeta.MinQty),
+		LongMinNotionalUSDT:                      parseFloat(longMeta.MinNotional),
+		ShortMinNotionalUSDT:                     parseFloat(shortMeta.MinNotional),
+		CrossVenueBasisBps:                       round4(crossVenueBasisBps(longBook.AskPrice, shortBook.BidPrice)),
+		FundingCarryPNL:                          round2(targetNotional * decision.ReverseDirectionProjection.CarryRate),
+		EntryFeePNL:                              currentPlan.EntryFeePNL,
+		ExitFeePNL:                               currentPlan.ExitFeePNL,
+		SlippagePNL:                              currentPlan.SlippagePNL,
+		SafetyBufferPNL:                          currentPlan.SafetyBufferPNL,
+		EntryPenaltyBps:                          currentPlan.EntryPenaltyBps,
+		ExitPenaltyBps:                           currentPlan.ExitPenaltyBps,
+		HedgePenaltyBps:                          currentPlan.HedgePenaltyBps,
+		ExecutionPenaltyBps:                      currentPlan.ExecutionPenaltyBps,
+		ExecutionPenaltyModel:                    currentPlan.ExecutionPenaltyModel,
+		ExecutionPenaltyBucket:                   currentPlan.ExecutionPenaltyBucket,
+		NetExpectedPNL:                           round2(targetNotional*decision.ReverseDirectionProjection.CarryRate - currentPlan.EntryFeePNL - currentPlan.ExitFeePNL - currentPlan.SlippagePNL - currentPlan.SafetyBufferPNL),
+		EarliestFundingTimeMs:                    minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
+		LatestFundingTimeMs:                      maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
+		ProjectedFundingTimeMs:                   decision.ReverseDirectionProjection.ProjectedFundingTimeMs,
+		RequiredEntryByFundingTimeMs:             now.UnixMilli(),
+		LongFundingEventCount:                    decision.ReverseDirectionProjection.LongFundingEventCount,
+		ShortFundingEventCount:                   decision.ReverseDirectionProjection.ShortFundingEventCount,
+		FundingWindowHours:                       decision.ReverseDirectionProjection.FundingWindowHours,
+		StrategyMode:                             StrategyModeRollingCycleAligned,
+		FundingComputationMode:                   decision.ReverseDirectionProjection.ComputationMode,
+		PerpFundingRank:                          currentPlan.PerpFundingRank,
+		PerpFundingRankTotal:                     currentPlan.PerpFundingRankTotal,
+		PerpFundingRankPercentile:                currentPlan.PerpFundingRankPercentile,
+		PerpFundingHistorySampleCount:            currentPlan.PerpFundingHistorySampleCount,
+		PerpFundingHistoryMeanRate:               currentPlan.PerpFundingHistoryMeanRate,
+		PerpFundingHistoryNegativeRatio:          currentPlan.PerpFundingHistoryNegativeRatio,
+		PerpFundingHistoryPositiveRatio:          currentPlan.PerpFundingHistoryPositiveRatio,
+		PerpFundingHistoricalSupportRatio:        currentPlan.PerpFundingHistoricalSupportRatio,
+		PerpFundingCurrentHistoricalPercentile:   currentPlan.PerpFundingCurrentHistoricalPercentile,
+		PerpFundingEstimatedEventRate:            currentPlan.PerpFundingEstimatedEventRate,
+		PerpFundingEstimatedAnnualizedCarryRate:  currentPlan.PerpFundingEstimatedAnnualizedCarryRate,
+		PerpFundingEstimatedAnnualizedNetRate:    currentPlan.PerpFundingEstimatedAnnualizedNetRate,
+		SameExchangeLongHoldEligible:             currentPlan.SameExchangeLongHoldEligible,
+		SameExchangeLongHoldReason:               currentPlan.SameExchangeLongHoldReason,
+		SameExchangeLongHoldUsingHistoryEstimate: currentPlan.SameExchangeLongHoldUsingHistoryEstimate,
+		SameExchangeLongHoldSuggestedFundingEvents:   currentPlan.SameExchangeLongHoldSuggestedFundingEvents,
+		SameExchangeLongHoldSuggestedHoldHours:       currentPlan.SameExchangeLongHoldSuggestedHoldHours,
+		SameExchangeLongHoldSuggestedFundingTimeMs:   currentPlan.SameExchangeLongHoldSuggestedFundingTimeMs,
+		SameExchangeLongHoldSuggestedGrossFundingPNL: currentPlan.SameExchangeLongHoldSuggestedGrossFundingPNL,
+		SameExchangeLongHoldSuggestedNetPNL:          currentPlan.SameExchangeLongHoldSuggestedNetPNL,
+		SameExchangeBasisUsesPaybackModel:            currentPlan.SameExchangeBasisUsesPaybackModel,
+		SameExchangeBasisCostBps:                     currentPlan.SameExchangeBasisCostBps,
+		SameExchangeBasisCarryPerEventBps:            currentPlan.SameExchangeBasisCarryPerEventBps,
+		SameExchangeBasisPaybackFundingEvents:        currentPlan.SameExchangeBasisPaybackFundingEvents,
+		SameExchangeBasisAllowed:                     currentPlan.SameExchangeBasisAllowed,
+		SameExchangeBasisReason:                      currentPlan.SameExchangeBasisReason,
+		SameExchangeBasisRiskSizeMultiplier:          currentPlan.SameExchangeBasisRiskSizeMultiplier,
+		NextReviewTimeMs:                             decision.NextReviewTimeMs,
+		SyncBoundaryTimeMs:                           decision.SyncBoundaryTimeMs,
+		EntryPathSegmentCount:                        decision.ReverseDirectionProjection.IncludedSegmentCount,
+		EntryPathStopReason:                          decision.ReverseDirectionProjection.PathEndReason,
+		EntryWindowOpenMs:                            now.Add(-time.Second).UnixMilli(),
+		EntryWindowCloseMs:                           now.Add(time.Minute).UnixMilli(),
+		TargetCloseTimeMs:                            decision.NextReviewTimeMs + s.cfg.RollingReviewSettleGracePeriod.Milliseconds(),
+		AsOfTimeMs:                                   now.UnixMilli(),
 	}
 	if plan.RoundedNotionalUSDT > 0 {
 		plan.NetExpectedPNLBps = round4(plan.NetExpectedPNL / plan.RoundedNotionalUSDT * 10000)
 	}
+	refreshSameExchangePlanLongHoldAssessment(s.cfg, &plan)
 	// successor 即使是即时构造，也尽量沿用 execution plan 的排序口径：
 	// funding 越高越好，basis 越窄越好。
 	plan.Score = plan.NetExpectedPNL*100 + decision.ReverseDirectionProjection.CarryRateHourlyEquivalent*1_000_000 - plan.CrossVenueBasisBps*2
@@ -564,21 +602,56 @@ func (s *ExecutionService) buildRollingSuccessorPlan(now time.Time, rec entity.E
 	return &plan, nil
 }
 
-func rollingSpotForecast(cfg Config, item entity.FundingSnapshot) fundingForecast {
+func rollingSpotForecast(cfg Config, item entity.FundingSnapshot, historyContext ...fundingForecast) fundingForecast {
 	decay := normalizedContinuationDecay(cfg.FundingRateContinuationDecay)
+	contextual := fundingForecast{}
+	if len(historyContext) > 0 {
+		contextual = historyContext[0]
+	}
+	if contextual.CurrentHistoricalPercentile <= 0 {
+		contextual.CurrentHistoricalPercentile = 0.5
+	}
+	regime := "spot_only"
+	confidence := "low"
+	clampSource := "spot_only"
+	historyMean := item.FundingRate
+	historyStdDev := 0.0
+	zScore := 0.0
+	historySampleCount := 0
+	historyNegativeRatio := 0.0
+	historyPositiveRatio := 0.0
+	if contextual.HistorySampleCount > 0 {
+		regime = "rolling_real_only"
+		confidence = pickFirstNonEmpty(contextual.Confidence, "medium")
+		clampSource = "rolling_real_only_current_clamp"
+		historyMean = contextual.HistoryMean
+		historyStdDev = contextual.HistoryStdDev
+		zScore = contextual.ZScore
+		historySampleCount = contextual.HistorySampleCount
+		historyNegativeRatio = contextual.HistoryNegativeRatio
+		historyPositiveRatio = contextual.HistoryPositiveRatio
+	}
 	// review 点之后我们只需要一个保守的短期延续假设：
-	// 当前 funding rate 既是 baseline，也是均值和上下限。
-	// 这样 forecast 不会在策略最敏感的切换时刻再引入额外历史拟合偏差。
+	// 当前 funding rate 是 baseline，也是最终 clamp 上下限。
+	// 这样即使我们保留历史画像给排序/展示/风控，真正用于后续事件的 rate 仍然只会等于当前值，
+	// 不会在策略最敏感的切换时刻再引入额外历史拟合偏差。
 	return fundingForecast{
-		CurrentRate:        item.FundingRate,
-		BaselineRate:       item.FundingRate,
-		HistoryMean:        item.FundingRate,
-		Regime:             "spot_only",
-		Confidence:         "low",
-		MeanReversion:      0.20,
-		ContinuationDecay:  decay,
-		EffectiveFloorRate: item.FundingRate,
-		EffectiveCapRate:   item.FundingRate,
+		CurrentRate:                 item.FundingRate,
+		BaselineRate:                item.FundingRate,
+		HistoryMean:                 historyMean,
+		HistoryStdDev:               historyStdDev,
+		HistorySampleCount:          historySampleCount,
+		HistoryNegativeRatio:        historyNegativeRatio,
+		HistoryPositiveRatio:        historyPositiveRatio,
+		CurrentHistoricalPercentile: contextual.CurrentHistoricalPercentile,
+		ZScore:                      zScore,
+		Regime:                      regime,
+		Confidence:                  confidence,
+		MeanReversion:               0.20,
+		ContinuationDecay:           decay,
+		EffectiveFloorRate:          item.FundingRate,
+		EffectiveCapRate:            item.FundingRate,
+		ClampSource:                 clampSource,
 	}
 }
 

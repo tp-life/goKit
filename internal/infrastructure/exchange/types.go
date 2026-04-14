@@ -31,6 +31,8 @@ const (
 
 	// AdapterKindHyperliquid 表示 Hyperliquid 专属接入协议族。
 	AdapterKindHyperliquid = "hyperliquid"
+	// AdapterKindBinanceSpot 表示 Binance Spot 协议族。
+	AdapterKindBinanceSpot = "binance_spot"
 )
 
 type FeeConfig struct {
@@ -60,6 +62,7 @@ type AuthConfig struct {
 type ExchangeConfig struct {
 	AdapterKind                 string            `mapstructure:"adapter_kind"`
 	VenueKind                   string            `mapstructure:"venue_kind"`
+	ArbitrageGroup              string            `mapstructure:"arbitrage_group"`
 	Enabled                     bool              `mapstructure:"enabled"`
 	RestBaseURL                 string            `mapstructure:"rest_base_url"`
 	MarketWSBaseURL             string            `mapstructure:"market_ws_base_url"`
@@ -127,6 +130,9 @@ func normalizeExchangeConfig(name string, c ExchangeConfig) ExchangeConfig {
 			c.AdapterKind = AdapterKindHyperliquid
 		}
 	}
+	if strings.TrimSpace(c.ArbitrageGroup) == "" {
+		c.ArbitrageGroup = name
+	}
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = 10 * time.Second
 	}
@@ -138,17 +144,42 @@ func normalizeExchangeConfig(name string, c ExchangeConfig) ExchangeConfig {
 		}
 	}
 	if strings.TrimSpace(c.SettleAsset) == "" {
-		switch name {
-		case "hyperliquid":
-			c.SettleAsset = "USDC"
-		default:
+		switch normalizeAdapterKind(c.AdapterKind) {
+		case AdapterKindBinanceSpot:
 			c.SettleAsset = "USDT"
+		default:
+			switch name {
+			case "hyperliquid":
+				c.SettleAsset = "USDC"
+			default:
+				c.SettleAsset = "USDT"
+			}
 		}
 	}
 	if strings.TrimSpace(c.Label) == "" {
 		c.Label = strings.Title(name)
 	}
 	return c
+}
+
+func (c ExchangeConfig) ArbitrageGroupKey(name string) string {
+	if value := strings.TrimSpace(c.ArbitrageGroup); value != "" {
+		return strings.ToLower(value)
+	}
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func (c ExchangeConfig) IsSpotMarket() bool {
+	switch normalizeAdapterKind(c.AdapterKind) {
+	case AdapterKindBinanceSpot:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c ExchangeConfig) IsPerpetualMarket() bool {
+	return !c.IsSpotMarket()
 }
 
 func readEnvByName(name string) string {

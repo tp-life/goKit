@@ -26,7 +26,7 @@ func (r *ExecutionRepo) Upsert(ctx context.Context, item *entity.ExecutionRecord
 		Columns: []clause.Column{{Name: "plan_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"batch_id", "opportunity_batch_id", "rolling_group_key", "symbol", "long_exchange", "short_exchange",
-			"strategy_mode", "status", "live_trading", "auto_close", "allocated_notional_usdt", "target_close_time_ms",
+			"arbitrage_mode", "strategy_mode", "status", "live_trading", "auto_close", "allocated_notional_usdt", "target_close_time_ms",
 			"next_review_time_ms", "current_sync_boundary_ms", "opened_at_ms", "closed_at_ms", "review_count",
 			"last_review_at_ms", "last_review_reason", "predecessor_plan_key", "successor_plan_key",
 			"last_transition_at_ms", "last_transition_event", "status_reason",
@@ -161,6 +161,7 @@ func executionRecordAssignments(item *entity.ExecutionRecord) map[string]any {
 		"symbol":                   item.Symbol,
 		"long_exchange":            item.LongExchange,
 		"short_exchange":           item.ShortExchange,
+		"arbitrage_mode":           item.ArbitrageMode,
 		"strategy_mode":            item.StrategyMode,
 		"status":                   item.Status,
 		"live_trading":             item.LiveTrading,

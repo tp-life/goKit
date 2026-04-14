@@ -3,6 +3,7 @@ package exchange
 import (
 	"context"
 	"strings"
+	"time"
 
 	"goKit/internal/domain/entity"
 )
@@ -34,6 +35,14 @@ type MarketAdapter interface {
 	Start(ctx context.Context, provider MarketSubscriptionProvider, sink MarketSink)
 }
 
+// FundingRateHistoryProvider 是市场适配器的可选能力接口。
+//
+// 它用于在策略启动和运行过程中，从交易所补齐“真实 funding 历史事件”。
+// 当前策略会优先消费这份历史事件，再退回到本地分钟级 snapshot。
+type FundingRateHistoryProvider interface {
+	FetchFundingRateHistory(ctx context.Context, symbol entity.Symbol, startTime, endTime time.Time) ([]entity.FundingRateHistory, error)
+}
+
 type TradeOrderRequest struct {
 	CanonicalSymbol string
 	VenueSymbol     string
@@ -43,6 +52,9 @@ type TradeOrderRequest struct {
 	TimeInForce     string
 	Quantity        float64
 	Price           float64
+	StopPrice       float64
+	WorkingType     string
+	PriceProtect    bool
 	ReduceOnly      bool
 	ClientOrderID   string
 	Reason          string
@@ -123,13 +135,14 @@ type OrderEventSink interface {
 }
 
 type Position struct {
-	Exchange      string
-	Symbol        string
-	VenueSymbol   string
-	Quantity      float64
-	EntryPrice    float64
-	MarkPrice     float64
-	UnrealizedPnL float64
+	Exchange         string
+	Symbol           string
+	VenueSymbol      string
+	Quantity         float64
+	EntryPrice       float64
+	MarkPrice        float64
+	LiquidationPrice float64
+	UnrealizedPnL    float64
 }
 
 type TradeCapabilities struct {
@@ -149,6 +162,19 @@ type TradeAdapter interface {
 	GetPosition(ctx context.Context, canonicalSymbol, venueSymbol, assetID string) (Position, error)
 	GetOrderStatus(ctx context.Context, req OrderLookupRequest) (OrderStatus, error)
 	GetAccountSnapshot(ctx context.Context) (AccountSnapshot, error)
+}
+
+// TradeProtectiveStopPlacer 是“交易所原生保护单”可选能力接口。
+//
+// 当前主要给 Binance-like 永续合约使用：
+// - 用原生 STOP_MARKET / reduce-only 把空头保护单挂到交易所；
+// - 真正触发时，不必等应用层下一轮轮询才开始平仓。
+//
+// Spot 侧不强求实现这条接口，因为同所模式里更安全的做法是：
+// - 永续腿先靠原生保护单止损；
+// - 现货腿再由仓位监控做联动收口。
+type TradeProtectiveStopPlacer interface {
+	PlaceProtectiveStop(ctx context.Context, req TradeOrderRequest) (TradeOrderResult, error)
 }
 
 // TradeOrderCanceler 是一个可选能力接口。

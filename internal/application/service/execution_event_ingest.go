@@ -134,6 +134,9 @@ func (s *ExecutionService) ApplyExternalOrderEvent(ctx context.Context, event Ex
 	if rec == nil {
 		return nil, fmt.Errorf("%w: execution record plan_key=%s", ErrExternalOrderTargetNotFound, order.PlanKey)
 	}
+	if normalizeExecutionStatus(order.Phase) == sameExchangeProtectPhase {
+		return rec, nil
+	}
 
 	return s.applyExecutionUpdateFromExternalOrderEvent(ctx, rec, *order, event)
 }

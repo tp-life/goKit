@@ -41,21 +41,33 @@ type OpportunitySummary struct {
 	LongMarkPrice  float64 `json:"long_mark_price"`
 	ShortMarkPrice float64 `json:"short_mark_price"`
 
-	GrossFundingPNL        float64 `json:"gross_funding_pnl"`
-	EntryFeePNL            float64 `json:"entry_fee_pnl"`
-	ExitFeePNL             float64 `json:"exit_fee_pnl"`
-	SlippagePNL            float64 `json:"slippage_pnl"`
-	SafetyBufferPNL        float64 `json:"safety_buffer_pnl"`
-	EntryPenaltyBps        float64 `json:"entry_penalty_bps"`
-	ExitPenaltyBps         float64 `json:"exit_penalty_bps"`
-	HedgePenaltyBps        float64 `json:"hedge_penalty_bps"`
-	ExecutionPenaltyBps    float64 `json:"execution_penalty_bps"`
-	ExecutionPenaltyModel  string  `json:"execution_penalty_model"`
-	ExecutionPenaltyBucket string  `json:"execution_penalty_bucket"`
-	NetExpectedPNL         float64 `json:"net_expected_pnl"`
-	NetExpectedBps         float64 `json:"net_expected_bps"`
-	BasisBps               float64 `json:"basis_bps"`
-	MaxAllowedBasisBps     float64 `json:"max_allowed_basis_bps"`
+	GrossFundingPNL                         float64 `json:"gross_funding_pnl"`
+	EntryFeePNL                             float64 `json:"entry_fee_pnl"`
+	ExitFeePNL                              float64 `json:"exit_fee_pnl"`
+	SlippagePNL                             float64 `json:"slippage_pnl"`
+	SafetyBufferPNL                         float64 `json:"safety_buffer_pnl"`
+	EntryPenaltyBps                         float64 `json:"entry_penalty_bps"`
+	ExitPenaltyBps                          float64 `json:"exit_penalty_bps"`
+	HedgePenaltyBps                         float64 `json:"hedge_penalty_bps"`
+	ExecutionPenaltyBps                     float64 `json:"execution_penalty_bps"`
+	ExecutionPenaltyModel                   string  `json:"execution_penalty_model"`
+	ExecutionPenaltyBucket                  string  `json:"execution_penalty_bucket"`
+	NetExpectedPNL                          float64 `json:"net_expected_pnl"`
+	NetExpectedBps                          float64 `json:"net_expected_bps"`
+	BasisBps                                float64 `json:"basis_bps"`
+	MaxAllowedBasisBps                      float64 `json:"max_allowed_basis_bps"`
+	SameExchangePriceRiskAllowed            bool    `json:"same_exchange_price_risk_allowed"`
+	SameExchangePriceRiskReason             string  `json:"same_exchange_price_risk_reason"`
+	SameExchangePriceShockCurrentMarkPrice  float64 `json:"same_exchange_price_shock_current_mark_price"`
+	SameExchangePriceShockBaselineMarkPrice float64 `json:"same_exchange_price_shock_baseline_mark_price"`
+	SameExchangePriceShockRatio             float64 `json:"same_exchange_price_shock_ratio"`
+	SameExchangeBasisUsesPaybackModel       bool    `json:"same_exchange_basis_uses_payback_model"`
+	SameExchangeBasisCostBps                float64 `json:"same_exchange_basis_cost_bps"`
+	SameExchangeBasisCarryPerEventBps       float64 `json:"same_exchange_basis_carry_per_event_bps"`
+	SameExchangeBasisPaybackFundingEvents   float64 `json:"same_exchange_basis_payback_funding_events"`
+	SameExchangeBasisAllowed                bool    `json:"same_exchange_basis_allowed"`
+	SameExchangeBasisReason                 string  `json:"same_exchange_basis_reason"`
+	SameExchangeBasisRiskSizeMultiplier     float64 `json:"same_exchange_basis_risk_size_multiplier"`
 
 	Score float64 `json:"score"`
 

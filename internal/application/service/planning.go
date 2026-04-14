@@ -68,6 +68,7 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 			LongFundingEventCount:        opp.LongFundingEventCount,
 			ShortFundingEventCount:       opp.ShortFundingEventCount,
 			FundingWindowHours:           opp.FundingWindowHours,
+			ArbitrageMode:                normalizeArbitrageMode(r.cfg.ArbitrageMode, ArbitrageModeCrossExchange),
 			StrategyMode:                 normalizeStrategyMode(opp.StrategyMode, StrategyModeLegacyProjection),
 			FundingComputationMode:       opp.FundingComputationMode,
 			NextReviewTimeMs:             opp.NextReviewTimeMs,
@@ -117,8 +118,94 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 		if plan.LongEntryPrice <= 0 || plan.ShortEntryPrice <= 0 {
 			continue
 		}
+		if plan.ArbitrageMode == ArbitrageModeSameExchangeSpotPerp {
+			plan.TargetLeverage = sameExchangePerpLeverage(r.cfg)
+			perpRule := opp.ShortFundingRule
+			if isPerpetualSymbol(longMeta) && !isPerpetualSymbol(shortMeta) {
+				perpRule = opp.LongFundingRule
+			}
+			plan.PerpFundingRank = perpRule.CurrentFundingRank
+			plan.PerpFundingRankTotal = perpRule.CurrentFundingRankTotal
+			plan.PerpFundingRankPercentile = perpRule.CurrentFundingRankPercentile
+			plan.PerpFundingHistorySampleCount = perpRule.HistorySampleCount
+			plan.PerpFundingHistoryMeanRate = perpRule.HistoryMeanRate
+			plan.PerpFundingHistoryNegativeRatio = perpRule.HistoryNegativeRatio
+			plan.PerpFundingHistoryPositiveRatio = perpRule.HistoryPositiveRatio
+			plan.PerpFundingHistoricalSupportRatio = perpRule.HistoricalSupportRatio
+			plan.PerpFundingCurrentHistoricalPercentile = perpRule.CurrentHistoricalPercentile
+			plan.PerpFundingEstimatedEventRate = perpRule.EstimatedEventRate
+			plan.PerpFundingEstimatedAnnualizedCarryRate = perpRule.EstimatedAnnualizedCarryRate
+			plan.PerpFundingEstimatedAnnualizedNetRate = perpRule.EstimatedAnnualizedNetRate
+			plan.SameExchangeLongHoldEligible = perpRule.LongHoldEligible
+			plan.SameExchangeLongHoldReason = perpRule.LongHoldReason
+			plan.SameExchangeLongHoldUsingHistoryEstimate = opp.SameExchangeLongHoldUsingHistoryEstimate
+			plan.SameExchangeLongHoldSuggestedFundingEvents = perpRule.SuggestedFundingEvents
+			plan.SameExchangeLongHoldSuggestedHoldHours = perpRule.SuggestedHoldHours
+			plan.SameExchangeLongHoldSuggestedFundingTimeMs = perpRule.SuggestedFundingTimeMs
+			plan.SameExchangeLongHoldSuggestedGrossFundingPNL = perpRule.SuggestedGrossFundingPNL
+			plan.SameExchangeLongHoldSuggestedNetPNL = perpRule.SuggestedNetPNL
+			plan.SameExchangePriceRiskAllowed = opp.SameExchangePriceRiskAllowed
+			plan.SameExchangePriceRiskReason = opp.SameExchangePriceRiskReason
+			plan.SameExchangePriceShockCurrentMarkPrice = opp.SameExchangePriceShockCurrentMarkPrice
+			plan.SameExchangePriceShockBaselineMarkPrice = opp.SameExchangePriceShockBaselineMarkPrice
+			plan.SameExchangePriceShockRatio = opp.SameExchangePriceShockRatio
+			if sameExchangeBasisAssessmentPresent(
+				opp.SameExchangeBasisReason,
+				opp.SameExchangeBasisUsesPaybackModel,
+				opp.SameExchangeBasisCostBps,
+				opp.SameExchangeBasisCarryPerEventBps,
+				opp.SameExchangeBasisPaybackFundingEvents,
+				opp.SameExchangeBasisRiskSizeMultiplier,
+			) {
+				plan.SameExchangeBasisUsesPaybackModel = opp.SameExchangeBasisUsesPaybackModel
+				plan.SameExchangeBasisCostBps = opp.SameExchangeBasisCostBps
+				plan.SameExchangeBasisCarryPerEventBps = opp.SameExchangeBasisCarryPerEventBps
+				plan.SameExchangeBasisPaybackFundingEvents = opp.SameExchangeBasisPaybackFundingEvents
+				plan.SameExchangeBasisAllowed = opp.SameExchangeBasisAllowed
+				plan.SameExchangeBasisReason = opp.SameExchangeBasisReason
+				plan.SameExchangeBasisRiskSizeMultiplier = opp.SameExchangeBasisRiskSizeMultiplier
+			}
+			if multiplier := sameExchangeFundingRiskSizeMultiplier(r.cfg, plan); multiplier > 0 && multiplier < 1 {
+				plan.CapitalAllocatedUSDT = round2(plan.CapitalAllocatedUSDT * multiplier)
+				plan.TargetNotionalUSDT = round2(plan.TargetNotionalUSDT * multiplier)
+			}
+		}
 		maxAllowedBasisBps := r.allowedPlanBasisThresholdBps(opp)
-		if math.Abs(plan.CrossVenueBasisBps) > maxAllowedBasisBps {
+		if plan.ArbitrageMode == ArbitrageModeSameExchangeSpotPerp {
+			if !sameExchangeBasisAssessmentPresent(
+				plan.SameExchangeBasisReason,
+				plan.SameExchangeBasisUsesPaybackModel,
+				plan.SameExchangeBasisCostBps,
+				plan.SameExchangeBasisCarryPerEventBps,
+				plan.SameExchangeBasisPaybackFundingEvents,
+				plan.SameExchangeBasisRiskSizeMultiplier,
+			) {
+				assessmentNotional := r.cfg.EffectiveNotional()
+				if assessmentNotional <= 0 {
+					assessmentNotional = plan.TargetNotionalUSDT
+				}
+				assessment := assessSameExchangeBasisRisk(
+					r.cfg,
+					plan.ArbitrageMode,
+					plan.FundingWindowHours,
+					rateFromPNL(opp.GrossFundingPNL, assessmentNotional),
+					plan.LongFundingEventCount,
+					plan.ShortFundingEventCount,
+					plan.CrossVenueBasisBps,
+					opp.EntryFeePNL+opp.ExitFeePNL+opp.SlippagePNL+opp.SafetyBufferPNL,
+					assessmentNotional,
+					maxAllowedBasisBps,
+				)
+				applySameExchangeBasisAssessmentToPlan(&plan, assessment)
+			}
+			if multiplier := plan.SameExchangeBasisRiskSizeMultiplier; multiplier > 0 && multiplier < 1 {
+				plan.CapitalAllocatedUSDT = round2(plan.CapitalAllocatedUSDT * multiplier)
+				plan.TargetNotionalUSDT = round2(plan.TargetNotionalUSDT * multiplier)
+			}
+		} else if math.Abs(plan.CrossVenueBasisBps) > maxAllowedBasisBps {
+			continue
+		}
+		if plan.TargetNotionalUSDT <= 0 || plan.CapitalAllocatedUSDT <= 0 {
 			continue
 		}
 
@@ -149,6 +236,15 @@ func (r *StrategyRunner) buildExecutionPlans(now time.Time, opportunityBatchID s
 			continue
 		}
 		r.applyScaledPlanEconomics(&plan, opp, roundedNotional)
+		refreshSameExchangePlanLongHoldAssessment(r.cfg, &plan)
+		if plan.NetExpectedPNL < r.cfg.MinNetPNL {
+			continue
+		}
+		if plan.ArbitrageMode == ArbitrageModeSameExchangeSpotPerp &&
+			r.cfg.SameExchangeRequireLongHoldEligible &&
+			!plan.SameExchangeLongHoldEligible {
+			continue
+		}
 
 		plan.ReadyNow = now.UnixMilli() >= plan.EntryWindowOpenMs && now.UnixMilli() <= plan.EntryWindowCloseMs
 		switch {
@@ -187,6 +283,16 @@ func (r *StrategyRunner) isOpportunityEligible(now time.Time, opp entity.Opportu
 	}
 	if strings.ToLower(strings.TrimSpace(opp.Status)) != OpportunityStatusEligible {
 		return false
+	}
+	if normalizeArbitrageMode(r.cfg.ArbitrageMode, ArbitrageModeCrossExchange) == ArbitrageModeSameExchangeSpotPerp &&
+		r.cfg.SameExchangeRequireLongHoldEligible {
+		perpRule := opp.ShortFundingRule
+		if isSpotFundingRule(perpRule) {
+			perpRule = opp.LongFundingRule
+		}
+		if !perpRule.LongHoldEligible {
+			return false
+		}
 	}
 	if opp.NetExpectedPNL < r.cfg.MinNetPNL {
 		return false

@@ -15,18 +15,22 @@
 
 - SQLite 持久化
 - Binance / Aster / Hyperliquid 公共行情接入
+- Binance Spot 公共行情接入
 - Bybit V5 public websocket 行情接入（`tickers.{symbol}` + `orderbook.1.{symbol}`）
 - 多交易所共同交易对自动发现
 - 规范化交易对映射（如 `BTCUSDT -> BTC`，`BTC -> BTC`）
 - 任意两两交易所组合的 funding 套利机会计算
+- 可按配置切换 `cross_exchange` 与 `same_exchange_spot_perp`
 - 执行计划生成（按最小下单量 / 最小名义价值 / 入场窗口）
 - 真实执行层抽象：
+  - Binance Spot 下单 / 平仓 / 查持仓
   - Binance 下单 / 平仓 / 查持仓
   - Aster 下单 / 平仓 / 查持仓
   - Bybit 下单 / 平仓 / 查持仓
   - Hyperliquid 下单 / 平仓 / 查持仓
 - 执行记录表 / 订单记录表
 - 自动开仓 / 自动平仓循环
+- 运行中仓位监听（单腿、反向、数量漂移）与主动换仓
 - Binance / Bybit 私有订单事件流基础接入（最小可用版）
 - 手动 HTTP 接口：开仓 / 平仓 / 查执行记录 / 查订单记录
 - 前端页面改为动态展示多交易所数据
@@ -47,6 +51,8 @@
 - `internal/infrastructure/exchange`
   - `interfaces.go`：统一市场/交易接口
   - `registry.go`：交易所适配器注册表，负责按配置组装 Market/Trade adapter
+  - `binance_spot_market.go`：Binance Spot 行情适配器
+  - `binance_spot_trade.go`：Binance Spot 下单适配器
   - `cex_market.go`：Binance-like 公共行情适配器（文件名保留历史命名）
   - `cex_trade.go`：Binance-like 下单适配器（文件名保留历史命名）
   - `bybit_market.go`：Bybit V5 perpetual 行情适配器
@@ -119,7 +125,10 @@
 
 重点参数：
 
-- `exchanges.<name>.adapter_kind`：声明该交易所复用哪类接入协议族；当前内置 `binance_like`、`bybit_v5` 与 `hyperliquid`
+- `strategy.arbitrage_mode`：`cross_exchange` 或 `same_exchange_spot_perp`
+- `strategy.hold_selection_mode` / `strategy.opportunity.legacy_hold_selection_mode`：支持 `dynamic_profit`；该模式会按收益自动搜索更优兑现点，不再受 `hold_hours` 截断
+- `exchanges.<name>.adapter_kind`：声明该交易所复用哪类接入协议族；当前内置 `binance_like`、`binance_spot`、`bybit_v5` 与 `hyperliquid`
+- `exchanges.<name>.arbitrage_group`：同所套利分组；`same_exchange_spot_perp` 模式下，只有同组 spot/perp 会被配对
 - `exchanges.<name>.venue_kind`：声明该交易所在策略层复用哪类 venue profile；为空时按交易所名或 `adapter_kind` 推断
 - `exchanges.<name>.auth.passphrase_env` / `auth.extra_env` / `adapter_options`：留给 OKX、Bybit 这类协议族的扩展配置位
 - `exchanges.<name>.private_ws_base_url`：显式指定私有订单/用户流 websocket 地址；像 Bybit 这类公私有流不共址的交易所应优先配置它
@@ -129,9 +138,13 @@
 - `strategy.allowed_symbols`：规范化 symbol 列表，建议写基础币 `BTC/ETH/SOL`
 - `strategy.entry_mode`：`maker / mixed / taker`
 - `strategy.exit_mode`：`maker / mixed / taker`
+- `strategy.capital.*`：`same_exchange_spot_perp` 模式下默认按“现货腿全额占资”推导 effective notional，不再把 leverage 额外乘进可开名义
+- `strategy.same_exchange.exit.*`：同所模式下的提前离场护栏；可按“永续 funding 转负 + 历史负费率占比 + 当前平仓盈利”联合决定是否提前退出
 - `strategy.execution.enabled`：是否允许真实下单；`false` 时只会生成 dry-run 执行记录
 - `strategy.execution.auto_entry`：是否自动开仓
 - `strategy.execution.auto_close`：是否自动平仓
+- `strategy.execution.position_monitor.*`：运行中仓位监听与异常仓位自动收口；可控制单腿、方向错位、数量漂移的处理方式
+- `strategy.execution.replacement.*`：主动换仓配置；系统会用“候选机会净收益 - 当前平仓成本 - 当前继续持有净值”做比较，只有净增益过门槛才切
 - `strategy.execution.close_grace_period`：最后一腿 funding 结算后等待多久再平仓
 - `exchanges.*.auth.*`：各交易所密钥环境变量名
 

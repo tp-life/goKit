@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -24,6 +25,7 @@ const (
 	OpportunityStatusNotProfitable    = "not_profitable"
 	OpportunityStatusSpreadTooSmall   = "spread_too_small"
 	OpportunityStatusBasisTooWide     = "basis_too_wide"
+	OpportunityStatusPriceRiskGuard   = "price_risk_guard"
 	OpportunityStatusStaleData        = "stale_data"
 	OpportunityStatusOutsideEntryWind = "outside_entry_window"
 
@@ -150,16 +152,17 @@ type evaluatedDirectionCandidate struct {
 //
 // 这样做的目的，是在“不轻易漏掉机会”和“别把 websocket / DB 压爆”之间取得平衡。
 type StrategyRunner struct {
-	cfg        Config
-	logger     *slog.Logger
-	store      *MarketStore
-	symbolRepo repository.SymbolRepository
-	marketRepo repository.MarketDataRepository
-	oppRepo    repository.OpportunityRepository
-	planRepo   repository.ExecutionPlanRepository
-	markets    map[string]exchange.MarketAdapter
-	forecaster FundingForecaster
-	venues     *VenueProfileRegistry
+	cfg             Config
+	logger          *slog.Logger
+	store           *MarketStore
+	symbolRepo      repository.SymbolRepository
+	marketRepo      repository.MarketDataRepository
+	oppRepo         repository.OpportunityRepository
+	planRepo        repository.ExecutionPlanRepository
+	markets         map[string]exchange.MarketAdapter
+	exchangeConfigs map[string]exchange.ExchangeConfig
+	forecaster      FundingForecaster
+	venues          *VenueProfileRegistry
 
 	lastFundingPersisted map[string]entity.FundingSnapshot
 	lastBookPersisted    map[string]entity.BookTopSnapshot
@@ -193,6 +196,7 @@ func NewStrategyRunner(p StrategyRunnerParams) *StrategyRunner {
 		oppRepo:                  p.OppRepo,
 		planRepo:                 p.PlanRepo,
 		markets:                  exchange.BuildMarketMap(p.Markets),
+		exchangeConfigs:          normalizedExchangeConfigs(p.Exchanges),
 		venues:                   venues,
 		forecaster:               NewFundingForecaster(cfg, p.MarketRepo, venues),
 		lastFundingPersisted:     make(map[string]entity.FundingSnapshot),
@@ -213,7 +217,32 @@ func StartStrategyRunner(lc fx.Lifecycle, runner *StrategyRunner) {
 			}
 			runCtx, c := context.WithCancel(context.Background())
 			cancel = c
-			return runner.Start(runCtx)
+			runner.logger.Info("strategy_runner_start_scheduled",
+				slog.String("strategy_mode", runner.cfg.StrategyMode),
+				slog.String("arbitrage_mode", runner.cfg.ArbitrageMode),
+				slog.Int("market_count", len(runner.markets)),
+			)
+			go func() {
+				startedAt := time.Now().UTC()
+				runner.logger.Info("strategy_runner_bootstrap_begin",
+					slog.String("started_at", startedAt.Format(time.RFC3339)),
+				)
+				if err := runner.Start(runCtx); err != nil {
+					level := slog.LevelError
+					if errors.Is(err, context.Canceled) {
+						level = slog.LevelInfo
+					}
+					runner.logger.Log(runCtx, level, "strategy_runner_bootstrap_finished",
+						slog.Any("err", err),
+						slog.Duration("elapsed", time.Since(startedAt)),
+					)
+					return
+				}
+				runner.logger.Info("strategy_runner_bootstrap_finished",
+					slog.Duration("elapsed", time.Since(startedAt)),
+				)
+			}()
+			return nil
 		},
 		OnStop: func(ctx context.Context) error {
 			if cancel != nil {
@@ -225,6 +254,7 @@ func StartStrategyRunner(lc fx.Lifecycle, runner *StrategyRunner) {
 }
 
 func (r *StrategyRunner) Start(ctx context.Context) error {
+	bootstrapStartedAt := time.Now().UTC()
 	allowed := make(map[string]struct{}, len(r.cfg.AllowedSymbols))
 	for _, sym := range r.cfg.AllowedSymbols {
 		key := strings.TrimSpace(strings.ToUpper(sym))
@@ -239,12 +269,21 @@ func (r *StrategyRunner) Start(ctx context.Context) error {
 		if market == nil || !market.Enabled() {
 			continue
 		}
+		fetchStartedAt := time.Now().UTC()
+		r.logger.Info("strategy_runner_symbol_fetch_begin",
+			slog.String("exchange", name),
+			slog.String("quote_asset", r.cfg.QuoteAsset),
+		)
 		items, err := market.FetchTradableSymbols(ctx, r.cfg.QuoteAsset, allowed)
 		if err != nil {
 			return fmt.Errorf("fetch %s symbols: %w", name, err)
 		}
 		symbolsByExchange[name] = items
-		r.logger.Info("strategy_symbols_loaded", slog.String("exchange", name), slog.Int("count", len(items)))
+		r.logger.Info("strategy_runner_symbol_fetch_done",
+			slog.String("exchange", name),
+			slog.Int("count", len(items)),
+			slog.Duration("elapsed", time.Since(fetchStartedAt)),
+		)
 	}
 
 	// 先保留“各交易所自己实际可交易”的完整 symbol inventory，供数据库与排障使用。
@@ -257,11 +296,19 @@ func (r *StrategyRunner) Start(ctx context.Context) error {
 	// - 最终看起来像是“某家交易所没拉全”，实际上是“入库前被交集过滤掉了”。
 	allRecords := flattenSymbolInventory(symbolsByExchange)
 
-	// 全市场基础池：只要一个 canonical symbol 在至少两家交易所同时存在，就纳入后续候选范围。
-	watchlist, recordsByExchange := buildMultiVenueWatchlist(symbolsByExchange)
+	// 全市场基础池会按 arbitrage_mode 收口成不同的可比集合：
+	// - cross_exchange: 只保留“至少两家永续市场同时存在”的 symbol；
+	// - same_exchange_spot_perp: 只保留“同一 arbitrage_group 下 spot+perp 都存在”的 symbol。
+	watchlist, recordsByExchange := buildWatchlistForArbitrageMode(r.cfg.ArbitrageMode, symbolsByExchange, r.exchangeConfigs)
 	if len(watchlist) == 0 {
-		return fmt.Errorf("no common tradable symbols found across at least two enabled exchanges")
+		return fmt.Errorf("no eligible tradable symbols found for arbitrage_mode=%s", r.cfg.ArbitrageMode)
 	}
+	r.logger.Info("strategy_runner_watchlist_ready",
+		slog.String("arbitrage_mode", r.cfg.ArbitrageMode),
+		slog.Int("watchlist_count", len(watchlist)),
+		slog.Int("inventory_exchange_count", len(symbolsByExchange)),
+		slog.Int("watched_exchange_count", len(recordsByExchange)),
+	)
 	if err := r.symbolRepo.UpsertBatch(ctx, allRecords); err != nil {
 		return err
 	}
@@ -278,18 +325,35 @@ func (r *StrategyRunner) Start(ctx context.Context) error {
 	// 启动初期还没有全市场 funding 粗筛结果，因此先用核心币 + 少量轮转种子预热盘口深扫池。
 	r.refreshDeepScanPlan(time.Now().UTC())
 
+	historySyncStartedAt := time.Now().UTC()
+	r.logger.Info("strategy_runner_funding_history_sync_begin",
+		slog.Duration("lookback", r.cfg.FundingRateHistoryLookback),
+		slog.Duration("sync_interval", r.cfg.FundingRateHistorySyncInterval),
+	)
+	r.syncFundingRateHistory(ctx, time.Now().UTC())
+	r.logger.Info("strategy_runner_funding_history_sync_done",
+		slog.Duration("elapsed", time.Since(historySyncStartedAt)),
+	)
+
 	for _, market := range r.markets {
 		if market == nil || !market.Enabled() {
 			continue
 		}
+		r.logger.Info("strategy_runner_market_stream_start",
+			slog.String("exchange", market.Name()),
+		)
 		market.Start(ctx, r, r.store)
 	}
 
 	go r.subscriptionPlannerLoop(ctx)
 	go r.fundingSnapshotLoop(ctx)
 	go r.bookSnapshotLoop(ctx)
+	go r.fundingRateHistorySyncLoop(ctx)
 	go r.snapshotCleanupLoop(ctx)
 	go r.opportunityLoop(ctx)
+	r.logger.Info("strategy_runner_loops_started",
+		slog.Duration("elapsed", time.Since(bootstrapStartedAt)),
+	)
 	return nil
 }
 
@@ -510,17 +574,45 @@ func (r *StrategyRunner) refreshDeepScanPlan(now time.Time) {
 func (r *StrategyRunner) rankCoarseCandidates(now time.Time) []coarseCandidate {
 	watch := r.store.Watchlist()
 	out := make([]coarseCandidate, 0, len(watch))
+	rankContext := r.buildFundingRankContext(now)
 	for _, symbol := range watch {
-		exchanges := r.store.ExchangesForSymbol(symbol)
-		if len(exchanges) < 2 {
-			continue
-		}
-
 		bestScore := 0.0
-		for i := 0; i < len(exchanges); i++ {
-			for j := i + 1; j < len(exchanges); j++ {
-				fA, okA := r.store.LatestFunding(exchanges[i], symbol)
-				fB, okB := r.store.LatestFunding(exchanges[j], symbol)
+		switch normalizeArbitrageMode(r.cfg.ArbitrageMode, ArbitrageModeCrossExchange) {
+		case ArbitrageModeSameExchangeSpotPerp:
+			for _, pair := range r.sameExchangeSpotPerpPairs(symbol) {
+				spotMeta, okSpotMeta := r.store.Symbol(pair.SpotExchange, symbol)
+				spotBook, okSpotBook := r.store.LatestBookTop(pair.SpotExchange, symbol)
+				perpFunding, okPerpFunding := r.store.LatestFunding(pair.PerpExchange, symbol)
+				if !(okSpotMeta && okSpotBook && okPerpFunding) {
+					continue
+				}
+				if r.isSnapshotStale(now, spotBook.EventTimeMs) || r.isSnapshotStale(now, perpFunding.EventTimeMs) {
+					continue
+				}
+				spotFunding := syntheticSpotFundingSnapshot(spotMeta, spotBook, perpFunding)
+				perpForecast := r.forecastFunding(context.Background(), now, perpFunding)
+				projection, ok := r.projectFundingCarry(now, spotFunding, syntheticSpotFundingForecast(), perpFunding, perpForecast)
+				if !ok || projection.CarryRate <= 0 {
+					continue
+				}
+
+				score := projection.CarryRate * 10000 * r.fundingTimeWeight(now, projection.ProjectedFundingTimeMs)
+				if projection.CarryRateHourlyEquivalent > 0 {
+					score += projection.CarryRateHourlyEquivalent * 1000
+				}
+				score += sameExchangeFundingSelectionBias(rankContext.lookup(pair.PerpExchange, symbol), perpForecast)
+				if score > bestScore {
+					bestScore = score
+				}
+			}
+		default:
+			exchanges := r.store.ExchangesForSymbol(symbol)
+			if len(exchanges) < 2 {
+				continue
+			}
+			for _, pair := range r.crossExchangePairs(symbol) {
+				fA, okA := r.store.LatestFunding(pair.LeftExchange, symbol)
+				fB, okB := r.store.LatestFunding(pair.RightExchange, symbol)
 				if !(okA && okB) {
 					continue
 				}
@@ -530,13 +622,11 @@ func (r *StrategyRunner) rankCoarseCandidates(now time.Time) []coarseCandidate {
 				forecastA := r.forecastFunding(context.Background(), now, fA)
 				forecastB := r.forecastFunding(context.Background(), now, fB)
 
-				_, _, projection, ok := r.bestFundingDirection(now, exchanges[i], fA, forecastA, exchanges[j], fB, forecastB)
+				_, _, projection, ok := r.bestFundingDirection(now, pair.LeftExchange, fA, forecastA, pair.RightExchange, fB, forecastB)
 				if !ok || projection.CarryRate <= 0 {
 					continue
 				}
 
-				// 全市场粗筛只用 funding 事件与时间信息打分，不依赖盘口。
-				// 这样可以把更多“可能有机会但还没进深扫池”的 symbol 先拉进候选集。
 				score := projection.CarryRate * 10000 * r.fundingTimeWeight(now, projection.ProjectedFundingTimeMs)
 				score *= 1 + float64(len(exchanges)-2)*0.05
 				if projection.CarryRateHourlyEquivalent > 0 {
@@ -642,14 +732,44 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 	//    下面的 ok1~ok6 校验会自动把该组合跳过。
 	watch := r.store.Watchlist()
 	items := make([]entity.Opportunity, 0, len(watch)*2)
+	rankContext := r.buildFundingRankContext(now)
 	for _, symbol := range watch {
-		exchanges := r.store.ExchangesForSymbol(symbol)
-		if len(exchanges) < 2 {
-			continue
-		}
-		for i := 0; i < len(exchanges); i++ {
-			for j := i + 1; j < len(exchanges); j++ {
-				exA, exB := exchanges[i], exchanges[j]
+		switch normalizeArbitrageMode(r.cfg.ArbitrageMode, ArbitrageModeCrossExchange) {
+		case ArbitrageModeSameExchangeSpotPerp:
+			for _, pair := range r.sameExchangeSpotPerpPairs(symbol) {
+				spotMeta, okSpotMeta := r.store.Symbol(pair.SpotExchange, symbol)
+				perpMeta, okPerpMeta := r.store.Symbol(pair.PerpExchange, symbol)
+				spotBook, okSpotBook := r.store.LatestBookTop(pair.SpotExchange, symbol)
+				perpBook, okPerpBook := r.store.LatestBookTop(pair.PerpExchange, symbol)
+				perpFunding, okPerpFunding := r.store.LatestFunding(pair.PerpExchange, symbol)
+				if !(okSpotMeta && okPerpMeta && okSpotBook && okPerpBook && okPerpFunding) {
+					continue
+				}
+
+				spotFunding := syntheticSpotFundingSnapshot(spotMeta, spotBook, perpFunding)
+				perpForecast := r.forecastFunding(context.Background(), now, perpFunding)
+				selected, ok := r.evaluateDirectionCandidate(
+					now,
+					symbol,
+					pair.SpotExchange,
+					spotFunding,
+					syntheticSpotFundingForecast(),
+					spotBook,
+					spotMeta,
+					pair.PerpExchange,
+					perpFunding,
+					perpForecast,
+					perpBook,
+					perpMeta,
+				)
+				if !ok {
+					continue
+				}
+				items = append(items, buildOpportunityFromDirectionCandidate(r, now, symbol, selected, rankContext))
+			}
+		default:
+			for _, pair := range r.crossExchangePairs(symbol) {
+				exA, exB := pair.LeftExchange, pair.RightExchange
 				fA, ok1 := r.store.LatestFunding(exA, symbol)
 				fB, ok2 := r.store.LatestFunding(exB, symbol)
 				bA, ok3 := r.store.LatestBookTop(exA, symbol)
@@ -675,96 +795,7 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 				case okBA && selectBetterDirectionCandidate(r.cfg.normalize(), candidateBA, candidateAB):
 					selected = candidateBA
 				}
-
-				longExchange, shortExchange := selected.LongExchange, selected.ShortExchange
-				longFunding, shortFunding := selected.LongFunding, selected.ShortFunding
-				longBook, shortBook := selected.LongBook, selected.ShortBook
-				longMeta, shortMeta := selected.LongMeta, selected.ShortMeta
-				longForecast, shortForecast := selected.LongForecast, selected.ShortForecast
-				projection := selected.PrimaryWindow.Projection
-
-				// 保留“小时化等价值”只用于展示和打分，不再作为 funding 收益的核心计算公式。
-				longHourly := longFunding.FundingRate / float64(maxInt(longFunding.FundingIntervalHours, 1))
-				shortHourly := shortFunding.FundingRate / float64(maxInt(shortFunding.FundingIntervalHours, 1))
-				entryFeePNL := selected.EntryFeePNL
-				exitFeePNL := selected.ExitFeePNL
-				basisBps := selected.BasisBps
-				windowEvaluations := selected.WindowEvaluations
-				primaryWindow := selected.PrimaryWindow
-				grossEdgeHourly := projection.CarryRateHourlyEquivalent
-				grossFundingPNL := primaryWindow.Detail.GrossFundingPNL
-				slippagePNL := primaryWindow.SlippagePNL
-				safetyBufferPNL := primaryWindow.SafetyBufferPNL
-				netExpectedPNL := primaryWindow.Detail.NetExpectedPNL
-				netExpectedBps := primaryWindow.Detail.NetExpectedBps
-				maxAllowedBasisBps := primaryWindow.MaxAllowedBasisBps
-				estimateMode, estimateConfidence := fundingEstimateProfile(projection, longForecast, shortForecast)
-				status, reason, eligible := r.evaluateOpportunity(now, projection, netExpectedPNL, basisBps, maxAllowedBasisBps, longFunding, shortFunding, longBook, shortBook)
-				items = append(items, entity.Opportunity{
-					BatchID:                      "",
-					AsOfTimeMs:                   now.UnixMilli(),
-					Symbol:                       symbol,
-					LongExchange:                 longExchange,
-					ShortExchange:                shortExchange,
-					LongVenueSymbol:              longMeta.VenueSymbol,
-					ShortVenueSymbol:             shortMeta.VenueSymbol,
-					LongFundingRate:              longFunding.FundingRate,
-					ShortFundingRate:             shortFunding.FundingRate,
-					LongFundingTimeMs:            longFunding.FundingTimeMs,
-					ShortFundingTimeMs:           shortFunding.FundingTimeMs,
-					LongFundingIntervalHours:     longFunding.FundingIntervalHours,
-					ShortFundingIntervalHours:    shortFunding.FundingIntervalHours,
-					LongFundingHourly:            longHourly,
-					ShortFundingHourly:           shortHourly,
-					GrossEdgeHourly:              grossEdgeHourly,
-					LongFutureFundingRate:        longForecast.PredictedRateForEvent(2),
-					ShortFutureFundingRate:       shortForecast.PredictedRateForEvent(2),
-					FundingEstimateMode:          estimateMode,
-					FundingEstimateConfidence:    estimateConfidence,
-					LongBidPrice:                 longBook.BidPrice,
-					LongAskPrice:                 longBook.AskPrice,
-					ShortBidPrice:                shortBook.BidPrice,
-					ShortAskPrice:                shortBook.AskPrice,
-					LongMarkPrice:                longFunding.MarkPrice,
-					ShortMarkPrice:               shortFunding.MarkPrice,
-					GrossFundingPNL:              grossFundingPNL,
-					EntryFeePNL:                  entryFeePNL,
-					ExitFeePNL:                   exitFeePNL,
-					SlippagePNL:                  slippagePNL,
-					SafetyBufferPNL:              safetyBufferPNL,
-					EntryPenaltyBps:              primaryWindow.EntryPenaltyBps,
-					ExitPenaltyBps:               primaryWindow.ExitPenaltyBps,
-					HedgePenaltyBps:              primaryWindow.HedgePenaltyBps,
-					ExecutionPenaltyBps:          primaryWindow.ExecutionPenaltyBps,
-					ExecutionPenaltyModel:        primaryWindow.ExecutionPenaltyModel,
-					ExecutionPenaltyBucket:       primaryWindow.ExecutionPenaltyBucket,
-					NetExpectedPNL:               netExpectedPNL,
-					NetExpectedBps:               netExpectedBps,
-					BasisBps:                     basisBps,
-					MaxAllowedBasisBps:           maxAllowedBasisBps,
-					Score:                        r.scoreOpportunity(netExpectedPNL, grossEdgeHourly, basisBps),
-					StrategyMode:                 projection.StrategyMode,
-					EarliestFundingTimeMs:        minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
-					LatestFundingTimeMs:          maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
-					ProjectedFundingTimeMs:       projection.ProjectedFundingTimeMs,
-					RequiredEntryByFundingTimeMs: projection.RequiredEntryByFundingTimeMs,
-					LongFundingEventCount:        projection.LongFundingEventCount,
-					ShortFundingEventCount:       projection.ShortFundingEventCount,
-					FundingWindowHours:           projection.FundingWindowHours,
-					FundingComputationMode:       projection.ComputationMode,
-					NextReviewTimeMs:             projection.NextReviewTimeMs,
-					SyncBoundaryTimeMs:           projection.SyncBoundaryTimeMs,
-					EntryPathSegmentCount:        projection.IncludedSegmentCount,
-					EntryPathStopReason:          projection.PathEndReason,
-					ProjectionDetails:            projectionDetails(windowEvaluations),
-					LongFundingRule:              buildFundingRuleMetadata(longFunding, longMeta, longForecast),
-					ShortFundingRule:             buildFundingRuleMetadata(shortFunding, shortMeta, shortForecast),
-					FundingSegments:              selected.FundingSegments,
-					EntryPathSegments:            selected.EntryPathSegments,
-					Status:                       status,
-					RejectReason:                 reason,
-					EligibleForExecution:         eligible,
-				})
+				items = append(items, buildOpportunityFromDirectionCandidate(r, now, symbol, selected, rankContext))
 			}
 		}
 	}
@@ -774,6 +805,288 @@ func (r *StrategyRunner) computeCandidates(now time.Time) []entity.Opportunity {
 	// 若在计算层提前截断，后端与前端都无法再检索被截掉的机会。
 	// 展示数量控制应由查询参数(limit)与前端分页/筛选承担。
 	return items
+}
+
+func buildOpportunityFromDirectionCandidate(r *StrategyRunner, now time.Time, symbol string, selected evaluatedDirectionCandidate, rankContext fundingRankContext) entity.Opportunity {
+	longExchange, shortExchange := selected.LongExchange, selected.ShortExchange
+	longFunding, shortFunding := selected.LongFunding, selected.ShortFunding
+	longBook, shortBook := selected.LongBook, selected.ShortBook
+	longMeta, shortMeta := selected.LongMeta, selected.ShortMeta
+	longForecast, shortForecast := selected.LongForecast, selected.ShortForecast
+	projection := selected.PrimaryWindow.Projection
+	longRank := rankContext.lookup(longExchange, symbol)
+	shortRank := rankContext.lookup(shortExchange, symbol)
+
+	longHourly := longFunding.FundingRate / float64(maxInt(longFunding.FundingIntervalHours, 1))
+	shortHourly := shortFunding.FundingRate / float64(maxInt(shortFunding.FundingIntervalHours, 1))
+	entryFeePNL := selected.EntryFeePNL
+	exitFeePNL := selected.ExitFeePNL
+	basisBps := selected.BasisBps
+	windowEvaluations := selected.WindowEvaluations
+	primaryWindow := selected.PrimaryWindow
+	activeProjection := projection
+	grossEdgeHourly := projection.CarryRateHourlyEquivalent
+	grossFundingPNL := primaryWindow.Detail.GrossFundingPNL
+	slippagePNL := primaryWindow.SlippagePNL
+	safetyBufferPNL := primaryWindow.SafetyBufferPNL
+	netExpectedPNL := primaryWindow.Detail.NetExpectedPNL
+	netExpectedBps := primaryWindow.Detail.NetExpectedBps
+	maxAllowedBasisBps := primaryWindow.MaxAllowedBasisBps
+	totalCostsPNL := entryFeePNL + exitFeePNL + slippagePNL + safetyBufferPNL
+	projectionRows := projectionDetails(windowEvaluations)
+	longFundingRule := buildFundingRuleMetadata(longFunding, longMeta, longForecast, longRank)
+	shortFundingRule := buildFundingRuleMetadata(shortFunding, shortMeta, shortForecast, shortRank)
+	longHoldAssessment := sameExchangeLongHoldAssessment{}
+	useHistoricalLongHoldEstimate := false
+	basisAssessment := sameExchangeBasisAssessment{
+		Allowed:        true,
+		SizeMultiplier: 1,
+		Reason:         sameExchangeBasisReasonEligible,
+	}
+	priceRiskAssessment := sameExchangePriceRiskAssessment{
+		Allowed: true,
+		Reason:  sameExchangePriceRiskReasonEligible,
+	}
+	if normalizeArbitrageMode(r.cfg.ArbitrageMode, ArbitrageModeCrossExchange) == ArbitrageModeSameExchangeSpotPerp {
+		perpForecast := shortForecast
+		perpRank := shortRank
+		perpExchange := shortExchange
+		perpFunding := shortFunding
+		if isPerpetualSymbol(longMeta) && !isPerpetualSymbol(shortMeta) {
+			perpForecast = longForecast
+			perpRank = longRank
+			perpExchange = longExchange
+			perpFunding = longFunding
+		}
+		perpRule := &shortFundingRule
+		if isPerpetualSymbol(longMeta) && !isPerpetualSymbol(shortMeta) {
+			perpRule = &longFundingRule
+		}
+		longHoldAssessment = assessSameExchangeLongHold(r.cfg, now, *perpRule, perpFunding.FundingRate, perpForecast, r.cfg.EffectiveNotional(), totalCostsPNL)
+		applySameExchangeLongHoldAssessment(perpRule, longHoldAssessment)
+		if sameExchangeShouldUseHistoricalLongHoldEstimate(r.cfg, netExpectedPNL, longHoldAssessment) {
+			activeProjection = sameExchangeHistoricalLongHoldProjection(projection, longHoldAssessment)
+			grossEdgeHourly = activeProjection.CarryRateHourlyEquivalent
+			grossFundingPNL = longHoldAssessment.SuggestedGrossFundingPNL
+			netExpectedPNL = longHoldAssessment.SuggestedNetPNL
+			if r.cfg.EffectiveNotional() > 0 {
+				netExpectedBps = round4(netExpectedPNL / r.cfg.EffectiveNotional() * 10000)
+			} else {
+				netExpectedBps = 0
+			}
+			projectionRows = applySameExchangeHistoricalProjectionDetails(projectionRows, activeProjection, grossFundingPNL, netExpectedPNL, r.cfg.EffectiveNotional())
+			useHistoricalLongHoldEstimate = true
+		}
+		maxAllowedBasisBps = r.allowedBasisThresholdBps(activeProjection)
+		scoreBias := sameExchangeFundingSelectionBias(perpRank, perpForecast) * 10
+		score := r.scoreOpportunity(netExpectedPNL, grossEdgeHourly, basisBps)
+		score += scoreBias
+		basisAssessment = assessSameExchangeBasisRisk(
+			r.cfg,
+			r.cfg.ArbitrageMode,
+			activeProjection.FundingWindowHours,
+			activeProjection.CarryRate,
+			activeProjection.LongFundingEventCount,
+			activeProjection.ShortFundingEventCount,
+			basisBps,
+			totalCostsPNL,
+			r.cfg.EffectiveNotional(),
+			maxAllowedBasisBps,
+		)
+		priceRiskAssessment = assessSameExchangePriceRisk(
+			context.Background(),
+			r.cfg,
+			r.marketRepo,
+			r.cfg.ArbitrageMode,
+			perpExchange,
+			symbol,
+			perpFunding,
+			now,
+		)
+		estimateMode, estimateConfidence := fundingEstimateProfile(activeProjection, longForecast, shortForecast)
+		status, reason, eligible := r.evaluateOpportunity(
+			now,
+			activeProjection,
+			netExpectedPNL,
+			basisBps,
+			maxAllowedBasisBps,
+			priceRiskAssessment,
+			longFunding,
+			shortFunding,
+			longBook,
+			shortBook,
+		)
+
+		opp := entity.Opportunity{
+			BatchID:                                  "",
+			AsOfTimeMs:                               now.UnixMilli(),
+			Symbol:                                   symbol,
+			LongExchange:                             longExchange,
+			ShortExchange:                            shortExchange,
+			LongVenueSymbol:                          longMeta.VenueSymbol,
+			ShortVenueSymbol:                         shortMeta.VenueSymbol,
+			LongFundingRate:                          longFunding.FundingRate,
+			ShortFundingRate:                         shortFunding.FundingRate,
+			LongFundingTimeMs:                        longFunding.FundingTimeMs,
+			ShortFundingTimeMs:                       shortFunding.FundingTimeMs,
+			LongFundingIntervalHours:                 longFunding.FundingIntervalHours,
+			ShortFundingIntervalHours:                shortFunding.FundingIntervalHours,
+			LongFundingHourly:                        longHourly,
+			ShortFundingHourly:                       shortHourly,
+			GrossEdgeHourly:                          grossEdgeHourly,
+			LongFutureFundingRate:                    longForecast.PredictedRateForEvent(2),
+			ShortFutureFundingRate:                   shortForecast.PredictedRateForEvent(2),
+			FundingEstimateMode:                      estimateMode,
+			FundingEstimateConfidence:                estimateConfidence,
+			LongBidPrice:                             longBook.BidPrice,
+			LongAskPrice:                             longBook.AskPrice,
+			ShortBidPrice:                            shortBook.BidPrice,
+			ShortAskPrice:                            shortBook.AskPrice,
+			LongMarkPrice:                            longFunding.MarkPrice,
+			ShortMarkPrice:                           shortFunding.MarkPrice,
+			GrossFundingPNL:                          grossFundingPNL,
+			EntryFeePNL:                              entryFeePNL,
+			ExitFeePNL:                               exitFeePNL,
+			SlippagePNL:                              slippagePNL,
+			SafetyBufferPNL:                          safetyBufferPNL,
+			EntryPenaltyBps:                          primaryWindow.EntryPenaltyBps,
+			ExitPenaltyBps:                           primaryWindow.ExitPenaltyBps,
+			HedgePenaltyBps:                          primaryWindow.HedgePenaltyBps,
+			ExecutionPenaltyBps:                      primaryWindow.ExecutionPenaltyBps,
+			ExecutionPenaltyModel:                    primaryWindow.ExecutionPenaltyModel,
+			ExecutionPenaltyBucket:                   primaryWindow.ExecutionPenaltyBucket,
+			NetExpectedPNL:                           netExpectedPNL,
+			NetExpectedBps:                           netExpectedBps,
+			BasisBps:                                 basisBps,
+			MaxAllowedBasisBps:                       maxAllowedBasisBps,
+			SameExchangePriceRiskAllowed:             priceRiskAssessment.Allowed,
+			SameExchangePriceRiskReason:              priceRiskAssessment.Reason,
+			SameExchangePriceShockCurrentMarkPrice:   priceRiskAssessment.CurrentMarkPrice,
+			SameExchangePriceShockBaselineMarkPrice:  priceRiskAssessment.BaselineMarkPrice,
+			SameExchangePriceShockRatio:              priceRiskAssessment.PriceShockRatio,
+			Score:                                    score,
+			StrategyMode:                             activeProjection.StrategyMode,
+			EarliestFundingTimeMs:                    minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
+			LatestFundingTimeMs:                      maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
+			ProjectedFundingTimeMs:                   activeProjection.ProjectedFundingTimeMs,
+			RequiredEntryByFundingTimeMs:             activeProjection.RequiredEntryByFundingTimeMs,
+			LongFundingEventCount:                    activeProjection.LongFundingEventCount,
+			ShortFundingEventCount:                   activeProjection.ShortFundingEventCount,
+			FundingWindowHours:                       activeProjection.FundingWindowHours,
+			FundingComputationMode:                   activeProjection.ComputationMode,
+			NextReviewTimeMs:                         activeProjection.NextReviewTimeMs,
+			SyncBoundaryTimeMs:                       activeProjection.SyncBoundaryTimeMs,
+			EntryPathSegmentCount:                    activeProjection.IncludedSegmentCount,
+			EntryPathStopReason:                      activeProjection.PathEndReason,
+			ProjectionDetails:                        projectionRows,
+			LongFundingRule:                          longFundingRule,
+			ShortFundingRule:                         shortFundingRule,
+			FundingSegments:                          selected.FundingSegments,
+			EntryPathSegments:                        selected.EntryPathSegments,
+			Status:                                   status,
+			RejectReason:                             reason,
+			EligibleForExecution:                     eligible,
+			SameExchangeLongHoldUsingHistoryEstimate: useHistoricalLongHoldEstimate,
+			SameExchangeLongHoldSuggestedFundingEvents:   longHoldAssessment.SuggestedFundingEvents,
+			SameExchangeLongHoldSuggestedHoldHours:       longHoldAssessment.SuggestedHoldHours,
+			SameExchangeLongHoldSuggestedFundingTimeMs:   longHoldAssessment.SuggestedFundingTimeMs,
+			SameExchangeLongHoldSuggestedGrossFundingPNL: longHoldAssessment.SuggestedGrossFundingPNL,
+			SameExchangeLongHoldSuggestedNetPNL:          longHoldAssessment.SuggestedNetPNL,
+		}
+		applySameExchangeBasisAssessmentToOpportunity(&opp, basisAssessment)
+		if r.cfg.SameExchangeRequireLongHoldEligible && !longHoldAssessment.Eligible {
+			opp.Status = OpportunityStatusLongHoldGuard
+			opp.RejectReason = sameExchangeLongHoldRejectReason(r.cfg, longHoldAssessment, perpForecast.HistorySampleCount)
+			opp.EligibleForExecution = false
+		}
+		return opp
+	}
+	score := r.scoreOpportunity(netExpectedPNL, grossEdgeHourly, basisBps)
+	estimateMode, estimateConfidence := fundingEstimateProfile(activeProjection, longForecast, shortForecast)
+	status, reason, eligible := r.evaluateOpportunity(
+		now,
+		activeProjection,
+		netExpectedPNL,
+		basisBps,
+		maxAllowedBasisBps,
+		priceRiskAssessment,
+		longFunding,
+		shortFunding,
+		longBook,
+		shortBook,
+	)
+
+	opp := entity.Opportunity{
+		BatchID:                                 "",
+		AsOfTimeMs:                              now.UnixMilli(),
+		Symbol:                                  symbol,
+		LongExchange:                            longExchange,
+		ShortExchange:                           shortExchange,
+		LongVenueSymbol:                         longMeta.VenueSymbol,
+		ShortVenueSymbol:                        shortMeta.VenueSymbol,
+		LongFundingRate:                         longFunding.FundingRate,
+		ShortFundingRate:                        shortFunding.FundingRate,
+		LongFundingTimeMs:                       longFunding.FundingTimeMs,
+		ShortFundingTimeMs:                      shortFunding.FundingTimeMs,
+		LongFundingIntervalHours:                longFunding.FundingIntervalHours,
+		ShortFundingIntervalHours:               shortFunding.FundingIntervalHours,
+		LongFundingHourly:                       longHourly,
+		ShortFundingHourly:                      shortHourly,
+		GrossEdgeHourly:                         grossEdgeHourly,
+		LongFutureFundingRate:                   longForecast.PredictedRateForEvent(2),
+		ShortFutureFundingRate:                  shortForecast.PredictedRateForEvent(2),
+		FundingEstimateMode:                     estimateMode,
+		FundingEstimateConfidence:               estimateConfidence,
+		LongBidPrice:                            longBook.BidPrice,
+		LongAskPrice:                            longBook.AskPrice,
+		ShortBidPrice:                           shortBook.BidPrice,
+		ShortAskPrice:                           shortBook.AskPrice,
+		LongMarkPrice:                           longFunding.MarkPrice,
+		ShortMarkPrice:                          shortFunding.MarkPrice,
+		GrossFundingPNL:                         grossFundingPNL,
+		EntryFeePNL:                             entryFeePNL,
+		ExitFeePNL:                              exitFeePNL,
+		SlippagePNL:                             slippagePNL,
+		SafetyBufferPNL:                         safetyBufferPNL,
+		EntryPenaltyBps:                         primaryWindow.EntryPenaltyBps,
+		ExitPenaltyBps:                          primaryWindow.ExitPenaltyBps,
+		HedgePenaltyBps:                         primaryWindow.HedgePenaltyBps,
+		ExecutionPenaltyBps:                     primaryWindow.ExecutionPenaltyBps,
+		ExecutionPenaltyModel:                   primaryWindow.ExecutionPenaltyModel,
+		ExecutionPenaltyBucket:                  primaryWindow.ExecutionPenaltyBucket,
+		NetExpectedPNL:                          netExpectedPNL,
+		NetExpectedBps:                          netExpectedBps,
+		BasisBps:                                basisBps,
+		MaxAllowedBasisBps:                      maxAllowedBasisBps,
+		SameExchangePriceRiskAllowed:            priceRiskAssessment.Allowed,
+		SameExchangePriceRiskReason:             priceRiskAssessment.Reason,
+		SameExchangePriceShockCurrentMarkPrice:  priceRiskAssessment.CurrentMarkPrice,
+		SameExchangePriceShockBaselineMarkPrice: priceRiskAssessment.BaselineMarkPrice,
+		SameExchangePriceShockRatio:             priceRiskAssessment.PriceShockRatio,
+		Score:                                   score,
+		StrategyMode:                            activeProjection.StrategyMode,
+		EarliestFundingTimeMs:                   minInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
+		LatestFundingTimeMs:                     maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs),
+		ProjectedFundingTimeMs:                  activeProjection.ProjectedFundingTimeMs,
+		RequiredEntryByFundingTimeMs:            activeProjection.RequiredEntryByFundingTimeMs,
+		LongFundingEventCount:                   activeProjection.LongFundingEventCount,
+		ShortFundingEventCount:                  activeProjection.ShortFundingEventCount,
+		FundingWindowHours:                      activeProjection.FundingWindowHours,
+		FundingComputationMode:                  activeProjection.ComputationMode,
+		NextReviewTimeMs:                        activeProjection.NextReviewTimeMs,
+		SyncBoundaryTimeMs:                      activeProjection.SyncBoundaryTimeMs,
+		EntryPathSegmentCount:                   activeProjection.IncludedSegmentCount,
+		EntryPathStopReason:                     activeProjection.PathEndReason,
+		ProjectionDetails:                       projectionRows,
+		LongFundingRule:                         longFundingRule,
+		ShortFundingRule:                        shortFundingRule,
+		FundingSegments:                         selected.FundingSegments,
+		EntryPathSegments:                       selected.EntryPathSegments,
+		Status:                                  status,
+		RejectReason:                            reason,
+		EligibleForExecution:                    eligible,
+	}
+	return opp
 }
 
 func (r *StrategyRunner) allowedBasisThresholdBps(projection fundingProjection) float64 {
@@ -814,15 +1127,19 @@ func (r *StrategyRunner) allowedBasisThresholdBps(projection fundingProjection) 
 // 3) basis 限制：避免靠 funding 赚的钱被入场基差吞掉；
 // 4) min net pnl：统一门槛；
 // 5) entry window：确保在计划结算前仍有可执行性。
-func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingProjection, netExpectedPNL float64, basisBps float64, maxAllowedBasisBps float64, longFunding, shortFunding entity.FundingSnapshot, longBook, shortBook entity.BookTopSnapshot) (string, string, bool) {
+func (r *StrategyRunner) evaluateOpportunity(now time.Time, projection fundingProjection, netExpectedPNL float64, basisBps float64, maxAllowedBasisBps float64, priceRiskAssessment sameExchangePriceRiskAssessment, longFunding, shortFunding entity.FundingSnapshot, longBook, shortBook entity.BookTopSnapshot) (string, string, bool) {
 	if r.isSnapshotStale(now, longFunding.EventTimeMs) || r.isSnapshotStale(now, shortFunding.EventTimeMs) || r.isSnapshotStale(now, longBook.EventTimeMs) || r.isSnapshotStale(now, shortBook.EventTimeMs) {
 		return OpportunityStatusStaleData, "market data is stale", false
 	}
 	if projection.CarryRate <= 0 {
 		return OpportunityStatusSpreadTooSmall, "event-based funding carry is not positive", false
 	}
-	if basisBps > maxAllowedBasisBps {
-		return OpportunityStatusBasisTooWide, fmt.Sprintf("basis %.4f bps > dynamic max %.4f bps", basisBps, maxAllowedBasisBps), false
+	if normalizeArbitrageMode(r.cfg.ArbitrageMode, ArbitrageModeCrossExchange) == ArbitrageModeSameExchangeSpotPerp {
+		if !priceRiskAssessment.Allowed {
+			return OpportunityStatusPriceRiskGuard, sameExchangePriceRiskRejectReason(r.cfg, priceRiskAssessment), false
+		}
+	} else if math.Abs(basisBps) > maxAllowedBasisBps {
+		return OpportunityStatusBasisTooWide, fmt.Sprintf("basis %.4f bps > dynamic max %.4f bps", math.Abs(basisBps), maxAllowedBasisBps), false
 	}
 	if netExpectedPNL < r.cfg.MinNetPNL {
 		return OpportunityStatusNotProfitable, fmt.Sprintf("net pnl %.4f < min %.4f", netExpectedPNL, r.cfg.MinNetPNL), false
@@ -1033,12 +1350,22 @@ func (r *StrategyRunner) projectFundingCarryVariants(now time.Time, longFunding 
 // - 因此它只负责给 funding 粗筛一个主窗口，不能替代最终净收益选择。
 //
 // 当前语义：
+// - dynamic_profit: 不受 hold_hours 截断，直接在动态候选里选 carry 最优窗口；
 // - strict_target: 直接选 hold_hours 内最后一个真实结算窗口；
 // - latest_profitable: 选 hold_hours 内“最晚且 carry 仍然为正”的 funding 窗口；
 // - 其他模式：保留原来的“最早候选窗口优先”，避免粗筛层过度激进。
 func selectPrimaryFundingProjectionForConfig(cfg Config, projections []fundingProjection) (fundingProjection, bool) {
 	if len(projections) == 0 {
 		return fundingProjection{}, false
+	}
+	if cfg.HoldSelectionMode == HoldSelectionModeDynamicProfit {
+		bestIdx := 0
+		for i := 1; i < len(projections); i++ {
+			if fundingProjectionBetter(projections[i], projections[bestIdx]) {
+				bestIdx = i
+			}
+		}
+		return projections[bestIdx], true
 	}
 	if cfg.HoldSelectionMode == HoldSelectionModeStrictTarget {
 		return projections[len(projections)-1], true
@@ -1126,6 +1453,11 @@ func selectBestOpportunityProjection(cfg Config, items []opportunityProjectionEv
 // - 这样可以让仓位尽量多覆盖几轮 funding，去摊薄开平仓成本；
 // - 如果更晚的窗口已经不满足门槛，再退回到更早但仍然赚钱的窗口。
 //
+// dynamic_profit 的语义是：
+// - 候选窗口不再受 hold_hours 截断；
+// - 系统会在内部安全边界内自动搜索更多兑现点；
+// - 最终仍按净收益最高的那一档决定主持有周期。
+//
 // strict_target 的语义是：
 // - 直接选 hold_hours 内最后一个真实结算窗口；
 // - 无论这个窗口最终是否过最小净收益门槛，都不再偷偷回退到更早窗口；
@@ -1197,6 +1529,19 @@ func opportunityProjectionBetter(left, right opportunityProjectionEvaluation) bo
 	return left.Projection.RequiredEntryByFundingTimeMs < right.Projection.RequiredEntryByFundingTimeMs
 }
 
+func fundingProjectionBetter(left, right fundingProjection) bool {
+	if left.CarryRate != right.CarryRate {
+		return left.CarryRate > right.CarryRate
+	}
+	if left.CarryRateHourlyEquivalent != right.CarryRateHourlyEquivalent {
+		return left.CarryRateHourlyEquivalent > right.CarryRateHourlyEquivalent
+	}
+	if left.ProjectedFundingTimeMs != right.ProjectedFundingTimeMs {
+		return left.ProjectedFundingTimeMs < right.ProjectedFundingTimeMs
+	}
+	return left.RequiredEntryByFundingTimeMs < right.RequiredEntryByFundingTimeMs
+}
+
 func projectionDetails(items []opportunityProjectionEvaluation) []entity.OpportunityProjection {
 	out := make([]entity.OpportunityProjection, 0, len(items))
 	for _, item := range items {
@@ -1236,7 +1581,29 @@ func fundingSegmentsToOpportunitySegments(items []fundingSegment) []entity.Oppor
 	return out
 }
 
-func buildFundingRuleMetadata(item entity.FundingSnapshot, meta entity.Symbol, forecast fundingForecast) entity.OpportunityFundingRule {
+func buildFundingRuleMetadata(item entity.FundingSnapshot, meta entity.Symbol, forecast fundingForecast, rankInfo fundingRankInfo) entity.OpportunityFundingRule {
+	if isSpotSymbol(meta) {
+		return entity.OpportunityFundingRule{
+			Exchange:                     item.Exchange,
+			VenueSymbol:                  pickFirstNonEmpty(meta.VenueSymbol, item.VenueSymbol),
+			FundingIntervalHours:         item.FundingIntervalHours,
+			NextFundingTimeMs:            item.FundingTimeMs,
+			CurrentFundingRate:           0,
+			CurrentFundingRank:           0,
+			CurrentFundingRankTotal:      0,
+			CurrentFundingRankPercentile: 0,
+			HistorySampleCount:           0,
+			HistoryNegativeRatio:         0,
+			HistoryPositiveRatio:         0,
+			CurrentHistoricalPercentile:  0.5,
+			ClampSource:                  "spot_synthetic_zero",
+			EffectiveFloorRate:           0,
+			EffectiveCapRate:             0,
+			ForecastRegime:               "spot_zero",
+			ForecastConfidence:           "high",
+			MetadataSummary:              "spot leg / synthetic zero funding",
+		}
+	}
 	summary := fmt.Sprintf("%s %dh funding / clamp=%s / range=[%s, %s]",
 		strings.ToLower(strings.TrimSpace(item.Exchange)),
 		maxInt(item.FundingIntervalHours, 1),
@@ -1245,17 +1612,25 @@ func buildFundingRuleMetadata(item entity.FundingSnapshot, meta entity.Symbol, f
 		formatFundingRateForSummary(forecast.EffectiveCapRate),
 	)
 	return entity.OpportunityFundingRule{
-		Exchange:             item.Exchange,
-		VenueSymbol:          pickFirstNonEmpty(meta.VenueSymbol, item.VenueSymbol),
-		FundingIntervalHours: item.FundingIntervalHours,
-		NextFundingTimeMs:    item.FundingTimeMs,
-		CurrentFundingRate:   item.FundingRate,
-		ClampSource:          forecast.ClampSource,
-		EffectiveFloorRate:   forecast.EffectiveFloorRate,
-		EffectiveCapRate:     forecast.EffectiveCapRate,
-		ForecastRegime:       forecast.Regime,
-		ForecastConfidence:   forecast.Confidence,
-		MetadataSummary:      summary,
+		Exchange:                     item.Exchange,
+		VenueSymbol:                  pickFirstNonEmpty(meta.VenueSymbol, item.VenueSymbol),
+		FundingIntervalHours:         item.FundingIntervalHours,
+		NextFundingTimeMs:            item.FundingTimeMs,
+		CurrentFundingRate:           item.FundingRate,
+		CurrentFundingRank:           rankInfo.Rank,
+		CurrentFundingRankTotal:      rankInfo.Total,
+		CurrentFundingRankPercentile: rankInfo.Percentile,
+		HistorySampleCount:           forecast.HistorySampleCount,
+		HistoryMeanRate:              forecast.HistoryMean,
+		HistoryNegativeRatio:         forecast.HistoryNegativeRatio,
+		HistoryPositiveRatio:         forecast.HistoryPositiveRatio,
+		CurrentHistoricalPercentile:  forecast.CurrentHistoricalPercentile,
+		ClampSource:                  forecast.ClampSource,
+		EffectiveFloorRate:           forecast.EffectiveFloorRate,
+		EffectiveCapRate:             forecast.EffectiveCapRate,
+		ForecastRegime:               forecast.Regime,
+		ForecastConfidence:           forecast.Confidence,
+		MetadataSummary:              summary,
 	}
 }
 
@@ -1285,6 +1660,42 @@ func pickFirstNonEmpty(values ...string) string {
 //   - 当 holdHours 更长（例如 24h）时，会继续评估更远的退出点，
 //     支持“多轮 funding 覆盖建仓成本”的策略；
 //   - 如果持仓窗口内没有任何 funding 事件，则当前方向不存在可兑现的 funding carry。
+const dynamicProfitMaxFundingEventsPerLeg = 12
+
+func buildFundingCandidateTimesForConfig(cfg Config, nowMs int64, longFunding, shortFunding entity.FundingSnapshot) []int64 {
+	normalized := cfg.normalize()
+	if !usesDynamicProfitHoldSelection(normalized.HoldSelectionMode) {
+		return buildFundingCandidateTimes(nowMs, longFunding, shortFunding, normalized.HoldHours)
+	}
+	return buildDynamicProfitFundingCandidateTimes(nowMs, longFunding, shortFunding, dynamicProfitMaxFundingEventsPerLeg)
+}
+
+func buildDynamicProfitFundingCandidateTimes(nowMs int64, longFunding, shortFunding entity.FundingSnapshot, maxEventsPerLeg int) []int64 {
+	horizonMs := maxInt64(
+		fundingTimelineHorizon(nowMs, longFunding.FundingTimeMs, longFunding.FundingIntervalHours, maxEventsPerLeg),
+		fundingTimelineHorizon(nowMs, shortFunding.FundingTimeMs, shortFunding.FundingIntervalHours, maxEventsPerLeg),
+	)
+	if horizonMs <= 0 {
+		horizonMs = maxInt64(longFunding.FundingTimeMs, shortFunding.FundingTimeMs)
+	}
+	if horizonMs <= nowMs {
+		return nil
+	}
+	holdHours := float64(horizonMs-nowMs) / float64(time.Hour/time.Millisecond)
+	return buildFundingCandidateTimes(nowMs, longFunding, shortFunding, holdHours)
+}
+
+func fundingTimelineHorizon(nowMs, nextFundingTimeMs int64, intervalHours, maxEvents int) int64 {
+	if nextFundingTimeMs <= nowMs {
+		return 0
+	}
+	intervalMs := int64(maxInt(intervalHours, 0)) * int64(time.Hour/time.Millisecond)
+	if intervalMs <= 0 || maxEvents <= 1 {
+		return nextFundingTimeMs
+	}
+	return nextFundingTimeMs + int64(maxEvents-1)*intervalMs
+}
+
 func buildFundingCandidateTimes(nowMs int64, longFunding, shortFunding entity.FundingSnapshot, holdHours float64) []int64 {
 	horizon := int64(0)
 	if holdHours > 0 {
@@ -1332,7 +1743,10 @@ func (r *StrategyRunner) forecastFunding(ctx context.Context, now time.Time, ite
 	// 因此这里也同步退化成 spot-only forecast，避免展示层和元数据里继续出现
 	// “下一事件预测费率远大于当前费率”的误导性数字。
 	if r.cfg.normalize().StrategyMode == StrategyModeRollingCycleAligned {
-		return rollingSpotForecast(r.cfg, item)
+		if r.forecaster == nil {
+			return rollingSpotForecast(r.cfg, item)
+		}
+		return rollingSpotForecast(r.cfg, item, r.forecaster.Forecast(ctx, now, item))
 	}
 	if r.forecaster == nil {
 		return rollingSpotForecast(r.cfg, item)
@@ -1483,6 +1897,9 @@ func (r *StrategyRunner) runPersistenceCleanup(ctx context.Context, now time.Tim
 	snapshotCutoff := now.Add(-r.cfg.SnapshotRetention)
 	if err := r.marketRepo.DeleteOldFundingSnapshots(ctx, snapshotCutoff); err != nil {
 		r.logger.Error("cleanup_old_funding_snapshots_failed", slog.Any("err", err))
+	}
+	if err := r.marketRepo.DeleteOldFundingRateHistory(ctx, now.Add(-r.fundingRateHistoryRetention())); err != nil {
+		r.logger.Error("cleanup_old_funding_rate_history_failed", slog.Any("err", err))
 	}
 	if err := r.marketRepo.DeleteOldBookTopSnapshots(ctx, snapshotCutoff); err != nil {
 		r.logger.Error("cleanup_old_book_snapshots_failed", slog.Any("err", err))

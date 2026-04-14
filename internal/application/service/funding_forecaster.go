@@ -23,18 +23,22 @@ type FundingForecaster interface {
 }
 
 type fundingForecast struct {
-	CurrentRate        float64
-	BaselineRate       float64
-	HistoryMean        float64
-	HistoryStdDev      float64
-	ZScore             float64
-	Regime             string
-	Confidence         string
-	MeanReversion      float64
-	ContinuationDecay  float64
-	EffectiveFloorRate float64
-	EffectiveCapRate   float64
-	ClampSource        string
+	CurrentRate                 float64
+	BaselineRate                float64
+	HistoryMean                 float64
+	HistoryStdDev               float64
+	HistorySampleCount          int
+	HistoryNegativeRatio        float64
+	HistoryPositiveRatio        float64
+	CurrentHistoricalPercentile float64
+	ZScore                      float64
+	Regime                      string
+	Confidence                  string
+	MeanReversion               float64
+	ContinuationDecay           float64
+	EffectiveFloorRate          float64
+	EffectiveCapRate            float64
+	ClampSource                 string
 }
 
 func (f fundingForecast) PredictedRateForEvent(eventIndex int) float64 {
@@ -49,11 +53,15 @@ func (f fundingForecast) PredictedRateForEvent(eventIndex int) float64 {
 }
 
 type fundingStats struct {
-	mean      float64
-	stdDev    float64
-	recentAvg float64
-	count     int
-	expiresAt time.Time
+	mean              float64
+	stdDev            float64
+	recentAvg         float64
+	count             int
+	historyCount      int
+	negativeRatio     float64
+	positiveRatio     float64
+	currentPercentile float64
+	expiresAt         time.Time
 }
 
 type RegimeAwareFundingForecaster struct {
@@ -85,18 +93,22 @@ func (f *RegimeAwareFundingForecaster) Forecast(ctx context.Context, now time.Ti
 	if !ok {
 		decay := normalizedContinuationDecay(f.cfg.FundingRateContinuationDecay)
 		return fundingForecast{
-			CurrentRate:        item.FundingRate,
-			BaselineRate:       item.FundingRate,
-			HistoryMean:        item.FundingRate,
-			HistoryStdDev:      0,
-			ZScore:             0,
-			Regime:             "spot_only",
-			Confidence:         "low",
-			MeanReversion:      0.20,
-			ContinuationDecay:  decay,
-			EffectiveFloorRate: item.FundingRate,
-			EffectiveCapRate:   item.FundingRate,
-			ClampSource:        "spot_only",
+			CurrentRate:                 item.FundingRate,
+			BaselineRate:                item.FundingRate,
+			HistoryMean:                 item.FundingRate,
+			HistoryStdDev:               0,
+			HistorySampleCount:          0,
+			HistoryNegativeRatio:        0,
+			HistoryPositiveRatio:        0,
+			CurrentHistoricalPercentile: 0.5,
+			ZScore:                      0,
+			Regime:                      "spot_only",
+			Confidence:                  "low",
+			MeanReversion:               0.20,
+			ContinuationDecay:           decay,
+			EffectiveFloorRate:          item.FundingRate,
+			EffectiveCapRate:            item.FundingRate,
+			ClampSource:                 "spot_only",
 		}
 	}
 
@@ -121,18 +133,22 @@ func (f *RegimeAwareFundingForecaster) Forecast(ctx context.Context, now time.Ti
 	decay = clampFloat(decay, 0.20, 0.98)
 
 	return fundingForecast{
-		CurrentRate:        item.FundingRate,
-		BaselineRate:       clampFloat(baseline, floorRate, capRate),
-		HistoryMean:        stats.mean,
-		HistoryStdDev:      stats.stdDev,
-		ZScore:             zScore,
-		Regime:             regime,
-		Confidence:         confidence,
-		MeanReversion:      meanReversion,
-		ContinuationDecay:  decay,
-		EffectiveFloorRate: floorRate,
-		EffectiveCapRate:   capRate,
-		ClampSource:        clampSource,
+		CurrentRate:                 item.FundingRate,
+		BaselineRate:                clampFloat(baseline, floorRate, capRate),
+		HistoryMean:                 stats.mean,
+		HistoryStdDev:               stats.stdDev,
+		HistorySampleCount:          stats.historyCount,
+		HistoryNegativeRatio:        stats.negativeRatio,
+		HistoryPositiveRatio:        stats.positiveRatio,
+		CurrentHistoricalPercentile: stats.currentPercentile,
+		ZScore:                      zScore,
+		Regime:                      regime,
+		Confidence:                  confidence,
+		MeanReversion:               meanReversion,
+		ContinuationDecay:           decay,
+		EffectiveFloorRate:          floorRate,
+		EffectiveCapRate:            capRate,
+		ClampSource:                 clampSource,
 	}
 }
 
@@ -147,21 +163,78 @@ func (f *RegimeAwareFundingForecaster) historyStats(ctx context.Context, now tim
 	if f.marketRepo == nil {
 		return fundingStats{}, false
 	}
-	lookback := f.cfg.FundingHistoryLookback
-	if lookback <= 0 {
+	historyLookback := f.cfg.FundingRateHistoryLookback
+	if historyLookback <= 0 {
+		historyLookback = f.cfg.FundingHistoryLookback
+	}
+	ttl := fundingStatsCacheTTL(f.cfg)
+	if historyLookback > 0 {
+		history, err := f.marketRepo.RecentFundingRateHistory(ctx, item.Exchange, item.Symbol, now.Add(-historyLookback), 1000)
+		if err == nil && len(history) > 0 {
+			rates := make([]float64, 0, len(history))
+			for _, snap := range history {
+				rates = append(rates, snap.FundingRate)
+			}
+			if stats, ok := buildFundingStatsFromRates(now, ttl, item.FundingRate, rates); ok {
+				f.mu.Lock()
+				f.cache[key] = stats
+				f.mu.Unlock()
+				return stats, true
+			}
+		}
+	}
+
+	snapshotLookback := f.cfg.FundingHistoryLookback
+	if snapshotLookback <= 0 {
 		return fundingStats{}, false
 	}
-	history, err := f.marketRepo.RecentFundingSnapshots(ctx, item.Exchange, item.Symbol, now.Add(-lookback), 48)
+	history, err := f.marketRepo.RecentFundingSnapshots(ctx, item.Exchange, item.Symbol, now.Add(-snapshotLookback), 48)
 	if err != nil || len(history) == 0 {
 		return fundingStats{}, false
 	}
 
-	values := make([]float64, 0, len(history)+1)
-	values = append(values, item.FundingRate)
+	rates := make([]float64, 0, len(history))
 	for _, snap := range history {
-		if !math.IsNaN(snap.FundingRate) && !math.IsInf(snap.FundingRate, 0) {
-			values = append(values, snap.FundingRate)
+		rates = append(rates, snap.FundingRate)
+	}
+	stats, ok := buildFundingStatsFromRates(now, ttl, item.FundingRate, rates)
+	if !ok {
+		return fundingStats{}, false
+	}
+	f.mu.Lock()
+	f.cache[key] = stats
+	f.mu.Unlock()
+	return stats, true
+}
+
+func ratioOrZero(part, total int) float64 {
+	if total <= 0 || part <= 0 {
+		return 0
+	}
+	return float64(part) / float64(total)
+}
+
+func fundingStatsCacheTTL(cfg Config) time.Duration {
+	ttl := cfg.OpportunityCalcInterval * 6
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	if ttl > 30*time.Second {
+		ttl = 30 * time.Second
+	}
+	return ttl
+}
+
+func buildFundingStatsFromRates(now time.Time, ttl time.Duration, currentRate float64, historyRates []float64) (fundingStats, bool) {
+	values := make([]float64, 0, len(historyRates)+1)
+	values = append(values, currentRate)
+	historyValues := make([]float64, 0, len(historyRates))
+	for _, rate := range historyRates {
+		if math.IsNaN(rate) || math.IsInf(rate, 0) {
+			continue
 		}
+		values = append(values, rate)
+		historyValues = append(historyValues, rate)
 	}
 	if len(values) == 0 {
 		return fundingStats{}, false
@@ -188,24 +261,36 @@ func (f *RegimeAwareFundingForecaster) historyStats(ctx context.Context, now tim
 	}
 	recentAvg /= float64(recentN)
 
-	ttl := f.cfg.OpportunityCalcInterval * 6
-	if ttl <= 0 {
-		ttl = 30 * time.Second
+	negativeCount := 0
+	positiveCount := 0
+	currentPercentile := 0.5
+	if len(historyValues) > 0 {
+		lessOrEqual := 0
+		for _, value := range historyValues {
+			if value < 0 {
+				negativeCount++
+			}
+			if value > 0 {
+				positiveCount++
+			}
+			if value <= currentRate {
+				lessOrEqual++
+			}
+		}
+		currentPercentile = float64(lessOrEqual) / float64(len(historyValues))
 	}
-	if ttl > 30*time.Second {
-		ttl = 30 * time.Second
-	}
-	stats := fundingStats{
-		mean:      mean,
-		stdDev:    stdDev,
-		recentAvg: recentAvg,
-		count:     len(values),
-		expiresAt: now.Add(ttl),
-	}
-	f.mu.Lock()
-	f.cache[key] = stats
-	f.mu.Unlock()
-	return stats, true
+
+	return fundingStats{
+		mean:              mean,
+		stdDev:            stdDev,
+		recentAvg:         recentAvg,
+		count:             len(values),
+		historyCount:      len(historyValues),
+		negativeRatio:     ratioOrZero(negativeCount, len(historyValues)),
+		positiveRatio:     ratioOrZero(positiveCount, len(historyValues)),
+		currentPercentile: currentPercentile,
+		expiresAt:         now.Add(ttl),
+	}, true
 }
 
 func fundingRegimeProfile(zScore, currentRate, mean float64) (regime, confidence string, meanReversion, decayTilt float64) {

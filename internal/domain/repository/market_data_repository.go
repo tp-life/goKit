@@ -15,10 +15,13 @@ type SnapshotStats struct {
 type MarketDataRepository interface {
 	SaveFundingSnapshots(ctx context.Context, items []entity.FundingSnapshot) error
 	SaveBookTopSnapshots(ctx context.Context, items []entity.BookTopSnapshot) error
+	SaveFundingRateHistory(ctx context.Context, items []entity.FundingRateHistory) error
 	RecentFundingSnapshots(ctx context.Context, exchangeName, symbol string, since time.Time, limit int) ([]entity.FundingSnapshot, error)
+	RecentFundingRateHistory(ctx context.Context, exchangeName, symbol string, since time.Time, limit int) ([]entity.FundingRateHistory, error)
 
 	// DeleteOldFundingSnapshots 删除保留期之外的 funding 快照。
 	DeleteOldFundingSnapshots(ctx context.Context, cutoff time.Time) error
+	DeleteOldFundingRateHistory(ctx context.Context, cutoff time.Time) error
 
 	// DeleteOldBookTopSnapshots 删除保留期之外的盘口快照。
 	DeleteOldBookTopSnapshots(ctx context.Context, cutoff time.Time) error

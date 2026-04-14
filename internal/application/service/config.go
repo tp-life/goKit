@@ -11,6 +11,11 @@ const (
 	// StrategyModeRollingCycleAligned 表示后续将切到“按结算段滚动 review / 续持 / 翻仓”的模式。
 	StrategyModeRollingCycleAligned = "rolling_cycle_aligned"
 
+	// ArbitrageModeCrossExchange 表示当前默认的“跨交易所 funding 套利”模式。
+	ArbitrageModeCrossExchange = "cross_exchange"
+	// ArbitrageModeSameExchangeSpotPerp 表示“同一交易所现货 + 永续空单”的套利模式。
+	ArbitrageModeSameExchangeSpotPerp = "same_exchange_spot_perp"
+
 	// HoldSelectionModeBestNet 表示：
 	// 在 hold_hours 允许的候选结算窗口内，直接选择“净收益最高”的那一个窗口。
 	//
@@ -38,6 +43,15 @@ const (
 	// 如果该目标窗口本身不赚钱，系统不会偷偷退回到更早窗口，
 	// 而是把这条机会明确展示为“不盈利/不可执行”。
 	HoldSelectionModeStrictTarget = "strict_target"
+	// HoldSelectionModeDynamicProfit 表示：
+	// 不再把 hold_hours 当成候选窗口上限，而是在一段内部安全边界内
+	// 自动搜索更多 funding 兑现点，并按净收益挑选最佳窗口。
+	//
+	// 这个模式更适合同所 spot-perp 这类“希望让收益自己决定持有多久”的场景：
+	// - 页面展示的主持有时长由收益最优窗口决定；
+	// - execution plan 也会对齐到这个动态窗口；
+	// - hold_hours 仍保留给旧模式与展示层，但不再限制这条模式的候选搜索范围。
+	HoldSelectionModeDynamicProfit = "dynamic_profit"
 )
 
 type StrategyUniverseConfig struct {
@@ -87,6 +101,8 @@ type StrategySpreadGuardConfig struct {
 
 type StrategyPredictionConfig struct {
 	FundingHistoryLookback                  time.Duration `mapstructure:"funding_history_lookback"`
+	FundingRateHistoryLookback              time.Duration `mapstructure:"funding_rate_history_lookback"`
+	FundingRateHistorySyncInterval          time.Duration `mapstructure:"funding_rate_history_sync_interval"`
 	FundingSmoothingCurrentWeight           float64       `mapstructure:"funding_smoothing_current_weight"`
 	FundingRateContinuationDecay            float64       `mapstructure:"funding_rate_continuation_decay"`
 	AllowIntermediateForecastBeforeBoundary *bool         `mapstructure:"allow_intermediate_forecast_before_boundary"`
@@ -98,6 +114,42 @@ type StrategyScanConfig struct {
 	RotationBatchSize     int           `mapstructure:"rotation_batch_size"`
 	RotationInterval      time.Duration `mapstructure:"rotation_interval"`
 	DeepScanHoldDuration  time.Duration `mapstructure:"deep_scan_hold_duration"`
+}
+
+type StrategySameExchangeExitConfig struct {
+	CloseOnNegativeFunding        *bool   `mapstructure:"close_on_negative_funding"`
+	HistoryNegativeRatioThreshold float64 `mapstructure:"history_negative_ratio_threshold"`
+	RequirePositiveClosePNL       *bool   `mapstructure:"require_positive_close_pnl"`
+	MinClosePNL                   float64 `mapstructure:"min_close_pnl"`
+}
+
+type StrategySameExchangeEntryConfig struct {
+	RequireLongHoldEligible   *bool   `mapstructure:"require_long_hold_eligible"`
+	MinHistorySampleCount     int     `mapstructure:"min_history_sample_count"`
+	MinHistoricalSupportRatio float64 `mapstructure:"min_historical_support_ratio"`
+	MinAnnualizedNetRate      float64 `mapstructure:"min_annualized_net_rate"`
+	BasisLongHoldWindowHours  float64 `mapstructure:"basis_long_hold_window_hours"`
+	MaxBasisPaybackEvents     float64 `mapstructure:"max_basis_payback_events"`
+}
+
+type StrategySameExchangeRiskConfig struct {
+	MaxPerpLeverage              float64 `mapstructure:"max_perp_leverage"`
+	MinLiqDistanceRatio          float64 `mapstructure:"min_liq_distance_ratio"`
+	WarnLiqDistanceRatio         float64 `mapstructure:"warn_liq_distance_ratio"`
+	ReduceLiqDistanceRatio       float64 `mapstructure:"reduce_liq_distance_ratio"`
+	EmergencyLiqDistanceRatio    float64 `mapstructure:"emergency_liq_distance_ratio"`
+	Max1hPriceShockRatio         float64 `mapstructure:"max_1h_price_shock_ratio"`
+	FundingExtremePercentile     float64 `mapstructure:"funding_extreme_percentile"`
+	ExtremeFundingNegativeRatio  float64 `mapstructure:"extreme_funding_negative_ratio"`
+	ExtremeFundingSizeMultiplier float64 `mapstructure:"extreme_funding_size_multiplier"`
+	ExtremeBasisPaybackEvents    float64 `mapstructure:"extreme_basis_payback_events"`
+	ExtremeBasisSizeMultiplier   float64 `mapstructure:"extreme_basis_size_multiplier"`
+}
+
+type StrategySameExchangeConfig struct {
+	Entry StrategySameExchangeEntryConfig `mapstructure:"entry"`
+	Exit  StrategySameExchangeExitConfig  `mapstructure:"exit"`
+	Risk  StrategySameExchangeRiskConfig  `mapstructure:"risk"`
 }
 
 type StrategyRollingReviewConfig struct {
@@ -127,6 +179,21 @@ type StrategyRollingConfig struct {
 	Flip                                    StrategyRollingFlipConfig   `mapstructure:"flip"`
 }
 
+type ExecutionPositionMonitorConfig struct {
+	ForceCloseOnSingleLeg    *bool   `mapstructure:"force_close_on_single_leg"`
+	ForceCloseOnSideMismatch *bool   `mapstructure:"force_close_on_side_mismatch"`
+	ForceCloseOnSizeMismatch *bool   `mapstructure:"force_close_on_size_mismatch"`
+	MaxQtyDeviationRatio     float64 `mapstructure:"max_qty_deviation_ratio"`
+}
+
+type ExecutionReplacementConfig struct {
+	Enabled               *bool   `mapstructure:"enabled"`
+	OnlyWhenConstrained   *bool   `mapstructure:"only_when_constrained"`
+	RequireNetImprovement *bool   `mapstructure:"require_net_improvement"`
+	MinNetImprovementPNL  float64 `mapstructure:"min_net_improvement_pnl"`
+	ExtraSafetyBufferUSDT float64 `mapstructure:"extra_safety_buffer_usdt"`
+}
+
 type ExecutionConfig struct {
 	Enabled   bool `mapstructure:"enabled"`
 	AutoEntry bool `mapstructure:"auto_entry"`
@@ -139,24 +206,26 @@ type ExecutionConfig struct {
 	//
 	// 对 funding 套利来说，这个值通常应该比较短；
 	// 若配得太长，会把原本不属于收益模型的额外市场暴露带进来。
-	CloseGracePeriod                  time.Duration `mapstructure:"close_grace_period"`
-	LoopInterval                      time.Duration `mapstructure:"loop_interval"`
-	MaxLatestPlans                    int           `mapstructure:"max_latest_plans"`
-	AutoAllocateCapital               bool          `mapstructure:"auto_allocate_capital"`
-	MaxLivePlans                      int           `mapstructure:"max_live_plans"`
-	MaxAutoOpenPerLoop                int           `mapstructure:"max_auto_open_per_loop"`
-	MaxSingleSymbolExposureUSDT       float64       `mapstructure:"max_single_symbol_exposure_usdt"`
-	MaxSingleExchangeExposureUSDT     float64       `mapstructure:"max_single_exchange_exposure_usdt"`
-	MinAccountEquityUSDT              float64       `mapstructure:"min_account_equity_usdt"`
-	MinAvailableBalanceRatio          float64       `mapstructure:"min_available_balance_ratio"`
-	MaxUnrealizedLossUSDT             float64       `mapstructure:"max_unrealized_loss_usdt"`
-	MaxUnwindBasisBps                 float64       `mapstructure:"max_unwind_basis_bps"`
-	EmergencyMinAvailableBalanceRatio float64       `mapstructure:"emergency_min_available_balance_ratio"`
-	PrimaryLegTimeout                 time.Duration `mapstructure:"primary_leg_timeout"`
-	APIFailureThreshold               int           `mapstructure:"api_failure_threshold"`
-	APIFailureCooldown                time.Duration `mapstructure:"api_failure_cooldown"`
-	OrderStatusPollAttempts           int           `mapstructure:"order_status_poll_attempts"`
-	OrderStatusPollInterval           time.Duration `mapstructure:"order_status_poll_interval"`
+	CloseGracePeriod                  time.Duration                  `mapstructure:"close_grace_period"`
+	LoopInterval                      time.Duration                  `mapstructure:"loop_interval"`
+	MaxLatestPlans                    int                            `mapstructure:"max_latest_plans"`
+	AutoAllocateCapital               bool                           `mapstructure:"auto_allocate_capital"`
+	MaxLivePlans                      int                            `mapstructure:"max_live_plans"`
+	MaxAutoOpenPerLoop                int                            `mapstructure:"max_auto_open_per_loop"`
+	MaxSingleSymbolExposureUSDT       float64                        `mapstructure:"max_single_symbol_exposure_usdt"`
+	MaxSingleExchangeExposureUSDT     float64                        `mapstructure:"max_single_exchange_exposure_usdt"`
+	MinAccountEquityUSDT              float64                        `mapstructure:"min_account_equity_usdt"`
+	MinAvailableBalanceRatio          float64                        `mapstructure:"min_available_balance_ratio"`
+	MaxUnrealizedLossUSDT             float64                        `mapstructure:"max_unrealized_loss_usdt"`
+	MaxUnwindBasisBps                 float64                        `mapstructure:"max_unwind_basis_bps"`
+	EmergencyMinAvailableBalanceRatio float64                        `mapstructure:"emergency_min_available_balance_ratio"`
+	PrimaryLegTimeout                 time.Duration                  `mapstructure:"primary_leg_timeout"`
+	APIFailureThreshold               int                            `mapstructure:"api_failure_threshold"`
+	APIFailureCooldown                time.Duration                  `mapstructure:"api_failure_cooldown"`
+	OrderStatusPollAttempts           int                            `mapstructure:"order_status_poll_attempts"`
+	OrderStatusPollInterval           time.Duration                  `mapstructure:"order_status_poll_interval"`
+	PositionMonitor                   ExecutionPositionMonitorConfig `mapstructure:"position_monitor"`
+	Replacement                       ExecutionReplacementConfig     `mapstructure:"replacement"`
 }
 
 type Config struct {
@@ -166,6 +235,7 @@ type Config struct {
 	// 当前代码仍主要运行 legacy_projection；
 	// rolling_cycle_aligned 先作为配置与设计层的正式入口，后续策略实现会接管它。
 	StrategyMode  string                      `mapstructure:"mode"`
+	ArbitrageMode string                      `mapstructure:"arbitrage_mode"`
 	Universe      StrategyUniverseConfig      `mapstructure:"universe"`
 	Capital       StrategyCapitalConfig       `mapstructure:"capital"`
 	Opportunity   StrategyOpportunityConfig   `mapstructure:"opportunity"`
@@ -174,6 +244,7 @@ type Config struct {
 	SpreadGuard   StrategySpreadGuardConfig   `mapstructure:"spread_guard"`
 	Prediction    StrategyPredictionConfig    `mapstructure:"prediction"`
 	Scan          StrategyScanConfig          `mapstructure:"scan"`
+	SameExchange  StrategySameExchangeConfig  `mapstructure:"same_exchange"`
 	Rolling       StrategyRollingConfig       `mapstructure:"rolling"`
 	// AllowedSymbols 是“硬白名单”。为空时表示先不过滤，允许所有 canonical symbol 进入基础池。
 	AllowedSymbols []string `mapstructure:"allowed_symbols"`
@@ -187,6 +258,7 @@ type Config struct {
 	// - best_net: 在这段时间里选净收益最高的窗口；
 	// - latest_profitable: 在这段时间里尽量选更晚、但仍然过收益门槛的窗口。
 	// - strict_target: 直接锚定 hold_hours 内最后一个真实结算窗口，不再回退。
+	// - dynamic_profit: 候选窗口不再受 hold_hours 截断，而是按收益自动搜索更优兑现点。
 	HoldHours float64 `mapstructure:"hold_hours"`
 	// HoldSelectionMode 控制“在 hold_hours 对应的候选 funding 窗口里，主计划到底选哪一个”。
 	//
@@ -196,6 +268,8 @@ type Config struct {
 	// 3. 计划性自动平仓的 TargetCloseTimeMs。
 	//
 	// 也就是说，收益怎么估，就应该按同一个窗口去持有。
+	//
+	// 注意：dynamic_profit 会显式跳过 hold_hours 对 legacy 候选窗口的截断。
 	HoldSelectionMode              string        `mapstructure:"hold_selection_mode"`
 	AssumedNotional                float64       `mapstructure:"assumed_notional"`
 	TotalCapitalUSDT               float64       `mapstructure:"total_capital_usdt"`
@@ -221,6 +295,8 @@ type Config struct {
 	BookSnapshotMinQtyChangeRatio  float64       `mapstructure:"book_snapshot_min_qty_change_ratio"`
 	OpportunityCalcInterval        time.Duration `mapstructure:"opportunity_calc_interval"`
 	FundingHistoryLookback         time.Duration `mapstructure:"funding_history_lookback"`
+	FundingRateHistoryLookback     time.Duration `mapstructure:"funding_rate_history_lookback"`
+	FundingRateHistorySyncInterval time.Duration `mapstructure:"funding_rate_history_sync_interval"`
 	FundingSmoothingCurrentWeight  float64       `mapstructure:"funding_smoothing_current_weight"`
 	// FundingRateContinuationDecay 控制“在同一持仓窗口内，对同一腿未来第2次及以后 funding 事件”的费率衰减。
 	//
@@ -259,26 +335,57 @@ type Config struct {
 	// 其中与 forecast 相关的开关目前主要保留兼容语义：
 	// rolling 结构仍保留 review / continue / flip，但机会识别已经切成 real-only，
 	// 不再把 boundary 之前的预测段直接算进当前开仓收益。
-	RollingEntryPathRequireConsistentDirection     bool          `mapstructure:"-"`
-	RollingMaxSingleExchangeForecastSegments       int           `mapstructure:"-"`
-	RollingAllowIntermediateForecastBeforeBoundary bool          `mapstructure:"-"`
-	RollingForbidBoundaryForecast                  bool          `mapstructure:"-"`
-	RollingReviewSettleGracePeriod                 time.Duration `mapstructure:"-"`
-	RollingReviewFreshSnapshotMaxWait              time.Duration `mapstructure:"-"`
-	RollingReviewCloseOnSnapshotTimeout            bool          `mapstructure:"-"`
-	RollingReviewContinueOnSameDirection           bool          `mapstructure:"-"`
-	RollingReviewCloseOnUnprofitable               bool          `mapstructure:"-"`
-	RollingReviewRequireIncrementalNetPositive     bool          `mapstructure:"-"`
-	RollingReviewMinIncrementalNetPNL              float64       `mapstructure:"-"`
-	RollingFlipEnabled                             bool          `mapstructure:"-"`
-	RollingFlipRequireNetPositive                  bool          `mapstructure:"-"`
-	RollingFlipMinNetPNL                           float64       `mapstructure:"-"`
-	RollingFlipSlippageMultiplier                  float64       `mapstructure:"-"`
-	RollingFlipExtraSafetyBufferUSDT               float64       `mapstructure:"-"`
+	RollingEntryPathRequireConsistentDirection       bool          `mapstructure:"-"`
+	RollingMaxSingleExchangeForecastSegments         int           `mapstructure:"-"`
+	RollingAllowIntermediateForecastBeforeBoundary   bool          `mapstructure:"-"`
+	RollingForbidBoundaryForecast                    bool          `mapstructure:"-"`
+	RollingReviewSettleGracePeriod                   time.Duration `mapstructure:"-"`
+	RollingReviewFreshSnapshotMaxWait                time.Duration `mapstructure:"-"`
+	RollingReviewCloseOnSnapshotTimeout              bool          `mapstructure:"-"`
+	RollingReviewContinueOnSameDirection             bool          `mapstructure:"-"`
+	RollingReviewCloseOnUnprofitable                 bool          `mapstructure:"-"`
+	RollingReviewRequireIncrementalNetPositive       bool          `mapstructure:"-"`
+	RollingReviewMinIncrementalNetPNL                float64       `mapstructure:"-"`
+	RollingFlipEnabled                               bool          `mapstructure:"-"`
+	RollingFlipRequireNetPositive                    bool          `mapstructure:"-"`
+	RollingFlipMinNetPNL                             float64       `mapstructure:"-"`
+	RollingFlipSlippageMultiplier                    float64       `mapstructure:"-"`
+	RollingFlipExtraSafetyBufferUSDT                 float64       `mapstructure:"-"`
+	ExecutionPositionMonitorForceCloseOnSingleLeg    bool          `mapstructure:"-"`
+	ExecutionPositionMonitorForceCloseOnSideMismatch bool          `mapstructure:"-"`
+	ExecutionPositionMonitorForceCloseOnSizeMismatch bool          `mapstructure:"-"`
+	ExecutionPositionMonitorMaxQtyDeviationRatio     float64       `mapstructure:"-"`
+	ExecutionReplacementEnabled                      bool          `mapstructure:"-"`
+	ExecutionReplacementOnlyWhenConstrained          bool          `mapstructure:"-"`
+	ExecutionReplacementRequireNetImprovement        bool          `mapstructure:"-"`
+	ExecutionReplacementMinNetImprovementPNL         float64       `mapstructure:"-"`
+	ExecutionReplacementExtraSafetyBufferUSDT        float64       `mapstructure:"-"`
+	SameExchangeRequireLongHoldEligible              bool          `mapstructure:"-"`
+	SameExchangeMinHistorySampleCount                int           `mapstructure:"-"`
+	SameExchangeMinHistoricalSupportRatio            float64       `mapstructure:"-"`
+	SameExchangeMinAnnualizedNetRate                 float64       `mapstructure:"-"`
+	SameExchangeBasisLongHoldWindowHours             float64       `mapstructure:"-"`
+	SameExchangeMaxBasisPaybackEvents                float64       `mapstructure:"-"`
+	SameExchangeCloseOnNegativeFunding               bool          `mapstructure:"-"`
+	SameExchangeHistoryNegativeExitThreshold         float64       `mapstructure:"-"`
+	SameExchangeExitRequirePositiveClosePNL          bool          `mapstructure:"-"`
+	SameExchangeExitMinClosePNL                      float64       `mapstructure:"-"`
+	SameExchangeMaxPerpLeverage                      float64       `mapstructure:"-"`
+	SameExchangeMinLiqDistanceRatio                  float64       `mapstructure:"-"`
+	SameExchangeWarnLiqDistanceRatio                 float64       `mapstructure:"-"`
+	SameExchangeReduceLiqDistanceRatio               float64       `mapstructure:"-"`
+	SameExchangeEmergencyLiqDistanceRatio            float64       `mapstructure:"-"`
+	SameExchangeMax1hPriceShockRatio                 float64       `mapstructure:"-"`
+	SameExchangeFundingExtremePercentile             float64       `mapstructure:"-"`
+	SameExchangeExtremeFundingNegativeRatio          float64       `mapstructure:"-"`
+	SameExchangeExtremeFundingSizeMultiplier         float64       `mapstructure:"-"`
+	SameExchangeExtremeBasisPaybackEvents            float64       `mapstructure:"-"`
+	SameExchangeExtremeBasisSizeMultiplier           float64       `mapstructure:"-"`
 }
 
 func (c Config) normalize() Config {
 	c.StrategyMode = normalizeStrategyMode(c.StrategyMode, StrategyModeLegacyProjection)
+	c.ArbitrageMode = normalizeArbitrageMode(c.ArbitrageMode, ArbitrageModeCrossExchange)
 	if len(c.AllowedSymbols) == 0 && len(c.Universe.AllowedSymbols) > 0 {
 		c.AllowedSymbols = append([]string(nil), c.Universe.AllowedSymbols...)
 	}
@@ -393,6 +500,12 @@ func (c Config) normalize() Config {
 	if c.FundingHistoryLookback <= 0 {
 		c.FundingHistoryLookback = c.Prediction.FundingHistoryLookback
 	}
+	if c.FundingRateHistoryLookback <= 0 {
+		c.FundingRateHistoryLookback = c.Prediction.FundingRateHistoryLookback
+	}
+	if c.FundingRateHistorySyncInterval <= 0 {
+		c.FundingRateHistorySyncInterval = c.Prediction.FundingRateHistorySyncInterval
+	}
 	if c.FundingSmoothingCurrentWeight < 0 || c.FundingSmoothingCurrentWeight > 1 {
 		c.FundingSmoothingCurrentWeight = c.Prediction.FundingSmoothingCurrentWeight
 	}
@@ -439,6 +552,12 @@ func (c Config) normalize() Config {
 	}
 	if c.FundingHistoryLookback <= 0 {
 		c.FundingHistoryLookback = 6 * time.Hour
+	}
+	if c.FundingRateHistoryLookback <= 0 {
+		c.FundingRateHistoryLookback = 30 * 24 * time.Hour
+	}
+	if c.FundingRateHistorySyncInterval <= 0 {
+		c.FundingRateHistorySyncInterval = 30 * time.Minute
 	}
 	if c.FundingSmoothingCurrentWeight < 0 || c.FundingSmoothingCurrentWeight > 1 {
 		c.FundingSmoothingCurrentWeight = 0.7
@@ -528,6 +647,134 @@ func (c Config) normalize() Config {
 	if c.Execution.OrderStatusPollInterval <= 0 {
 		c.Execution.OrderStatusPollInterval = 1500 * time.Millisecond
 	}
+	c.ExecutionPositionMonitorForceCloseOnSingleLeg = boolOrDefault(c.Execution.PositionMonitor.ForceCloseOnSingleLeg, true)
+	c.ExecutionPositionMonitorForceCloseOnSideMismatch = boolOrDefault(c.Execution.PositionMonitor.ForceCloseOnSideMismatch, true)
+	c.ExecutionPositionMonitorForceCloseOnSizeMismatch = boolOrDefault(c.Execution.PositionMonitor.ForceCloseOnSizeMismatch, true)
+	c.ExecutionPositionMonitorMaxQtyDeviationRatio = c.Execution.PositionMonitor.MaxQtyDeviationRatio
+	if c.ExecutionPositionMonitorMaxQtyDeviationRatio <= 0 || c.ExecutionPositionMonitorMaxQtyDeviationRatio > 1 {
+		c.ExecutionPositionMonitorMaxQtyDeviationRatio = 0.15
+	}
+	c.ExecutionReplacementEnabled = boolOrDefault(c.Execution.Replacement.Enabled, false)
+	c.ExecutionReplacementOnlyWhenConstrained = boolOrDefault(c.Execution.Replacement.OnlyWhenConstrained, true)
+	c.ExecutionReplacementRequireNetImprovement = boolOrDefault(c.Execution.Replacement.RequireNetImprovement, true)
+	c.ExecutionReplacementMinNetImprovementPNL = c.Execution.Replacement.MinNetImprovementPNL
+	if c.ExecutionReplacementMinNetImprovementPNL < 0 {
+		c.ExecutionReplacementMinNetImprovementPNL = 0
+	}
+	c.ExecutionReplacementExtraSafetyBufferUSDT = c.Execution.Replacement.ExtraSafetyBufferUSDT
+	if c.ExecutionReplacementExtraSafetyBufferUSDT < 0 {
+		c.ExecutionReplacementExtraSafetyBufferUSDT = 0
+	}
+	if c.ExecutionReplacementExtraSafetyBufferUSDT == 0 {
+		c.ExecutionReplacementExtraSafetyBufferUSDT = c.SafetyBufferUSDT
+	}
+	c.SameExchangeRequireLongHoldEligible = boolOrDefault(c.SameExchange.Entry.RequireLongHoldEligible, false)
+	c.SameExchangeMinHistorySampleCount = c.SameExchange.Entry.MinHistorySampleCount
+	if c.SameExchangeMinHistorySampleCount < 0 {
+		c.SameExchangeMinHistorySampleCount = 0
+	}
+	if c.SameExchangeMinHistorySampleCount == 0 {
+		c.SameExchangeMinHistorySampleCount = 10
+	}
+	c.SameExchangeMinHistoricalSupportRatio = c.SameExchange.Entry.MinHistoricalSupportRatio
+	if c.SameExchangeMinHistoricalSupportRatio < 0 || c.SameExchangeMinHistoricalSupportRatio > 1 {
+		c.SameExchangeMinHistoricalSupportRatio = 0.55
+	}
+	c.SameExchangeMinAnnualizedNetRate = c.SameExchange.Entry.MinAnnualizedNetRate
+	if c.SameExchangeMinAnnualizedNetRate < 0 {
+		c.SameExchangeMinAnnualizedNetRate = 0
+	}
+	if c.SameExchangeMinAnnualizedNetRate == 0 {
+		c.SameExchangeMinAnnualizedNetRate = 0.15
+	}
+	c.SameExchangeBasisLongHoldWindowHours = c.SameExchange.Entry.BasisLongHoldWindowHours
+	if c.SameExchangeBasisLongHoldWindowHours < 0 {
+		c.SameExchangeBasisLongHoldWindowHours = 0
+	}
+	if c.SameExchangeBasisLongHoldWindowHours == 0 {
+		c.SameExchangeBasisLongHoldWindowHours = 12
+	}
+	c.SameExchangeMaxBasisPaybackEvents = c.SameExchange.Entry.MaxBasisPaybackEvents
+	if c.SameExchangeMaxBasisPaybackEvents <= 0 {
+		c.SameExchangeMaxBasisPaybackEvents = 4
+	}
+	c.SameExchangeCloseOnNegativeFunding = boolOrDefault(c.SameExchange.Exit.CloseOnNegativeFunding, true)
+	c.SameExchangeHistoryNegativeExitThreshold = c.SameExchange.Exit.HistoryNegativeRatioThreshold
+	if c.SameExchangeHistoryNegativeExitThreshold < 0 || c.SameExchangeHistoryNegativeExitThreshold > 1 {
+		c.SameExchangeHistoryNegativeExitThreshold = 0.5
+	}
+	c.SameExchangeExitRequirePositiveClosePNL = boolOrDefault(c.SameExchange.Exit.RequirePositiveClosePNL, true)
+	c.SameExchangeExitMinClosePNL = c.SameExchange.Exit.MinClosePNL
+	if c.SameExchangeExitMinClosePNL < 0 {
+		c.SameExchangeExitMinClosePNL = 0
+	}
+	c.SameExchangeMaxPerpLeverage = c.SameExchange.Risk.MaxPerpLeverage
+	if c.SameExchangeMaxPerpLeverage < 0 {
+		c.SameExchangeMaxPerpLeverage = 0
+	}
+	if c.SameExchangeMaxPerpLeverage > 0 && c.SameExchangeMaxPerpLeverage < 1 {
+		c.SameExchangeMaxPerpLeverage = 1
+	}
+	c.SameExchangeMinLiqDistanceRatio = c.SameExchange.Risk.MinLiqDistanceRatio
+	if c.SameExchangeMinLiqDistanceRatio < 0 || c.SameExchangeMinLiqDistanceRatio > 1 {
+		c.SameExchangeMinLiqDistanceRatio = 0
+	}
+	c.SameExchangeWarnLiqDistanceRatio = c.SameExchange.Risk.WarnLiqDistanceRatio
+	if c.SameExchangeWarnLiqDistanceRatio < 0 || c.SameExchangeWarnLiqDistanceRatio > 1 {
+		c.SameExchangeWarnLiqDistanceRatio = 0.20
+	}
+	c.SameExchangeReduceLiqDistanceRatio = c.SameExchange.Risk.ReduceLiqDistanceRatio
+	if c.SameExchangeReduceLiqDistanceRatio < 0 || c.SameExchangeReduceLiqDistanceRatio > 1 {
+		c.SameExchangeReduceLiqDistanceRatio = 0.10
+	}
+	c.SameExchangeEmergencyLiqDistanceRatio = c.SameExchange.Risk.EmergencyLiqDistanceRatio
+	if c.SameExchangeEmergencyLiqDistanceRatio < 0 || c.SameExchangeEmergencyLiqDistanceRatio > 1 {
+		c.SameExchangeEmergencyLiqDistanceRatio = 0.08
+	}
+	c.SameExchangeMax1hPriceShockRatio = c.SameExchange.Risk.Max1hPriceShockRatio
+	if c.SameExchangeMax1hPriceShockRatio <= 0 || c.SameExchangeMax1hPriceShockRatio > 1 {
+		c.SameExchangeMax1hPriceShockRatio = 0.08
+	}
+	if c.SameExchangeWarnLiqDistanceRatio > 0 && c.SameExchangeReduceLiqDistanceRatio > c.SameExchangeWarnLiqDistanceRatio {
+		c.SameExchangeReduceLiqDistanceRatio = c.SameExchangeWarnLiqDistanceRatio
+	}
+	if c.SameExchangeReduceLiqDistanceRatio > 0 && c.SameExchangeEmergencyLiqDistanceRatio > c.SameExchangeReduceLiqDistanceRatio {
+		c.SameExchangeEmergencyLiqDistanceRatio = c.SameExchangeReduceLiqDistanceRatio
+	}
+	if c.SameExchangeMinLiqDistanceRatio > 0 {
+		if c.SameExchangeWarnLiqDistanceRatio < c.SameExchangeMinLiqDistanceRatio {
+			c.SameExchangeWarnLiqDistanceRatio = c.SameExchangeMinLiqDistanceRatio
+		}
+		if c.SameExchangeReduceLiqDistanceRatio < c.SameExchangeMinLiqDistanceRatio {
+			c.SameExchangeReduceLiqDistanceRatio = c.SameExchangeMinLiqDistanceRatio
+		}
+		if c.SameExchangeEmergencyLiqDistanceRatio < c.SameExchangeMinLiqDistanceRatio {
+			c.SameExchangeEmergencyLiqDistanceRatio = c.SameExchangeMinLiqDistanceRatio
+		}
+	}
+	c.SameExchangeFundingExtremePercentile = c.SameExchange.Risk.FundingExtremePercentile
+	if c.SameExchangeFundingExtremePercentile < 0 || c.SameExchangeFundingExtremePercentile > 1 {
+		c.SameExchangeFundingExtremePercentile = 0.95
+	}
+	c.SameExchangeExtremeFundingNegativeRatio = c.SameExchange.Risk.ExtremeFundingNegativeRatio
+	if c.SameExchangeExtremeFundingNegativeRatio < 0 || c.SameExchangeExtremeFundingNegativeRatio > 1 {
+		c.SameExchangeExtremeFundingNegativeRatio = 0.50
+	}
+	c.SameExchangeExtremeFundingSizeMultiplier = c.SameExchange.Risk.ExtremeFundingSizeMultiplier
+	if c.SameExchangeExtremeFundingSizeMultiplier <= 0 || c.SameExchangeExtremeFundingSizeMultiplier > 1 {
+		c.SameExchangeExtremeFundingSizeMultiplier = 0.50
+	}
+	c.SameExchangeExtremeBasisPaybackEvents = c.SameExchange.Risk.ExtremeBasisPaybackEvents
+	if c.SameExchangeExtremeBasisPaybackEvents <= 0 {
+		c.SameExchangeExtremeBasisPaybackEvents = 2.5
+	}
+	if c.SameExchangeExtremeBasisPaybackEvents > c.SameExchangeMaxBasisPaybackEvents {
+		c.SameExchangeExtremeBasisPaybackEvents = c.SameExchangeMaxBasisPaybackEvents
+	}
+	c.SameExchangeExtremeBasisSizeMultiplier = c.SameExchange.Risk.ExtremeBasisSizeMultiplier
+	if c.SameExchangeExtremeBasisSizeMultiplier <= 0 || c.SameExchangeExtremeBasisSizeMultiplier > 1 {
+		c.SameExchangeExtremeBasisSizeMultiplier = 0.65
+	}
 
 	c.RollingEntryPathRequireConsistentDirection = boolOrDefault(c.Rolling.EntryPathRequireConsistentDirection, true)
 	c.RollingMaxSingleExchangeForecastSegments = c.Rolling.MaxSingleExchangeForecastSegments
@@ -576,6 +823,13 @@ func (c Config) normalize() Config {
 }
 
 func (c Config) EffectiveNotional() float64 {
+	if normalizeArbitrageMode(c.ArbitrageMode, ArbitrageModeCrossExchange) == ArbitrageModeSameExchangeSpotPerp {
+		notional := c.TotalCapitalUSDT * c.CapitalUtilization
+		if notional > 0 {
+			return notional
+		}
+		return c.AssumedNotional
+	}
 	notional := c.TotalCapitalUSDT * c.CapitalUtilization * c.Leverage
 	if notional > 0 {
 		return notional
@@ -606,7 +860,21 @@ func normalizeStrategyMode(mode, fallback string) string {
 func normalizeHoldSelectionMode(mode, fallback string) string {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
-	case HoldSelectionModeBestNet, HoldSelectionModeLatestProfitable, HoldSelectionModeStrictTarget:
+	case HoldSelectionModeBestNet, HoldSelectionModeLatestProfitable, HoldSelectionModeStrictTarget, HoldSelectionModeDynamicProfit:
+		return mode
+	default:
+		return fallback
+	}
+}
+
+func usesDynamicProfitHoldSelection(mode string) bool {
+	return normalizeHoldSelectionMode(mode, "") == HoldSelectionModeDynamicProfit
+}
+
+func normalizeArbitrageMode(mode, fallback string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case ArbitrageModeCrossExchange, ArbitrageModeSameExchangeSpotPerp:
 		return mode
 	default:
 		return fallback

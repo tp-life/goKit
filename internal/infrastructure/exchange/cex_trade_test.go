@@ -100,6 +100,7 @@ func TestAsterLegacyHMACTradeUsesLegacyAccountAndPositionEndpoints(t *testing.T)
 				"positionAmt":"0.02",
 				"entryPrice":"60100",
 				"markPrice":"60050",
+				"liquidationPrice":"55000",
 				"unRealizedProfit":"1.25"
 			}]`)
 		case "/fapi/v4/account":
@@ -129,7 +130,7 @@ func TestAsterLegacyHMACTradeUsesLegacyAccountAndPositionEndpoints(t *testing.T)
 	if err != nil {
 		t.Fatalf("GetPosition error = %v", err)
 	}
-	if position.Quantity != 0.02 || position.EntryPrice != 60100 || position.MarkPrice != 60050 {
+	if position.Quantity != 0.02 || position.EntryPrice != 60100 || position.MarkPrice != 60050 || position.LiquidationPrice != 55000 {
 		t.Fatalf("unexpected position %#v", position)
 	}
 	account, err := client.GetAccountSnapshot(context.Background())
@@ -380,6 +381,77 @@ func TestBinanceLikeTradePlaceOrder_503ReturnsUnknownExecutionOutcome(t *testing
 	}
 	if unknownErr.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected status 503, got %#v", unknownErr)
+	}
+}
+
+func TestBinanceTradePlaceProtectiveStop_UsesStopMarketParams(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "binance-key")
+	t.Setenv("BINANCE_API_SECRET", "binance-secret")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-MBX-APIKEY"); got != "binance-key" {
+			t.Fatalf("unexpected api key header %q", got)
+		}
+		assertLegacyAsterSignature(t, r, "binance-secret")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fapi/v3/positionRisk":
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/fapi/v1/order":
+			values := r.URL.Query()
+			if got := values.Get("type"); got != "STOP_MARKET" {
+				t.Fatalf("expected STOP_MARKET type, got %q", got)
+			}
+			if got := values.Get("stopPrice"); got != "108.5" {
+				t.Fatalf("expected stopPrice 108.5, got %q", got)
+			}
+			if got := values.Get("workingType"); got != "MARK_PRICE" {
+				t.Fatalf("expected workingType MARK_PRICE, got %q", got)
+			}
+			if got := values.Get("priceProtect"); got != "TRUE" {
+				t.Fatalf("expected priceProtect TRUE, got %q", got)
+			}
+			if got := values.Get("reduceOnly"); got != "true" {
+				t.Fatalf("expected reduceOnly true, got %q", got)
+			}
+			_, _ = io.WriteString(w, `{
+				"orderId":"protect-1",
+				"clientOrderId":"protect-cli",
+				"status":"NEW"
+			}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewBinanceTradeClient(ConfigSet{
+		Binance: ExchangeConfig{
+			Enabled:     true,
+			RestBaseURL: server.URL,
+			Auth: AuthConfig{
+				APIKeyEnv:    "BINANCE_API_KEY",
+				APISecretEnv: "BINANCE_API_SECRET",
+			},
+		},
+	}, logger).(*CEXTradeClient)
+
+	result, err := client.PlaceProtectiveStop(context.Background(), TradeOrderRequest{
+		CanonicalSymbol: "BTC",
+		VenueSymbol:     "BTCUSDT",
+		Side:            "BUY",
+		Quantity:        1,
+		StopPrice:       108.5,
+		ClientOrderID:   "protect-cli",
+	})
+	if err != nil {
+		t.Fatalf("PlaceProtectiveStop error = %v", err)
+	}
+	if result.VenueOrderID != "protect-1" || result.ClientOrderID != "protect-cli" || result.Status != "NEW" {
+		t.Fatalf("unexpected protective stop result %#v", result)
 	}
 }
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"goKit/internal/domain/entity"
@@ -9,14 +10,16 @@ import (
 )
 
 type OpportunityQueryService struct {
-	repo repository.OpportunityRepository
-	cfg  Config
+	repo       repository.OpportunityRepository
+	marketRepo repository.MarketDataRepository
+	cfg        Config
 }
 
-func NewOpportunityQueryService(repo repository.OpportunityRepository, cfg Config) *OpportunityQueryService {
+func NewOpportunityQueryService(repo repository.OpportunityRepository, marketRepo repository.MarketDataRepository, cfg Config) *OpportunityQueryService {
 	return &OpportunityQueryService{
-		repo: repo,
-		cfg:  cfg.normalize(),
+		repo:       repo,
+		marketRepo: marketRepo,
+		cfg:        cfg.normalize(),
 	}
 }
 
@@ -57,7 +60,62 @@ func (s *OpportunityQueryService) ListLatestSummary(ctx context.Context, limit i
 }
 
 func (s *OpportunityQueryService) GetByID(ctx context.Context, id uint) (*entity.Opportunity, error) {
-	return s.repo.FindByID(ctx, id)
+	item, err := s.repo.FindByID(ctx, id)
+	if err != nil || item == nil {
+		return item, err
+	}
+	s.enrichFundingRuleHistory(ctx, item)
+	return item, nil
+}
+
+const opportunityFundingHistorySeriesLimit = 12
+
+func (s *OpportunityQueryService) enrichFundingRuleHistory(ctx context.Context, item *entity.Opportunity) {
+	if item == nil || s.marketRepo == nil {
+		return
+	}
+	item.LongFundingRule = s.loadFundingRuleHistory(ctx, item.Symbol, item.LongFundingRule)
+	item.ShortFundingRule = s.loadFundingRuleHistory(ctx, item.Symbol, item.ShortFundingRule)
+}
+
+func (s *OpportunityQueryService) loadFundingRuleHistory(ctx context.Context, symbol string, rule entity.OpportunityFundingRule) entity.OpportunityFundingRule {
+	if strings.TrimSpace(symbol) == "" || strings.TrimSpace(rule.Exchange) == "" || isSpotFundingRule(rule) {
+		return rule
+	}
+
+	lookback := s.cfg.FundingRateHistoryLookback
+	if lookback > 0 {
+		history, err := s.marketRepo.RecentFundingRateHistory(ctx, rule.Exchange, symbol, time.Now().UTC().Add(-lookback), opportunityFundingHistorySeriesLimit)
+		if err == nil && len(history) > 0 {
+			rule.HistorySeries = make([]entity.OpportunityFundingHistoryPoint, 0, len(history))
+			for _, row := range history {
+				rule.HistorySeries = append(rule.HistorySeries, entity.OpportunityFundingHistoryPoint{
+					FundingTimeMs: row.FundingTimeMs,
+					FundingRate:   row.FundingRate,
+					MarkPrice:     row.MarkPrice,
+				})
+			}
+			return rule
+		}
+	}
+
+	snapshotLookback := s.cfg.FundingHistoryLookback
+	if snapshotLookback <= 0 {
+		return rule
+	}
+	snapshots, err := s.marketRepo.RecentFundingSnapshots(ctx, rule.Exchange, symbol, time.Now().UTC().Add(-snapshotLookback), opportunityFundingHistorySeriesLimit)
+	if err != nil || len(snapshots) == 0 {
+		return rule
+	}
+	rule.HistorySeries = make([]entity.OpportunityFundingHistoryPoint, 0, len(snapshots))
+	for _, row := range snapshots {
+		rule.HistorySeries = append(rule.HistorySeries, entity.OpportunityFundingHistoryPoint{
+			FundingTimeMs: row.FundingTimeMs,
+			FundingRate:   row.FundingRate,
+			MarkPrice:     row.MarkPrice,
+		})
+	}
+	return rule
 }
 
 func applyOpportunityLimit[T any](items []T, limit int) []T {

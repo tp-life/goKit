@@ -57,6 +57,11 @@ func DefaultAdapterFactories() []AdapterFactory {
 			BuildTrade:  NewBinanceLikeTradeAdapter,
 		},
 		{
+			Kind:        AdapterKindBinanceSpot,
+			BuildMarket: NewBinanceSpotMarketAdapter,
+			BuildTrade:  NewBinanceSpotTradeAdapter,
+		},
+		{
 			Kind:           AdapterKindBybitV5,
 			BuildMarket:    NewBybitV5MarketAdapter,
 			BuildTrade:     NewBybitV5TradeAdapter,
@@ -163,9 +168,10 @@ func normalizeRegistryExchangeConfig(name string, cfg ExchangeConfig) (ExchangeC
 	cfg = normalizeExchangeConfig(name, cfg)
 	if strings.TrimSpace(cfg.AdapterKind) == "" {
 		return ExchangeConfig{}, fmt.Errorf(
-			"exchange %s must explicitly configure adapter_kind; built-in adapter kinds are %q, %q and %q",
+			"exchange %s must explicitly configure adapter_kind; built-in adapter kinds are %q, %q, %q and %q",
 			name,
 			AdapterKindBinanceLike,
+			AdapterKindBinanceSpot,
 			AdapterKindBybitV5,
 			AdapterKindHyperliquid,
 		)

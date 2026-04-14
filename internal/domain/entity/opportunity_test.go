@@ -20,6 +20,9 @@ func TestOpportunityJSONHooks_RoundTripProjectionDetails(t *testing.T) {
 			Exchange:             "binance",
 			FundingIntervalHours: 1,
 			ClampSource:          "binance_like_adaptive_short_interval_cap",
+			HistorySeries: []OpportunityFundingHistoryPoint{
+				{FundingTimeMs: 111, FundingRate: 0.0012, MarkPrice: 64000},
+			},
 		},
 		FundingSegments: []OpportunityFundingSegment{
 			{
@@ -61,6 +64,12 @@ func TestOpportunityJSONHooks_RoundTripProjectionDetails(t *testing.T) {
 	}
 	if loaded.LongFundingRule.ClampSource != "binance_like_adaptive_short_interval_cap" {
 		t.Fatalf("unexpected clamp source after round-trip: %s", loaded.LongFundingRule.ClampSource)
+	}
+	if len(loaded.LongFundingRule.HistorySeries) != 1 {
+		t.Fatalf("expected 1 funding history point, got %d", len(loaded.LongFundingRule.HistorySeries))
+	}
+	if loaded.LongFundingRule.HistorySeries[0].FundingTimeMs != 111 {
+		t.Fatalf("unexpected history point after round-trip: %#v", loaded.LongFundingRule.HistorySeries[0])
 	}
 	if len(loaded.FundingSegments) != 1 {
 		t.Fatalf("expected 1 funding segment, got %d", len(loaded.FundingSegments))

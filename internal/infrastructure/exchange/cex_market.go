@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -109,6 +110,68 @@ func (c *CEXMarketClient) Enabled() bool          { return c.cfg.Enabled }
 func (c *CEXMarketClient) Fees() FeeConfig        { return c.cfg.Fees }
 func (c *CEXMarketClient) Config() ExchangeConfig { return c.cfg }
 
+func (c *CEXMarketClient) FetchFundingRateHistory(ctx context.Context, symbol entity.Symbol, startTime, endTime time.Time) ([]entity.FundingRateHistory, error) {
+	contractType := strings.ToUpper(strings.TrimSpace(symbol.ContractType))
+	if !c.Enabled() || (contractType != "" && !strings.Contains(contractType, "PERPETUAL")) {
+		return nil, nil
+	}
+	startMs := startTime.UTC().UnixMilli()
+	endMs := endTime.UTC().UnixMilli()
+	if startMs <= 0 || endMs <= 0 || startMs > endMs {
+		return nil, nil
+	}
+
+	const pageSize = 1000
+	endpoint := strings.TrimRight(c.cfg.RestBaseURL, "/") + "/fapi/v1/fundingRate"
+	cursor := startMs
+	out := make([]entity.FundingRateHistory, 0, 128)
+	for cursor <= endMs {
+		params := url.Values{}
+		params.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol.VenueSymbol)))
+		params.Set("startTime", strconv.FormatInt(cursor, 10))
+		params.Set("endTime", strconv.FormatInt(endMs, 10))
+		params.Set("limit", strconv.Itoa(pageSize))
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+params.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var payload []fundingRateHistoryItem
+		if err := readJSONBody(resp, &payload); err != nil {
+			return nil, err
+		}
+		if len(payload) == 0 {
+			break
+		}
+
+		lastFundingTimeMs := int64(0)
+		for _, item := range payload {
+			if item.FundingTime <= 0 {
+				continue
+			}
+			lastFundingTimeMs = item.FundingTime
+			out = append(out, entity.FundingRateHistory{
+				Exchange:      c.name,
+				Symbol:        symbol.Symbol,
+				VenueSymbol:   firstNonEmpty(strings.ToUpper(strings.TrimSpace(item.Symbol)), symbol.VenueSymbol),
+				FundingRate:   mustFloat(item.FundingRate),
+				MarkPrice:     mustFloat(item.MarkPrice),
+				FundingTimeMs: item.FundingTime,
+				Source:        "exchange_api",
+			})
+		}
+		if len(payload) < pageSize || lastFundingTimeMs <= 0 || lastFundingTimeMs >= endMs {
+			break
+		}
+		cursor = lastFundingTimeMs + 1
+	}
+	return out, nil
+}
+
 type exchangeInfoFilter struct {
 	FilterType  string `json:"filterType"`
 	TickSize    string `json:"tickSize"`
@@ -140,6 +203,13 @@ func parseExchangeInfoFloat(raw string) float64 {
 type fundingInfoItem struct {
 	Symbol               string `json:"symbol"`
 	FundingIntervalHours int    `json:"fundingIntervalHours"`
+}
+
+type fundingRateHistoryItem struct {
+	Symbol      string `json:"symbol"`
+	FundingRate string `json:"fundingRate"`
+	FundingTime int64  `json:"fundingTime"`
+	MarkPrice   string `json:"markPrice"`
 }
 
 func (c *CEXMarketClient) FetchTradableSymbols(ctx context.Context, quoteAsset string, allowed map[string]struct{}) ([]entity.Symbol, error) {

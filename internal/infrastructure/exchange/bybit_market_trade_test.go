@@ -519,6 +519,7 @@ func TestBybitV5TradeParsesOrderPositionAndAccountResponses(t *testing.T) {
 							"size":"0.02",
 							"avgPrice":"60100",
 							"markPrice":"60050",
+							"liqPrice":"65000",
 							"unrealisedPnl":"1.25"
 						}
 					]
@@ -572,7 +573,7 @@ func TestBybitV5TradeParsesOrderPositionAndAccountResponses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPosition error = %v", err)
 	}
-	if position.Quantity != -0.02 || position.EntryPrice != 60100 || position.MarkPrice != 60050 {
+	if position.Quantity != -0.02 || position.EntryPrice != 60100 || position.MarkPrice != 60050 || position.LiquidationPrice != 65000 {
 		t.Fatalf("unexpected position %#v", position)
 	}
 

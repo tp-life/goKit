@@ -65,6 +65,7 @@ type bybitPositionItem struct {
 	Size          string `json:"size"`
 	AvgPrice      string `json:"avgPrice"`
 	MarkPrice     string `json:"markPrice"`
+	LiqPrice      string `json:"liqPrice"`
 	UnrealisedPnl string `json:"unrealisedPnl"`
 }
 
@@ -314,13 +315,14 @@ func (c *BybitV5TradeClient) GetPosition(ctx context.Context, canonicalSymbol, v
 			qty = -qty
 		}
 		return Position{
-			Exchange:      c.name,
-			Symbol:        canonicalSymbol,
-			VenueSymbol:   firstNonEmpty(venueSymbol, item.Symbol),
-			Quantity:      qty,
-			EntryPrice:    parseNullableFloat(item.AvgPrice),
-			MarkPrice:     parseNullableFloat(item.MarkPrice),
-			UnrealizedPnL: parseNullableFloat(item.UnrealisedPnl),
+			Exchange:         c.name,
+			Symbol:           canonicalSymbol,
+			VenueSymbol:      firstNonEmpty(venueSymbol, item.Symbol),
+			Quantity:         qty,
+			EntryPrice:       parseNullableFloat(item.AvgPrice),
+			MarkPrice:        parseNullableFloat(item.MarkPrice),
+			LiquidationPrice: parseNullableFloat(item.LiqPrice),
+			UnrealizedPnL:    parseNullableFloat(item.UnrealisedPnl),
 		}, nil
 	}
 

@@ -2,13 +2,117 @@ package service
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"math"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"goKit/internal/domain/entity"
+	"goKit/internal/domain/repository"
 	"goKit/internal/infrastructure/exchange"
 )
+
+type testMarketDataRepo struct {
+	funding        []entity.FundingSnapshot
+	fundingHistory []entity.FundingRateHistory
+}
+
+type testFundingHistoryMarket struct {
+	name     string
+	enabled  bool
+	history  map[string][]entity.FundingRateHistory
+	requests []string
+}
+
+func ptrBool(v bool) *bool { return &v }
+
+func (m *testFundingHistoryMarket) Name() string { return m.name }
+func (m *testFundingHistoryMarket) Enabled() bool {
+	return m.enabled
+}
+func (m *testFundingHistoryMarket) Fees() exchange.FeeConfig {
+	return exchange.FeeConfig{}
+}
+func (m *testFundingHistoryMarket) Config() exchange.ExchangeConfig {
+	return exchange.ExchangeConfig{}
+}
+func (m *testFundingHistoryMarket) FetchTradableSymbols(context.Context, string, map[string]struct{}) ([]entity.Symbol, error) {
+	return nil, nil
+}
+func (m *testFundingHistoryMarket) Start(context.Context, exchange.MarketSubscriptionProvider, exchange.MarketSink) {
+}
+func (m *testFundingHistoryMarket) FetchFundingRateHistory(_ context.Context, symbol entity.Symbol, startTime, endTime time.Time) ([]entity.FundingRateHistory, error) {
+	m.requests = append(m.requests, symbol.Symbol+"@"+startTime.UTC().Format(time.RFC3339)+"-"+endTime.UTC().Format(time.RFC3339))
+	return append([]entity.FundingRateHistory(nil), m.history[strings.ToUpper(symbol.Symbol)]...), nil
+}
+
+func (r *testMarketDataRepo) SaveFundingSnapshots(context.Context, []entity.FundingSnapshot) error {
+	return nil
+}
+
+func (r *testMarketDataRepo) SaveBookTopSnapshots(context.Context, []entity.BookTopSnapshot) error {
+	return nil
+}
+
+func (r *testMarketDataRepo) SaveFundingRateHistory(_ context.Context, items []entity.FundingRateHistory) error {
+	r.fundingHistory = append(r.fundingHistory, items...)
+	return nil
+}
+
+func (r *testMarketDataRepo) RecentFundingSnapshots(_ context.Context, exchangeName, symbol string, since time.Time, limit int) ([]entity.FundingSnapshot, error) {
+	out := make([]entity.FundingSnapshot, 0, len(r.funding))
+	for _, item := range r.funding {
+		if !strings.EqualFold(item.Exchange, exchangeName) || !strings.EqualFold(item.Symbol, symbol) {
+			continue
+		}
+		if item.EventTimeMs < since.UnixMilli() {
+			continue
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EventTimeMs > out[j].EventTimeMs })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (r *testMarketDataRepo) RecentFundingRateHistory(_ context.Context, exchangeName, symbol string, since time.Time, limit int) ([]entity.FundingRateHistory, error) {
+	out := make([]entity.FundingRateHistory, 0, len(r.fundingHistory))
+	for _, item := range r.fundingHistory {
+		if !strings.EqualFold(item.Exchange, exchangeName) || !strings.EqualFold(item.Symbol, symbol) {
+			continue
+		}
+		if item.FundingTimeMs < since.UnixMilli() {
+			continue
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FundingTimeMs > out[j].FundingTimeMs })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (r *testMarketDataRepo) DeleteOldFundingSnapshots(context.Context, time.Time) error {
+	return nil
+}
+
+func (r *testMarketDataRepo) DeleteOldFundingRateHistory(context.Context, time.Time) error {
+	return nil
+}
+
+func (r *testMarketDataRepo) DeleteOldBookTopSnapshots(context.Context, time.Time) error {
+	return nil
+}
+
+func (r *testMarketDataRepo) CountSnapshotStats(context.Context, time.Time) (repository.SnapshotStats, error) {
+	return repository.SnapshotStats{}, nil
+}
 
 func TestFundingEventCountUntil(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
@@ -67,6 +171,490 @@ func TestBuildFundingCandidateTimes_IncludesSharedSettlementInsideHoldWindow(t *
 	}
 	if want := time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(); times[0] != want {
 		t.Fatalf("expected only 20:00 funding candidate, got %d", times[0])
+	}
+}
+
+func TestBuildFundingRankContext_RanksFundingDescendingPerExchange(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := NewMarketStore()
+	store.SetWatchlist([]string{"BTC", "ETH", "SOL"})
+	for symbol, rate := range map[string]float64{
+		"BTC": 0.0100,
+		"ETH": 0.0040,
+		"SOL": -0.0010,
+	} {
+		store.UpsertSymbol(entity.Symbol{
+			Exchange:     "binance",
+			Symbol:       symbol,
+			VenueSymbol:  symbol + "USDT",
+			ContractType: "PERPETUAL",
+		})
+		store.UpsertFunding(entity.FundingSnapshot{
+			Exchange:             "binance",
+			Symbol:               symbol,
+			VenueSymbol:          symbol + "USDT",
+			FundingRate:          rate,
+			FundingTimeMs:        now.Add(time.Hour).UnixMilli(),
+			FundingIntervalHours: 8,
+			EventTimeMs:          now.UnixMilli(),
+		})
+	}
+
+	runner := &StrategyRunner{
+		cfg:   Config{MaxDataAge: time.Minute}.normalize(),
+		store: store,
+	}
+
+	ranks := runner.buildFundingRankContext(now)
+	if got := ranks.lookup("binance", "BTC"); got.Rank != 1 || got.Total != 3 {
+		t.Fatalf("expected BTC rank #1/3, got %+v", got)
+	}
+	if got := ranks.lookup("binance", "ETH"); got.Rank != 2 {
+		t.Fatalf("expected ETH rank #2, got %+v", got)
+	}
+	if got := ranks.lookup("binance", "SOL"); got.Rank != 3 || got.Percentile != 0 {
+		t.Fatalf("expected SOL rank #3 with percentile 0, got %+v", got)
+	}
+}
+
+func TestAssessSameExchangeLongHold_ComputesAnnualizedRatesAndEligibility(t *testing.T) {
+	cfg := Config{
+		MinNetPNL: 1.5,
+		SameExchange: StrategySameExchangeConfig{
+			Entry: StrategySameExchangeEntryConfig{
+				MinHistorySampleCount:     10,
+				MinHistoricalSupportRatio: 0.55,
+				MinAnnualizedNetRate:      0.15,
+			},
+		},
+	}.normalize()
+	rule := entity.OpportunityFundingRule{FundingIntervalHours: 8}
+	forecast := fundingForecast{
+		HistoryMean:          0.0002,
+		HistorySampleCount:   24,
+		HistoryPositiveRatio: 0.70,
+	}
+
+	got := assessSameExchangeLongHold(cfg, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), rule, 0.0008, forecast, 1000, 3)
+	if !got.Eligible {
+		t.Fatalf("expected long-hold assessment to be eligible, got %+v", got)
+	}
+	if got.HistoricalSupportRatio != 0.70 {
+		t.Fatalf("expected support ratio 0.70, got %.4f", got.HistoricalSupportRatio)
+	}
+	wantCarry := (0.0008*0.70 + 0.0002*0.30) * (24 * 365 / 8.0)
+	if math.Abs(got.EstimatedAnnualizedCarryRate-wantCarry) > 1e-9 {
+		t.Fatalf("expected annualized carry %.10f, got %.10f", wantCarry, got.EstimatedAnnualizedCarryRate)
+	}
+	wantNet := wantCarry - 3.0/1000.0
+	if math.Abs(got.EstimatedAnnualizedNetRate-wantNet) > 1e-9 {
+		t.Fatalf("expected annualized net %.10f, got %.10f", wantNet, got.EstimatedAnnualizedNetRate)
+	}
+}
+
+func TestAssessSameExchangeLongHold_SuggestsHoldToReachMinNetPNL(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		MinNetPNL: 1.5,
+		Prediction: StrategyPredictionConfig{
+			FundingRateHistoryLookback: 30 * 24 * time.Hour,
+		},
+		SameExchange: StrategySameExchangeConfig{
+			Entry: StrategySameExchangeEntryConfig{
+				MinHistorySampleCount:     10,
+				MinHistoricalSupportRatio: 0.55,
+				MinAnnualizedNetRate:      0.15,
+			},
+		},
+	}.normalize()
+	rule := entity.OpportunityFundingRule{
+		FundingIntervalHours: 8,
+		NextFundingTimeMs:    now.Add(2 * time.Hour).UnixMilli(),
+	}
+	forecast := fundingForecast{
+		HistoryMean:          0.0002,
+		HistorySampleCount:   24,
+		HistoryPositiveRatio: 0.75,
+	}
+
+	got := assessSameExchangeLongHold(cfg, now, rule, 0.0004, forecast, 1000, 1.1)
+	if !got.Eligible {
+		t.Fatalf("expected long-hold assessment to stay eligible, got %+v", got)
+	}
+	if got.SuggestedFundingEvents != 8 {
+		t.Fatalf("expected 8 suggested funding events, got %d", got.SuggestedFundingEvents)
+	}
+	if math.Abs(got.SuggestedHoldHours-58) > 1e-9 {
+		t.Fatalf("expected suggested hold hours 58, got %.4f", got.SuggestedHoldHours)
+	}
+	if got.SuggestedFundingTimeMs != now.Add(58*time.Hour).UnixMilli() {
+		t.Fatalf("expected suggested funding time %d, got %d", now.Add(58*time.Hour).UnixMilli(), got.SuggestedFundingTimeMs)
+	}
+	if got.SuggestedNetPNL < cfg.MinNetPNL {
+		t.Fatalf("expected suggested net pnl >= min %.2f, got %.4f", cfg.MinNetPNL, got.SuggestedNetPNL)
+	}
+}
+
+func TestBuildOpportunityFromDirectionCandidate_SameExchangePromotesHistoricalLongHoldEstimate(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	runner := &StrategyRunner{
+		cfg: Config{
+			ArbitrageMode:      ArbitrageModeSameExchangeSpotPerp,
+			TotalCapitalUSDT:   1000,
+			CapitalUtilization: 1,
+			Leverage:           1,
+			MinNetPNL:          1.5,
+			SameExchange: StrategySameExchangeConfig{
+				Entry: StrategySameExchangeEntryConfig{
+					RequireLongHoldEligible:   ptrBool(true),
+					MinHistorySampleCount:     10,
+					MinHistoricalSupportRatio: 0.55,
+					MinAnnualizedNetRate:      0.15,
+				},
+			},
+			Prediction: StrategyPredictionConfig{
+				FundingRateHistoryLookback: 30 * 24 * time.Hour,
+			},
+			SpreadGuard: StrategySpreadGuardConfig{
+				EntryLeadTime:   4 * time.Hour,
+				EntryCutoffTime: 30 * time.Second,
+			},
+		}.normalize(),
+		store:      NewMarketStore(),
+		marketRepo: &testMarketDataRepo{},
+	}
+
+	selected := evaluatedDirectionCandidate{
+		LongExchange:  "binance_spot",
+		ShortExchange: "binance",
+		LongFunding: entity.FundingSnapshot{
+			Exchange:             "binance_spot",
+			Symbol:               "BTC",
+			VenueSymbol:          "BTCUSDT",
+			FundingRate:          0,
+			FundingTimeMs:        now.Add(2 * time.Hour).UnixMilli(),
+			FundingIntervalHours: 8,
+			EventTimeMs:          now.UnixMilli(),
+			MarkPrice:            100,
+		},
+		ShortFunding: entity.FundingSnapshot{
+			Exchange:             "binance",
+			Symbol:               "BTC",
+			VenueSymbol:          "BTCUSDT",
+			FundingRate:          0.0006,
+			FundingTimeMs:        now.Add(2 * time.Hour).UnixMilli(),
+			FundingIntervalHours: 8,
+			EventTimeMs:          now.UnixMilli(),
+			MarkPrice:            100.2,
+		},
+		LongBook: entity.BookTopSnapshot{
+			Exchange:    "binance_spot",
+			Symbol:      "BTC",
+			VenueSymbol: "BTCUSDT",
+			BidPrice:    100,
+			AskPrice:    100.1,
+			EventTimeMs: now.UnixMilli(),
+		},
+		ShortBook: entity.BookTopSnapshot{
+			Exchange:    "binance",
+			Symbol:      "BTC",
+			VenueSymbol: "BTCUSDT",
+			BidPrice:    100.2,
+			AskPrice:    100.3,
+			EventTimeMs: now.UnixMilli(),
+		},
+		LongMeta: entity.Symbol{
+			Exchange:     "binance_spot",
+			Symbol:       "BTC",
+			VenueSymbol:  "BTCUSDT",
+			ContractType: "SPOT",
+		},
+		ShortMeta: entity.Symbol{
+			Exchange:             "binance",
+			Symbol:               "BTC",
+			VenueSymbol:          "BTCUSDT",
+			ContractType:         "PERPETUAL",
+			FundingIntervalHours: 8,
+		},
+		LongForecast: syntheticSpotFundingForecast(),
+		ShortForecast: fundingForecast{
+			CurrentRate:                 0.0006,
+			BaselineRate:                0.0006,
+			HistoryMean:                 0.0002,
+			HistorySampleCount:          24,
+			HistoryPositiveRatio:        0.8,
+			CurrentHistoricalPercentile: 0.92,
+			Regime:                      "positive_premium",
+			Confidence:                  "medium",
+			MeanReversion:               0.20,
+			ContinuationDecay:           0.5,
+			EffectiveFloorRate:          0.0001,
+			EffectiveCapRate:            0.001,
+			ClampSource:                 "history_band",
+		},
+		EntryFeePNL: 0.5,
+		ExitFeePNL:  0.5,
+		BasisBps:    10,
+		WindowEvaluations: []opportunityProjectionEvaluation{
+			{
+				Projection: fundingProjection{
+					ProjectedFundingTimeMs:       now.Add(2 * time.Hour).UnixMilli(),
+					RequiredEntryByFundingTimeMs: now.Add(2 * time.Hour).UnixMilli(),
+					LongFundingEventCount:        1,
+					ShortFundingEventCount:       1,
+					FundingWindowHours:           2,
+					CarryRate:                    0.001,
+					CarryRateHourlyEquivalent:    0.0005,
+					ComputationMode:              "legacy_projection",
+					StrategyMode:                 StrategyModeLegacyProjection,
+				},
+				Detail: entity.OpportunityProjection{
+					ProjectionRank:               1,
+					IsBestProjection:             true,
+					ProjectedFundingTimeMs:       now.Add(2 * time.Hour).UnixMilli(),
+					RequiredEntryByFundingTimeMs: now.Add(2 * time.Hour).UnixMilli(),
+					LongFundingEventCount:        1,
+					ShortFundingEventCount:       1,
+					FundingWindowHours:           2,
+					CarryRate:                    0.001,
+					CarryRateHourlyEquivalent:    0.0005,
+					GrossFundingPNL:              1.0,
+					NetExpectedPNL:               -0.6,
+					NetExpectedBps:               -6,
+					ComputationMode:              "legacy_projection",
+					StrategyMode:                 StrategyModeLegacyProjection,
+				},
+				MaxAllowedBasisBps: 12,
+				SlippagePNL:        0.4,
+				SafetyBufferPNL:    0.2,
+			},
+		},
+		PrimaryWindow: opportunityProjectionEvaluation{
+			Projection: fundingProjection{
+				ProjectedFundingTimeMs:       now.Add(2 * time.Hour).UnixMilli(),
+				RequiredEntryByFundingTimeMs: now.Add(2 * time.Hour).UnixMilli(),
+				LongFundingEventCount:        1,
+				ShortFundingEventCount:       1,
+				FundingWindowHours:           2,
+				CarryRate:                    0.001,
+				CarryRateHourlyEquivalent:    0.0005,
+				ComputationMode:              "legacy_projection",
+				StrategyMode:                 StrategyModeLegacyProjection,
+			},
+			Detail: entity.OpportunityProjection{
+				ProjectionRank:               1,
+				IsBestProjection:             true,
+				ProjectedFundingTimeMs:       now.Add(2 * time.Hour).UnixMilli(),
+				RequiredEntryByFundingTimeMs: now.Add(2 * time.Hour).UnixMilli(),
+				LongFundingEventCount:        1,
+				ShortFundingEventCount:       1,
+				FundingWindowHours:           2,
+				CarryRate:                    0.001,
+				CarryRateHourlyEquivalent:    0.0005,
+				GrossFundingPNL:              1.0,
+				NetExpectedPNL:               -0.6,
+				NetExpectedBps:               -6,
+				ComputationMode:              "legacy_projection",
+				StrategyMode:                 StrategyModeLegacyProjection,
+			},
+			MaxAllowedBasisBps: 12,
+			SlippagePNL:        0.4,
+			SafetyBufferPNL:    0.2,
+		},
+	}
+
+	opp := buildOpportunityFromDirectionCandidate(runner, now, "BTC", selected, fundingRankContext{})
+	if !opp.SameExchangeLongHoldUsingHistoryEstimate {
+		t.Fatal("expected same-exchange opportunity to use historical long-hold estimate")
+	}
+	if !opp.EligibleForExecution || opp.Status != OpportunityStatusEligible {
+		t.Fatalf("expected opportunity to become eligible via historical long-hold estimate, got status=%s eligible=%v reason=%s", opp.Status, opp.EligibleForExecution, opp.RejectReason)
+	}
+	if opp.NetExpectedPNL < runner.cfg.MinNetPNL {
+		t.Fatalf("expected promoted net pnl >= min %.2f, got %.4f", runner.cfg.MinNetPNL, opp.NetExpectedPNL)
+	}
+	if opp.FundingComputationMode != "same_exchange_long_hold_history" {
+		t.Fatalf("expected historical long-hold computation mode, got %s", opp.FundingComputationMode)
+	}
+	if opp.ShortFundingRule.SuggestedFundingEvents <= 1 {
+		t.Fatalf("expected suggested funding events > 1, got %d", opp.ShortFundingRule.SuggestedFundingEvents)
+	}
+	if len(opp.ProjectionDetails) == 0 || !opp.ProjectionDetails[0].IsBestProjection {
+		t.Fatalf("expected first projection row to be injected as best historical projection, got %+v", opp.ProjectionDetails)
+	}
+}
+
+func TestSameExchangeHistoricalLongHoldProjectionForPlan_UsesAdjustedHistoricalRate(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	plan := &entity.ExecutionPlan{
+		ArbitrageMode:                              ArbitrageModeSameExchangeSpotPerp,
+		SameExchangeLongHoldUsingHistoryEstimate:   true,
+		SameExchangeLongHoldSuggestedFundingEvents: 4,
+		PerpFundingHistorySampleCount:              20,
+		PerpFundingHistoryMeanRate:                 0.0002,
+		PerpFundingHistoricalSupportRatio:          0.75,
+		RequiredEntryByFundingTimeMs:               now.Add(time.Hour).UnixMilli(),
+	}
+	perpFunding := entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          0.0006,
+		FundingTimeMs:        now.Add(2 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 8,
+	}
+
+	got, ok := sameExchangeHistoricalLongHoldProjectionForPlan(now, plan, perpFunding)
+	if !ok {
+		t.Fatal("expected plan revalidation projection to be available")
+	}
+	wantCarry := (0.0006*0.75 + 0.0002*0.25) * 4
+	if math.Abs(got.CarryRate-wantCarry) > 1e-9 {
+		t.Fatalf("expected carry %.10f, got %.10f", wantCarry, got.CarryRate)
+	}
+	if got.ProjectedFundingTimeMs != now.Add(26*time.Hour).UnixMilli() {
+		t.Fatalf("expected projected funding time %d, got %d", now.Add(26*time.Hour).UnixMilli(), got.ProjectedFundingTimeMs)
+	}
+	if got.ComputationMode != "same_exchange_long_hold_history" {
+		t.Fatalf("expected historical long-hold computation mode, got %s", got.ComputationMode)
+	}
+}
+
+func TestSyncFundingRateHistory_SavesExchangeHistoryForPerpetualTargets(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	repo := &testMarketDataRepo{}
+	market := &testFundingHistoryMarket{
+		name:    "binance",
+		enabled: true,
+		history: map[string][]entity.FundingRateHistory{
+			"BTC": {
+				{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: 0.0012, FundingTimeMs: now.Add(-8 * time.Hour).UnixMilli()},
+				{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: -0.0008, FundingTimeMs: now.Add(-16 * time.Hour).UnixMilli()},
+			},
+		},
+	}
+	runner := &StrategyRunner{
+		cfg: Config{
+			FundingRateHistoryLookback: 30 * 24 * time.Hour,
+		}.normalize(),
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		marketRepo: repo,
+		markets: map[string]exchange.MarketAdapter{
+			"binance": market,
+		},
+		fundingSymbolsByExchange: map[string][]entity.Symbol{
+			"binance": {
+				{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL"},
+			},
+			"binance_spot": {
+				{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "SPOT"},
+			},
+		},
+	}
+
+	runner.syncFundingRateHistory(context.Background(), now)
+
+	if len(market.requests) != 1 {
+		t.Fatalf("expected exactly one perpetual history sync request, got %d", len(market.requests))
+	}
+	if len(repo.fundingHistory) != 2 {
+		t.Fatalf("expected 2 saved funding history rows, got %d", len(repo.fundingHistory))
+	}
+}
+
+func TestSyncFundingRateHistory_UsesIncrementalStartAndPrioritizesMissingSymbols(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	repo := &testMarketDataRepo{
+		fundingHistory: []entity.FundingRateHistory{
+			{
+				Exchange:      "binance",
+				Symbol:        "BTC",
+				VenueSymbol:   "BTCUSDT",
+				FundingRate:   0.0012,
+				FundingTimeMs: now.Add(-4 * time.Hour).UnixMilli(),
+			},
+		},
+	}
+	market := &testFundingHistoryMarket{
+		name:    "binance",
+		enabled: true,
+		history: map[string][]entity.FundingRateHistory{
+			"AAA": {
+				{Exchange: "binance", Symbol: "AAA", VenueSymbol: "AAAUSDT", FundingRate: 0.0010, FundingTimeMs: now.Add(-8 * time.Hour).UnixMilli()},
+			},
+			"BTC": {
+				{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: 0.0015, FundingTimeMs: now.Add(-3 * time.Hour).UnixMilli()},
+			},
+		},
+	}
+	runner := &StrategyRunner{
+		cfg: Config{
+			FundingRateHistoryLookback: 30 * 24 * time.Hour,
+		}.normalize(),
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		marketRepo: repo,
+		markets: map[string]exchange.MarketAdapter{
+			"binance": market,
+		},
+		fundingSymbolsByExchange: map[string][]entity.Symbol{
+			"binance": {
+				{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL", FundingIntervalHours: 1},
+				{Exchange: "binance", Symbol: "AAA", VenueSymbol: "AAAUSDT", ContractType: "PERPETUAL", FundingIntervalHours: 8},
+			},
+		},
+	}
+
+	runner.syncFundingRateHistory(context.Background(), now)
+
+	if len(market.requests) != 2 {
+		t.Fatalf("expected 2 sync requests, got %d", len(market.requests))
+	}
+	if !strings.HasPrefix(market.requests[0], "AAA@") {
+		t.Fatalf("expected missing symbol AAA to be requested first, got %#v", market.requests)
+	}
+	if !strings.Contains(market.requests[1], "BTC@2026-01-02T08:00:00Z-2026-01-02T12:00:00Z") {
+		t.Fatalf("expected BTC request to resume from latest local funding time, got %#v", market.requests)
+	}
+}
+
+func TestSyncFundingRateHistory_SkipsSymbolsWithNoDueFundingEvent(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	repo := &testMarketDataRepo{
+		fundingHistory: []entity.FundingRateHistory{
+			{
+				Exchange:      "binance",
+				Symbol:        "BTC",
+				VenueSymbol:   "BTCUSDT",
+				FundingRate:   0.0012,
+				FundingTimeMs: now.Add(-2 * time.Hour).UnixMilli(),
+			},
+		},
+	}
+	market := &testFundingHistoryMarket{
+		name:    "binance",
+		enabled: true,
+		history: map[string][]entity.FundingRateHistory{},
+	}
+	runner := &StrategyRunner{
+		cfg: Config{
+			FundingRateHistoryLookback: 30 * 24 * time.Hour,
+		}.normalize(),
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		marketRepo: repo,
+		markets: map[string]exchange.MarketAdapter{
+			"binance": market,
+		},
+		fundingSymbolsByExchange: map[string][]entity.Symbol{
+			"binance": {
+				{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL", FundingIntervalHours: 8},
+			},
+		},
+	}
+
+	runner.syncFundingRateHistory(context.Background(), now)
+
+	if len(market.requests) != 0 {
+		t.Fatalf("expected fresh symbol with no due funding event to be skipped, got %#v", market.requests)
 	}
 }
 
@@ -368,6 +956,70 @@ func TestProjectFundingCarry_StrictTargetPinsLatestWindowEvenWhenCarryTurnsNegat
 	}
 	if projection.CarryRate >= 0 {
 		t.Fatalf("expected strict target latest window to preserve negative carry, got %.8f", projection.CarryRate)
+	}
+}
+
+func TestBuildFundingCandidateTimesForConfig_DynamicProfitIgnoresHoldHours(t *testing.T) {
+	cfg := Config{
+		HoldHours:         1,
+		HoldSelectionMode: HoldSelectionModeDynamicProfit,
+		StrategyMode:      StrategyModeLegacyProjection,
+	}
+	now := time.Date(2026, 1, 1, 18, 40, 0, 0, time.UTC).UnixMilli()
+
+	long := entity.FundingSnapshot{
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingTimeMs:        time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	times := buildFundingCandidateTimesForConfig(cfg, now, long, short)
+	if len(times) == 0 {
+		t.Fatal("expected dynamic profit mode to return candidate times")
+	}
+	found22h := false
+	for _, ts := range times {
+		if ts == time.Date(2026, 1, 1, 22, 0, 0, 0, time.UTC).UnixMilli() {
+			found22h = true
+			break
+		}
+	}
+	if !found22h {
+		t.Fatalf("expected dynamic profit mode to search beyond hold_hours and include 22:00, got %v", times)
+	}
+}
+
+func TestProjectFundingCarry_DynamicProfitSelectsBestCarryBeyondHoldHours(t *testing.T) {
+	r := &StrategyRunner{cfg: Config{
+		HoldHours:                    1,
+		HoldSelectionMode:            HoldSelectionModeDynamicProfit,
+		FundingRateContinuationDecay: 1,
+	}}
+	now := time.Date(2026, 1, 1, 18, 40, 0, 0, time.UTC)
+
+	long := entity.FundingSnapshot{
+		FundingRate:          0.0001,
+		FundingTimeMs:        time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 4,
+	}
+	short := entity.FundingSnapshot{
+		FundingRate:          0.0004,
+		FundingTimeMs:        time.Date(2026, 1, 1, 19, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 1,
+	}
+
+	projection, ok := r.projectFundingCarry(now, long, spotForecast(long.FundingRate, 1), short, spotForecast(short.FundingRate, 1))
+	if !ok {
+		t.Fatalf("expected projection to be valid")
+	}
+	if minWant := time.Date(2026, 1, 1, 22, 0, 0, 0, time.UTC).UnixMilli(); projection.ProjectedFundingTimeMs <= minWant {
+		t.Fatalf("expected dynamic profit mode to select a window beyond hold_hours, got %d", projection.ProjectedFundingTimeMs)
+	}
+	if projection.LongFundingEventCount <= 1 || projection.ShortFundingEventCount <= 4 {
+		t.Fatalf("expected dynamic profit window to accumulate more events than the hold_hours-limited 22:00 window, got long=%d short=%d", projection.LongFundingEventCount, projection.ShortFundingEventCount)
 	}
 }
 
@@ -970,6 +1622,60 @@ func TestStrategyRunnerForecastFunding_RollingModeFallsBackToSpotOnly(t *testing
 	}
 }
 
+func TestStrategyRunnerForecastFunding_RollingModePreservesHistoryContext(t *testing.T) {
+	now := time.Date(2026, 1, 1, 13, 48, 0, 0, time.UTC)
+	repo := &testMarketDataRepo{
+		fundingHistory: []entity.FundingRateHistory{
+			{Exchange: "binance", Symbol: "BTC", FundingRate: -0.0020, FundingTimeMs: now.Add(-5 * time.Hour).UnixMilli()},
+			{Exchange: "binance", Symbol: "BTC", FundingRate: -0.0010, FundingTimeMs: now.Add(-4 * time.Hour).UnixMilli()},
+			{Exchange: "binance", Symbol: "BTC", FundingRate: 0.0015, FundingTimeMs: now.Add(-3 * time.Hour).UnixMilli()},
+			{Exchange: "binance", Symbol: "BTC", FundingRate: 0.0020, FundingTimeMs: now.Add(-2 * time.Hour).UnixMilli()},
+		},
+	}
+	cfg := Config{
+		StrategyMode:                  StrategyModeRollingCycleAligned,
+		FundingRateContinuationDecay:  0.3,
+		FundingSmoothingCurrentWeight: 0.1,
+		FundingHistoryLookback:        6 * time.Hour,
+		OpportunityCalcInterval:       5 * time.Second,
+	}
+	r := &StrategyRunner{
+		cfg:        cfg,
+		forecaster: NewFundingForecaster(cfg, repo, nil),
+	}
+
+	item := entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		FundingRate:          0.0100,
+		FundingTimeMs:        time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC).UnixMilli(),
+		FundingIntervalHours: 8,
+	}
+
+	forecast := r.forecastFunding(context.Background(), now, item)
+	if forecast.Regime != "rolling_real_only" {
+		t.Fatalf("expected rolling forecast to keep history context with rolling_real_only regime, got %s", forecast.Regime)
+	}
+	if forecast.HistorySampleCount != 4 {
+		t.Fatalf("expected rolling forecast to keep 4 history samples, got %d", forecast.HistorySampleCount)
+	}
+	if forecast.HistoryNegativeRatio != 0.5 {
+		t.Fatalf("expected 50%% negative history ratio, got %.4f", forecast.HistoryNegativeRatio)
+	}
+	if forecast.HistoryPositiveRatio != 0.5 {
+		t.Fatalf("expected 50%% positive history ratio, got %.4f", forecast.HistoryPositiveRatio)
+	}
+	if forecast.CurrentHistoricalPercentile != 1 {
+		t.Fatalf("expected current rate percentile to be 1.0, got %.4f", forecast.CurrentHistoricalPercentile)
+	}
+	if got := forecast.PredictedRateForEvent(2); got != item.FundingRate {
+		t.Fatalf("expected rolling forecast to keep future event on current rate %.8f, got %.8f", item.FundingRate, got)
+	}
+	if forecast.EffectiveFloorRate != item.FundingRate || forecast.EffectiveCapRate != item.FundingRate {
+		t.Fatalf("expected rolling clamp to stay on current rate %.8f, got [%.8f, %.8f]", item.FundingRate, forecast.EffectiveFloorRate, forecast.EffectiveCapRate)
+	}
+}
+
 func spotForecast(currentRate, decay float64) fundingForecast {
 	return fundingForecast{
 		CurrentRate:        currentRate,
@@ -1002,6 +1708,143 @@ func TestAllowedPlanBasisThresholdBps_UsesOpportunityValue(t *testing.T) {
 	got := r.allowedPlanBasisThresholdBps(opp)
 	if got != 18 {
 		t.Fatalf("expected plan threshold to respect opportunity value 18, got %.4f", got)
+	}
+}
+
+func TestAssessSameExchangeBasisRisk_ShortWindowSoftensToDownsize(t *testing.T) {
+	cfg := Config{
+		ArbitrageMode: ArbitrageModeSameExchangeSpotPerp,
+		MaxSpreadBps:  12,
+		SameExchange: StrategySameExchangeConfig{
+			Entry: StrategySameExchangeEntryConfig{
+				BasisLongHoldWindowHours: 12,
+				MaxBasisPaybackEvents:    4,
+			},
+			Risk: StrategySameExchangeRiskConfig{
+				ExtremeBasisPaybackEvents:  2.5,
+				ExtremeBasisSizeMultiplier: 0.65,
+			},
+		},
+	}.normalize()
+
+	got := assessSameExchangeBasisRisk(cfg, ArbitrageModeSameExchangeSpotPerp, 6, 0.006, 1, 1, 18, 2, 1000, 12)
+	if !got.Allowed {
+		t.Fatalf("expected short-window basis to stay eligible, got %+v", got)
+	}
+	if got.Reason != sameExchangeBasisReasonShortWindowTooWide {
+		t.Fatalf("expected short-window reason %s, got %s", sameExchangeBasisReasonShortWindowTooWide, got.Reason)
+	}
+	if got.UsesPaybackModel {
+		t.Fatalf("expected short-window guard to skip payback model, got %+v", got)
+	}
+	if got.SizeMultiplier != 0.65 {
+		t.Fatalf("expected short-window basis to downsize to 0.65, got %+v", got)
+	}
+}
+
+func TestAssessSameExchangeBasisRisk_LongWindowUsesPayback(t *testing.T) {
+	cfg := Config{
+		ArbitrageMode: ArbitrageModeSameExchangeSpotPerp,
+		MaxSpreadBps:  12,
+		SameExchange: StrategySameExchangeConfig{
+			Entry: StrategySameExchangeEntryConfig{
+				BasisLongHoldWindowHours: 12,
+				MaxBasisPaybackEvents:    4,
+			},
+			Risk: StrategySameExchangeRiskConfig{
+				ExtremeBasisPaybackEvents:  2.5,
+				ExtremeBasisSizeMultiplier: 0.65,
+			},
+		},
+	}.normalize()
+
+	got := assessSameExchangeBasisRisk(cfg, ArbitrageModeSameExchangeSpotPerp, 24, 0.009, 0, 3, 24, 3, 1000, 18)
+	if !got.Allowed {
+		t.Fatalf("expected long-window payback guard to allow opportunity, got %+v", got)
+	}
+	if !got.UsesPaybackModel {
+		t.Fatalf("expected long-window guard to use payback model, got %+v", got)
+	}
+	if got.PaybackFundingEvents <= 0 || got.PaybackFundingEvents >= 2 {
+		t.Fatalf("expected payback events below 2, got %+v", got)
+	}
+}
+
+func TestAssessSameExchangeBasisRisk_SlowPaybackDownsizesInsteadOfRejecting(t *testing.T) {
+	cfg := Config{
+		ArbitrageMode: ArbitrageModeSameExchangeSpotPerp,
+		MaxSpreadBps:  12,
+		SameExchange: StrategySameExchangeConfig{
+			Entry: StrategySameExchangeEntryConfig{
+				BasisLongHoldWindowHours: 12,
+				MaxBasisPaybackEvents:    4,
+			},
+			Risk: StrategySameExchangeRiskConfig{
+				ExtremeBasisPaybackEvents:  2.5,
+				ExtremeBasisSizeMultiplier: 0.65,
+			},
+		},
+	}.normalize()
+
+	got := assessSameExchangeBasisRisk(cfg, ArbitrageModeSameExchangeSpotPerp, 24, 0.0015, 0, 3, 24, 4, 1000, 18)
+	if !got.Allowed {
+		t.Fatalf("expected slow payback to remain eligible with reduced size, got %+v", got)
+	}
+	if got.Reason != sameExchangeBasisReasonPaybackTooHigh {
+		t.Fatalf("expected payback-too-high reason, got %+v", got)
+	}
+	if got.SizeMultiplier != 0.65 {
+		t.Fatalf("expected slow payback to downsize to 0.65, got %+v", got)
+	}
+}
+
+func TestAssessSameExchangePriceRisk_BlocksAbnormal1hPump(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := &testMarketDataRepo{
+		funding: []entity.FundingSnapshot{
+			{
+				Exchange:    "binance",
+				Symbol:      "BTC",
+				MarkPrice:   100,
+				EventTimeMs: now.Add(-55 * time.Minute).UnixMilli(),
+			},
+			{
+				Exchange:    "binance",
+				Symbol:      "BTC",
+				MarkPrice:   104,
+				EventTimeMs: now.Add(-20 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	cfg := Config{
+		ArbitrageMode: ArbitrageModeSameExchangeSpotPerp,
+		SameExchange: StrategySameExchangeConfig{
+			Risk: StrategySameExchangeRiskConfig{
+				Max1hPriceShockRatio: 0.08,
+			},
+		},
+	}.normalize()
+
+	got := assessSameExchangePriceRisk(
+		context.Background(),
+		cfg,
+		repo,
+		ArbitrageModeSameExchangeSpotPerp,
+		"binance",
+		"BTC",
+		entity.FundingSnapshot{
+			Exchange:    "binance",
+			Symbol:      "BTC",
+			MarkPrice:   109,
+			EventTimeMs: now.UnixMilli(),
+		},
+		now,
+	)
+	if got.Allowed {
+		t.Fatalf("expected abnormal 1h pump to be blocked, got %+v", got)
+	}
+	if got.Reason != sameExchangePriceRiskReason1hPriceShock {
+		t.Fatalf("expected 1h price shock reason, got %+v", got)
 	}
 }
 

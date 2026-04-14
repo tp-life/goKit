@@ -228,6 +228,8 @@ func inferVenueKind(name string, cfg exchange.ExchangeConfig) string {
 		return "hyperliquid"
 	case "bybit_v5":
 		return "bybit"
+	case "binance_spot":
+		return "binance"
 	case "binance_like":
 		return "binance_like"
 	default:

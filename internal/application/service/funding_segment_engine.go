@@ -107,7 +107,7 @@ func buildDirectionalFundingPlanForConfig(
 	normalized := cfg.normalize()
 	if normalized.StrategyMode != StrategyModeRollingCycleAligned {
 		return directionalFundingPlan{
-			Projections: buildLegacyFundingProjections(now, normalized.HoldHours, longFunding, longForecast, shortFunding, shortForecast),
+			Projections: buildLegacyFundingProjectionsForConfig(normalized, now, longFunding, longForecast, shortFunding, shortForecast),
 		}
 	}
 	return buildRollingDirectionalFundingPlan(
@@ -425,9 +425,19 @@ func buildSingleFundingSegment(
 	}
 }
 
+func buildLegacyFundingProjectionsForConfig(cfg Config, now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
+	nowMs := now.UnixMilli()
+	candidateTimes := buildFundingCandidateTimesForConfig(cfg, nowMs, longFunding, shortFunding)
+	return buildLegacyFundingProjectionsFromCandidateTimes(nowMs, candidateTimes, longFunding, longForecast, shortFunding, shortForecast)
+}
+
 func buildLegacyFundingProjections(now time.Time, holdHours float64, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
 	nowMs := now.UnixMilli()
 	candidateTimes := buildFundingCandidateTimes(nowMs, longFunding, shortFunding, holdHours)
+	return buildLegacyFundingProjectionsFromCandidateTimes(nowMs, candidateTimes, longFunding, longForecast, shortFunding, shortForecast)
+}
+
+func buildLegacyFundingProjectionsFromCandidateTimes(nowMs int64, candidateTimes []int64, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
 	if len(candidateTimes) == 0 {
 		return nil
 	}

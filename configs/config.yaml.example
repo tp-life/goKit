@@ -56,6 +56,10 @@ strategy:
   # 当前这份示例按 rolling 设计组织配置；
   # 代码里已有兼容桥，会把新配置层映射回现有运行时字段。
   mode: "rolling_cycle_aligned"
+  # 套利模式：
+  # - cross_exchange: 现有默认模式，做跨交易所 funding 套利
+  # - same_exchange_spot_perp: 新模式，只做同一 arbitrage_group 下的现货多 + 永续空
+  arbitrage_mode: "same_exchange_spot_perp"
 
   universe:
     # 统一使用 canonical symbol（基础币）做监控范围。
@@ -72,6 +76,9 @@ strategy:
     # 资金利用率（0~1）。
     capital_utilization: 0.8
     # 目标杠杆。
+    # 注意：same_exchange_spot_perp 模式下，effective_notional 默认按
+    # total_capital_usdt * capital_utilization 计算，不再额外乘 leverage，
+    # 因为现货腿本身需要全额占资；这里主要用于永续空单那一腿的保证金口径。
     leverage: 2
     # 假设名义价值（当无法从资金*杠杆推导时的兜底值）。
     assumed_notional: 1600
@@ -79,10 +86,13 @@ strategy:
   opportunity:
     # 允许往后看的最大持有窗口（小时）。
     # rolling 模式下它主要决定“机会视角最多往后看多远”，不是固定最终持有到多久。
+    # 如果持有模式改成 dynamic_profit，则不会再用它截断 legacy 候选窗口。
     hold_hours: 24
     # 兼容当前 legacy 主链的主窗口选择模式。
+    # - latest_profitable: 在 hold_hours 内尽量选更晚且仍过门槛的窗口
+    # - dynamic_profit: 不受 hold_hours 截断，按收益自动搜索更优兑现点
     # rolling 逻辑真正落地前，兼容桥会使用这个字段回退到旧行为。
-    legacy_hold_selection_mode: "latest_profitable"
+    legacy_hold_selection_mode: "dynamic_profit"
     # 扣除手续费/滑点/安全垫后的最小净收益门槛（USDT）。
     min_net_pnl: 1.5
     # 前端展示机会数量上限（仅展示层建议值，非核心计算截断）。
@@ -131,6 +141,10 @@ strategy:
     # funding 平滑估算的历史回看窗口。
     # 当前主要给 legacy_projection 使用；rolling_cycle_aligned 的机会识别已改成 real-only。
     funding_history_lookback: 6h
+    # 真实 funding 历史事件的统计窗口。建议至少覆盖数天，否则 8h 结算币种样本会偏少。
+    funding_rate_history_lookback: 720h
+    # 启动回补 + 周期性同步交易所真实 funding 历史事件的间隔。
+    funding_rate_history_sync_interval: 30m
     # 当前 funding 快照在平滑估算中的权重（0~1）。
     # rolling real-only 模式下，这个参数不会再影响“当前是否是机会”的主 carry。
     funding_smoothing_current_weight: 0.7
@@ -141,6 +155,52 @@ strategy:
     allow_intermediate_forecast_before_boundary: true
     # 兼容开关：rolling real-only 机会识别当前天然满足这个约束。
     forbid_boundary_forecast: true
+
+  same_exchange:
+    entry:
+      # 是否要求“粗略年化净收益 + 历史支持比例”同时过线，才允许把机会视为可开仓/可长期持有。
+      require_long_hold_eligible: true
+      # 长期持有评估要求的最少历史 funding 样本数。
+      min_history_sample_count: 10
+      # 当前 funding 同方向的历史支持比例门槛。
+      # 例如当前 funding 为正，则使用“历史正费率占比”来判断它是否具备持续性。
+      min_historical_support_ratio: 0.55
+      # 基于“当前 funding * 同向支持比例 + 历史均值回归”的粗略年化净收益门槛。
+      min_annualized_net_rate: 0.15
+      # funding 持有窗口达到该时长后，基差不再只看硬阈值，而是改按“几轮 funding 才能覆盖基差+摩擦成本”判断。
+      basis_long_hold_window_hours: 12
+      # 长持模式下，若“覆盖基差+摩擦成本”需要的 funding 轮数超过该值，则标记为回本偏慢并优先降仓。
+      max_basis_payback_events: 4
+    exit:
+      # 同所 spot-perp 模式下，若永续 funding 转负，是否触发一轮提前离场评估。
+      close_on_negative_funding: true
+      # 只有当历史 funding 中至少这么高比例为负时，当前 funding 转负才会触发这条离场逻辑。
+      history_negative_ratio_threshold: 0.5
+      # 是否要求“按当前盘口估算的平仓净值”仍为正，才执行这条提前离场。
+      require_positive_close_pnl: true
+      # 提前离场要求的最低估算平仓盈利（USDT）。
+      min_close_pnl: 0.5
+    risk:
+      # 同所现货对冲模式下，永续空头允许使用的最大杠杆。
+      max_perp_leverage: 1.5
+      # 若账户上已经存在同 symbol 永续持仓，且离 liquidation 太近，则拒绝继续加仓/开仓。
+      min_liq_distance_ratio: 0.12
+      # 仅作为风险分层参考的“预警区”阈值。
+      warn_liq_distance_ratio: 0.20
+      # 持仓中的永续空头距离 liquidation 进入该区间时，直接触发保护性离场。
+      reduce_liq_distance_ratio: 0.10
+      # 更靠近 liquidation 的紧急阈值，命中后立即优先平仓。
+      emergency_liq_distance_ratio: 0.08
+      # 最近 1 小时内永续标记价若单边上冲超过该比例，则拒绝开仓并在持仓中触发保护性离场。
+      max_1h_price_shock_ratio: 0.08
+      # 当前 funding 若处于历史极高分位，同时历史负费率占比又偏高，则自动缩小仓位。
+      funding_extreme_percentile: 0.95
+      extreme_funding_negative_ratio: 0.50
+      # 命中“高 funding 但历史易反转”的拥挤风险时，目标仓位缩放系数。
+      extreme_funding_size_multiplier: 0.50
+      # 长持模式下，若基差回本轮数已经偏高但尚未到拒绝阈值，则先缩小仓位。
+      extreme_basis_payback_events: 2.5
+      extreme_basis_size_multiplier: 0.65
 
   rolling:
     # EntryPath 是否只保留“方向连续一致”的 segment 前缀。
@@ -228,6 +288,26 @@ strategy:
     # 超时后系统不会无限卡住，而会立刻用 client_order_id 做 best-effort 查单/查仓。
     # =0 表示不额外加这层腿级超时。
     primary_leg_timeout: 0
+    position_monitor:
+      # 运行中若检测到只剩单腿暴露，是否立即触发 reduce-only 收口。
+      force_close_on_single_leg: true
+      # 运行中若检测到某条腿方向与预期相反，是否立即触发收口。
+      force_close_on_side_mismatch: true
+      # 运行中若检测到某条腿数量明显偏离计划对冲规模，是否立即触发收口。
+      force_close_on_size_mismatch: true
+      # 数量漂移容忍比例；例如 0.15 表示偏离 15% 以内仍视为可接受。
+      max_qty_deviation_ratio: 0.15
+    replacement:
+      # 是否启用“更优机会出现时主动换仓”。
+      enabled: true
+      # 仅在 live slot 或总预算已经吃满时才考虑换仓。
+      only_when_constrained: true
+      # 是否要求“扣完当前平仓成本后”的净增益仍然过门槛。
+      require_net_improvement: true
+      # 主动换仓最小净增益门槛（USDT）。
+      min_net_improvement_pnl: 1.5
+      # 主动换仓额外安全垫（USDT），用于覆盖平旧仓时的额外摩擦。
+      extra_safety_buffer_usdt: 0.2
 
 exchanges:
   binance:
@@ -245,6 +325,8 @@ exchanges:
     enabled: true
     # 展示名称。
     label: "Binance"
+    # 同所套利分组；只有同一个 arbitrage_group 下的 spot/perp 才会被 same_exchange_spot_perp 模式配对。
+    arbitrage_group: "binance"
     # 结算资产（用于跨所比较与风险提示）。
     settle_asset: "USDT"
     # REST API 基地址。
@@ -279,6 +361,37 @@ exchanges:
     adapter_options:
       # Binance 当前支持 legacy_hmac 与 rsa 两种私有鉴权方式。
       # 若只配置了 private_key_env 且未提供 api_secret_env，程序会自动推断为 rsa。
+      # trade_auth_mode: "legacy_hmac"
+      # trade_auth_mode: "rsa"
+
+  # 如需启用“同一交易所现货 + 永续空单”模式，可额外配置一个 Binance Spot 逻辑实例，
+  # 并与上面的 Binance Futures 共用同一个 arbitrage_group。
+  #
+  # 使用方式：
+  # 1. strategy.arbitrage_mode 改成 same_exchange_spot_perp
+  # 2. 打开下面的 binance_spot.enabled
+  # 3. 保持 binance.enabled=true，系统就会只配对 binance_spot + binance
+  binance_spot:
+    adapter_kind: "binance_spot"
+    venue_kind: "binance"
+    enabled: false
+    label: "Binance Spot"
+    arbitrage_group: "binance"
+    settle_asset: "USDT"
+    rest_base_url: "https://api.binance.com"
+    request_timeout: 10s
+    proxy:
+      enabled: false
+      url: "http://127.0.0.1:7890"
+    fees:
+      maker_bps: 1.0
+      taker_bps: 1.0
+    auth:
+      # 若同一个 Binance key 同时具备 spot/futures 权限，可以直接复用同一组环境变量。
+      api_key_env: "BINANCE_API_KEY"
+      api_secret_env: "BINANCE_API_SECRET"
+      # private_key_env: "BINANCE_RSA_PRIVATE_KEY"
+    adapter_options:
       # trade_auth_mode: "legacy_hmac"
       # trade_auth_mode: "rsa"
 

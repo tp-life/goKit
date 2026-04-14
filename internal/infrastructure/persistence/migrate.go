@@ -9,6 +9,7 @@ func AutoMigrate(client *db.Client) error {
 	return client.GetDB(nil).AutoMigrate(
 		&entity.Symbol{},
 		&entity.FundingSnapshot{},
+		&entity.FundingRateHistory{},
 		&entity.BookTopSnapshot{},
 		&entity.Opportunity{},
 		&entity.StrategyRun{},

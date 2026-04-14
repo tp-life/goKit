@@ -9,6 +9,7 @@ import (
 
 	"goKit/internal/application/service"
 	"goKit/internal/domain/entity"
+	"goKit/internal/infrastructure/exchange"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -52,11 +53,32 @@ var ui = styles{
 }
 
 func renderPanel(width int, height int, content string) string {
-	return ui.panel.Width(panelContentWidth(width)).Height(panelContentHeight(height)).Render(content)
+	contentHeight := panelContentHeight(height)
+	return ui.panel.Width(panelContentWidth(width)).Height(contentHeight).Render(clampRenderedContentHeight(content, contentHeight))
 }
 
 func renderModal(width int, height int, content string) string {
-	return ui.modal.Width(modalContentWidth(width)).Height(modalContentHeight(height)).Render(content)
+	contentHeight := modalContentHeight(height)
+	return ui.modal.Width(modalContentWidth(width)).Height(contentHeight).Render(clampRenderedContentHeight(content, contentHeight))
+}
+
+func clampRenderedContentHeight(content string, height int) string {
+	height = maxInt(1, height)
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return ""
+	}
+
+	lines := strings.Split(content, "\n")
+	if len(lines) <= height {
+		return strings.Join(lines, "\n")
+	}
+	lines = append([]string(nil), lines[:height]...)
+	if height > 0 {
+		lines[height-1] = ui.subtle.Render("...")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) View() string {
@@ -86,7 +108,7 @@ func (m Model) renderHeader(width int) string {
 	statusLine := strings.Join([]string{
 		m.chip("模式 "+m.interactionModeLabel(), m.interactionModeTone()),
 		m.chip("刷新 "+m.refreshInterval.String(), "accent"),
-		m.chip("排序 "+m.sort.String(), "accent"),
+		m.chip("排序 "+m.sortLabel(), "accent"),
 		m.chip("交易对 "+m.currentPairLabel(), "accent"),
 		m.chip("搜索 "+orDefault(strings.TrimSpace(m.search.Value()), "--"), "accent"),
 		m.chip("实盘 "+boolWord(m.data.System.Execution.LiveTradingEnabled), boolTone(m.data.System.Execution.LiveTradingEnabled, true)),
@@ -97,6 +119,7 @@ func (m Model) renderHeader(width int) string {
 		m.chip("最小收益 "+compactUSDT(strategy.MinNetPNL, 3), "good"),
 		m.chip("最大价差 "+compactBps(strategy.MaxSpreadBps, 2), "warn"),
 		m.chip("策略 "+strategyModeText(strategy.Mode), "accent"),
+		m.chip("套利 "+arbitrageModeText(strategy.ArbitrageMode), "accent"),
 		m.chip("持有模式 "+holdSelectionModeText(strategy.HoldSelectionMode), "accent"),
 		m.chip("提前开仓 "+orDefault(strategy.EntryLeadTime, "--"), "accent"),
 		m.chip("平仓缓冲 "+orDefault(exec.CloseGracePeriod, "--"), "accent"),
@@ -225,10 +248,18 @@ func (m Model) renderSystemBody(height int) string {
 }
 
 func (m Model) renderOpportunityList(width int, height int) string {
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangeOpportunityList(width, height)
+	}
+	return m.renderCrossExchangeOpportunityList(width, height)
+}
+
+func (m Model) renderCrossExchangeOpportunityList(width int, height int) string {
 	items := m.filteredOpportunities()
 	lines := []string{
-		ui.panelTitle.Render(fmt.Sprintf("Opportunities  %d visible / %d total", len(items), len(m.data.Opportunities))),
-		ui.subtle.Render(fmt.Sprintf("sorted by %s  |  j/k move  / search  f pair  s sort  o open  c close", m.sort.String())),
+		ui.panelTitle.Render(fmt.Sprintf("Opportunities [%s]  %d visible / %d total", arbitrageModeText(service.ArbitrageModeCrossExchange), len(items), len(m.data.Opportunities))),
+		ui.subtle.Render(fmt.Sprintf("sorted by %s  |  j/k move  / search  f pair  s sort  o open  c close", m.sortLabel())),
 		"",
 	}
 	if len(items) == 0 {
@@ -257,8 +288,8 @@ func (m Model) renderOpportunityList(width int, height int) string {
 		pnlText := alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 12)
 		carryText := alignRightValue(renderPctValue(displayedCarryRate(item, m.data.System.Strategy, entity.ExecutionPlan{}, false), 5), 10)
 		row := []string{
-			fmt.Sprintf("%s %-3d %-7s %-24s %s", marker, i+1, clip(item.Symbol, 7), clip(opportunityDirection(item), 24), pnlText),
-			fmt.Sprintf("     %-18s basis %-9s carry %s", clip(opportunityPair(item), 18), fmtSignedBps(item.BasisBps, 2), carryText),
+			fmt.Sprintf("%s %-3d %-7s %-24s %s", marker, i+1, clip(item.Symbol, 7), clip(opportunityDirectionDisplay(item, service.ArbitrageModeCrossExchange), 24), pnlText),
+			fmt.Sprintf("     %-22s 基差 %-9s carry %s", clip(opportunityPairDisplay(item, service.ArbitrageModeCrossExchange), 22), fmtSignedBps(item.BasisBps, 2), carryText),
 			fmt.Sprintf("     %-14s  |  %s  |  %s", clip(holdingDurationText(item), 14), planText, clip(statusText(item.Status), 16)),
 		}
 		block := strings.Join(row, "\n")
@@ -270,7 +301,98 @@ func (m Model) renderOpportunityList(width int, height int) string {
 	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
 
+func (m Model) renderSameExchangeOpportunityList(width int, height int) string {
+	items := m.filteredOpportunities()
+	const rowHeight = 5
+	lines := []string{
+		ui.panelTitle.Render(fmt.Sprintf("现货对冲机会  %d visible / %d total", len(items), len(m.data.Opportunities))),
+		ui.subtle.Render(fmt.Sprintf("sorted by %s  |  j/k move  / search  f pair  s sort  o open  c close", m.sortLabel())),
+		"",
+	}
+	if len(items) == 0 {
+		if m.isLoading(loadOpportunities) && len(m.data.Opportunities) == 0 {
+			lines = append(lines, ui.subtle.Render("正在加载同所现货 / 永续对冲机会..."))
+			return renderPanel(width, height, strings.Join(lines, "\n"))
+		}
+		lines = append(lines, ui.subtle.Render("当前筛选条件下没有同所现货 / 永续对冲机会。"))
+		return renderPanel(width, height, strings.Join(lines, "\n"))
+	}
+
+	visibleRows := maxInt(1, panelListContentHeight(height)/rowHeight)
+	selected := m.indexOfOpportunity(items, m.selectedOpportunityKey)
+	if selected < 0 {
+		selected = 0
+	}
+	start := clampOffset(m.opportunityOffset, len(items), visibleRows)
+	end := minInt(len(items), start+visibleRows)
+	lines = append(lines, ui.subtle.Render(fmt.Sprintf("showing %d-%d", start+1, end)), "")
+	for i := start; i < end; i++ {
+		item := items[i]
+		active := i == selected
+		planLabel, planTone := m.opportunityPlanLabel(item)
+		planText := toneStyle(planTone).Render(clip(planLabel, 18))
+		marker := selectedMarker(active)
+		fundingText := alignRightValue(renderPctValue(item.ShortFundingRate, 5), 10)
+		posText, negText, rankText := "--", "--", "--"
+		annualizedNetText, longHoldText := "--", "--"
+		plan := entity.ExecutionPlan{}
+		hasPlan := false
+		if matchedPlan, ok := m.bestPlanForOpportunity(item); ok {
+			plan = matchedPlan
+			hasPlan = true
+			if value := perpFundingHistoryPositivePlanText(plan); value != "" {
+				posText = value
+			}
+			if value := perpFundingHistoryNegativePlanText(plan); value != "" {
+				negText = value
+			}
+			if value := fundingRankPlanText(plan); value != "" {
+				rankText = value
+			}
+			if value := perpFundingAnnualizedNetPlanText(plan); value != "" {
+				annualizedNetText = value
+			}
+			if value := sameExchangeLongHoldPlanText(plan, m.data.System.Strategy); value != "" {
+				longHoldText = value
+			}
+		}
+		nextFundingGrossText := fmtMoney(sameExchangeNextFundingGrossPNL(item, plan, hasPlan, m.data.System.Strategy), 3)
+		windowFundingGrossText := fmtMoney(sameExchangeWindowGrossPNL(item), 3)
+		netText := fmtMoney(item.NetExpectedPNL, 3)
+		basisPaybackText := "--"
+		basisActionText := "--"
+		if _, _, _, paybackText, actionText, _, _ := sameExchangeBasisContext(nil, item, plan, hasPlan, m.data.System.Strategy); paybackText != "" || actionText != "" {
+			if strings.TrimSpace(paybackText) != "" {
+				basisPaybackText = paybackText
+			}
+			if strings.TrimSpace(actionText) != "" {
+				basisActionText = actionText
+			}
+		}
+		longHoldTone := toneStyle(sameExchangeLongHoldTone(longHoldText)).Render(clip(orDefault(longHoldText, "--"), 12))
+		basisActionTone := toneStyle(sameExchangeBasisActionTone(basisActionText)).Render(clip(orDefault(basisActionText, "--"), 16))
+		row := []string{
+			fmt.Sprintf("%s %-3d %-7s %-24s funding %s", marker, i+1, clip(item.Symbol, 7), clip(opportunityDirectionDisplay(item, service.ArbitrageModeSameExchangeSpotPerp), 24), fundingText),
+			fmt.Sprintf("     %-18s 单轮毛收 %-14s 主窗毛收 %-14s", clip(opportunityPairDisplay(item, service.ArbitrageModeSameExchangeSpotPerp), 18), clip(nextFundingGrossText, 14), clip(windowFundingGrossText, 14)),
+			fmt.Sprintf("     基差 %-10s 回本 %-10s 动作 %s", clip(fmtSignedBps(item.BasisBps, 2), 10), clip(orDefault(basisPaybackText, "--"), 10), basisActionTone),
+			fmt.Sprintf("     净收 %-14s 排名 %-10s 历史- %-12s 长持 %s", clip(netText, 14), clip(rankText, 10), clip(negText, 12), longHoldTone),
+			fmt.Sprintf("     粗年化净 %-10s 历史+ %-12s  |  %s  |  %s", clip(annualizedNetText, 10), clip(posText, 12), planText, clip(statusText(item.Status), 16)),
+		}
+		block := strings.Join(row, "\n")
+		if active {
+			block = ui.activeRow.Render(block)
+		}
+		lines = append(lines, block)
+	}
+	return renderPanel(width, height, strings.Join(lines, "\n"))
+}
+
 func (m Model) renderScannerDetail(width int, height int) string {
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	title := "套利详情"
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		title = "现货对冲详情"
+	}
 	tabs := []string{
 		m.renderTab("总览", m.tab == tabOverview),
 		m.renderTab("双腿", m.tab == tabLegs),
@@ -279,7 +401,7 @@ func (m Model) renderScannerDetail(width int, height int) string {
 		m.renderTab("订单", m.tab == tabOrders),
 	}
 	lines := []string{
-		ui.panelTitle.Render("套利详情"),
+		ui.panelTitle.Render(title),
 		strings.Join(tabs, " "),
 		"",
 	}
@@ -313,8 +435,12 @@ func (m Model) renderScannerDetail(width int, height int) string {
 }
 
 func (m Model) renderExecutionList(width int, height int) string {
-	title := fmt.Sprintf("执行  [%s]", m.execTab.String())
+	globalMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	title := fmt.Sprintf("执行  [%s | %s]", m.execTab.String(), arbitrageModeText(globalMode))
 	sub := "切换标签  p 计划  x 执行记录  o 开仓  c 平仓"
+	if isSameExchangeArbitrageMode(globalMode) {
+		sub = "切换标签  p 现货对冲计划  x 现货对冲执行记录  o 开仓  c 平仓"
+	}
 	lines := []string{ui.panelTitle.Render(title), ui.subtle.Render(sub), ""}
 
 	if m.execTab == execRecords {
@@ -336,16 +462,13 @@ func (m Model) renderExecutionList(width int, height int) string {
 		lines = append(lines, ui.subtle.Render(fmt.Sprintf("显示 %d-%d", start+1, end)), "")
 		for i := start; i < end; i++ {
 			item := m.data.Executions[i]
+			arbitrageMode := recordArbitrageMode(item, m.data.System.Strategy.ArbitrageMode)
 			marker := selectedMarker(i == selected)
 			allocatedText := "--"
 			if value := executionAllocatedNotional(item, entity.ExecutionPlan{}, false); value > 0 {
 				allocatedText = fmtMoney(value, 2)
 			}
-			block := strings.Join([]string{
-				fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), statusText(item.Status)),
-				fmt.Sprintf("    计划 %-28s 实盘 %-3s 自动平仓 %-3s", clip(item.PlanKey, 28), boolWord(item.LiveTrading), boolWord(item.AutoClose)),
-				fmt.Sprintf("    占用 %-14s 开仓 %s  平仓 %s", clip(allocatedText, 14), clip(fmtTime(item.OpenedAtMs), 19), clip(fmtTime(item.ClosedAtMs), 19)),
-			}, "\n")
+			block := m.renderExecutionRecordListBlock(item, arbitrageMode, marker, allocatedText)
 			if i == selected {
 				block = ui.activeRow.Render(block)
 			}
@@ -372,13 +495,9 @@ func (m Model) renderExecutionList(width int, height int) string {
 	lines = append(lines, ui.subtle.Render(fmt.Sprintf("显示 %d-%d", start+1, end)), "")
 	for i := start; i < end; i++ {
 		item := m.data.AllPlans[i]
+		arbitrageMode := planArbitrageMode(item, m.data.System.Strategy.ArbitrageMode)
 		marker := selectedMarker(i == selected)
-		pnlText := alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 10)
-		block := strings.Join([]string{
-			fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirection(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 25), pnlText),
-			fmt.Sprintf("    %-18s 就绪 %-3s 状态 %-18s", clip(opportunityPair(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}), 18), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
-			fmt.Sprintf("    计划 %-16s 名义 %-12s", clip(item.PlanKey, 16), clip(fmtMoney(targetNotional(item), 2), 12)),
-		}, "\n")
+		block := m.renderExecutionPlanListBlock(item, arbitrageMode, marker)
 		if i == selected {
 			block = ui.activeRow.Render(block)
 		}
@@ -388,9 +507,16 @@ func (m Model) renderExecutionList(width int, height int) string {
 }
 
 func (m Model) renderExecutionDetail(width int, height int) string {
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	title := "执行详情"
+	subtitle := "展示当前选中项的计划状态、执行记录与订单历史。"
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		title = "现货对冲执行详情"
+		subtitle = "展示当前选中项的现货腿、永续腿、执行状态与订单历史。"
+	}
 	lines := []string{
-		ui.panelTitle.Render("执行详情"),
-		ui.subtle.Render("展示当前选中项的计划状态、执行记录与订单历史。"),
+		ui.panelTitle.Render(title),
+		ui.subtle.Render(subtitle),
 		"",
 	}
 	var detail string
@@ -459,9 +585,10 @@ func (m Model) renderConfigPanel(width int, height int) string {
 		ui.panelTitle.Render("策略与执行配置"),
 		ui.subtle.Render("展示当前生效的策略参数和监控名单，用来确认系统处于观察模式还是实盘模式。"),
 		"",
-		fmt.Sprintf("策略: 启用=%s  模式=%s  持有上限=%sh  持有模式=%s  杠杆=%sx  最小净收益=%s  有效名义=%s",
+		fmt.Sprintf("策略: 启用=%s  模式=%s  套利=%s  持有上限=%sh  持有模式=%s  杠杆=%sx  最小净收益=%s  有效名义=%s",
 			boolWord(strategy.Enabled),
 			strategyModeText(strategy.Mode),
+			arbitrageModeText(strategy.ArbitrageMode),
 			fmtNumber(strategy.HoldHours, 1),
 			holdSelectionModeText(strategy.HoldSelectionMode),
 			fmtNumber(strategy.Leverage, 2),
@@ -490,6 +617,20 @@ func (m Model) renderConfigPanel(width int, height int) string {
 			renderLimitSuffix(exec.MaxLivePlans),
 			renderLoopLimit(exec.MaxAutoOpenPerLoop),
 		),
+	}
+	if isSameExchangeArbitrageMode(strategy.ArbitrageMode) {
+		lines = append(lines, fmt.Sprintf("同所开仓: 长持达标必需=%s  历史样本>=%d  同向支持>=%s  粗年化净收益>=%s",
+			boolWord(strategy.SameExchangeRequireLongHoldEligible),
+			strategy.SameExchangeMinHistorySampleCount,
+			fmtPctRatio(strategy.SameExchangeMinHistoricalSupportRatio, 1),
+			fmtPctRatio(strategy.SameExchangeMinAnnualizedNetRate, 1),
+		))
+		lines = append(lines, fmt.Sprintf("同所退出: funding转负即评估=%s  历史负费率阈值=%s  要求平仓盈利=%s  最低平仓盈利=%s",
+			boolWord(strategy.SameExchangeCloseOnNegativeFunding),
+			fmtPctRatio(strategy.SameExchangeHistoryNegativeExitThreshold, 1),
+			boolWord(strategy.SameExchangeExitRequirePositiveClosePNL),
+			fmtMoney(strategy.SameExchangeExitMinClosePNL, 3),
+		))
 	}
 	if isRollingStrategyMode(strategy.Mode) {
 		lines = append(lines,
@@ -630,18 +771,25 @@ func (m Model) renderLivePositionPanel(width int, height int) string {
 	_, end := visibleWindow(0, len(items), visibleRows)
 	for _, item := range items[:end] {
 		statusTone := livePositionStatusTone(item.SyncStatus)
+		arbitrageMode := recordArbitrageMode(item.Execution, m.data.System.Strategy.ArbitrageMode)
+		if item.Plan != nil {
+			arbitrageMode = planArbitrageMode(*item.Plan, arbitrageMode)
+		}
+		longLabel, shortLabel := livePositionLegLabels(arbitrageMode)
 		block := strings.Join([]string{
 			fmt.Sprintf("%-7s %-24s %s",
 				clip(item.Execution.Symbol, 7),
 				clip(item.Execution.PlanKey, 24),
 				toneStyle(statusTone).Render(livePositionStatusLabel(item.SyncStatus)),
 			),
-			fmt.Sprintf("    多 %-8s %-12s %s",
+			fmt.Sprintf("    %-4s %-8s %-12s %s",
+				clip(longLabel, 4),
 				clip(item.LongLeg.Exchange, 8),
 				clip(item.LongLeg.VenueSymbol, 12),
 				clip(renderLivePositionLegSummary(item.LongLeg), maxInt(10, width-30)),
 			),
-			fmt.Sprintf("    空 %-8s %-12s %s",
+			fmt.Sprintf("    %-4s %-8s %-12s %s",
+				clip(shortLabel, 4),
 				clip(item.ShortLeg.Exchange, 8),
 				clip(item.ShortLeg.VenueSymbol, 12),
 				clip(renderLivePositionLegSummary(item.ShortLeg), maxInt(10, width-30)),
@@ -654,6 +802,17 @@ func (m Model) renderLivePositionPanel(width int, height int) string {
 }
 
 func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	if hasPlan {
+		arbitrageMode = planArbitrageMode(plan, arbitrageMode)
+	}
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangeOverviewDetail(item, detail, hasDetail, loading, plan, hasPlan, rec, hasRec, width)
+	}
+	return m.renderCrossExchangeOverviewDetail(item, detail, hasDetail, loading, plan, hasPlan, rec, hasRec, width)
+}
+
+func (m Model) renderCrossExchangeOverviewDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	planLabel, _ := m.opportunityPlanLabel(item)
 	carrySource := any(item)
 	if hasDetail && detail != nil {
@@ -664,7 +823,7 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 	expectedCloseMs := opportunityExpectedCloseTimeMs(carrySource, m.data.System.Execution)
 	mode := opportunityStrategyMode(carrySource)
 	lines := []string{
-		fmt.Sprintf("%s  %s", ui.accent.Render(item.Symbol), ui.subtle.Render(opportunityDirection(item))),
+		fmt.Sprintf("%s  %s", ui.accent.Render(item.Symbol), ui.subtle.Render(opportunityDirectionDisplay(item, service.ArbitrageModeCrossExchange))),
 		strings.Join([]string{
 			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
 			renderField("净收益率", renderBpsValue(item.NetExpectedBps, 2)),
@@ -714,6 +873,9 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 		ui.panelTitle.Render("双腿信息"),
 		m.renderLegsDetail(item, detail, hasDetail, loading, width),
 		"",
+		ui.panelTitle.Render("历史资金费率明细"),
+		m.renderCrossExchangeFundingHistoryDetail(detail, loading, width),
+		"",
 		ui.panelTitle.Render("收益构成"),
 		m.renderPnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width),
 		"",
@@ -723,7 +885,162 @@ func (m Model) renderOverviewDetail(item OpportunityListItem, detail *entity.Opp
 	return strings.Join(lines, "\n")
 }
 
+func (m Model) renderSameExchangeOverviewDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, plan entity.ExecutionPlan, hasPlan bool, rec entity.ExecutionRecord, hasRec bool, width int) string {
+	planLabel, _ := m.opportunityPlanLabel(item)
+	carrySource := any(item)
+	if hasDetail && detail != nil {
+		carrySource = *detail
+	}
+	displayCarryRate := displayedCarryRate(carrySource, m.data.System.Strategy, plan, hasPlan)
+	displayHourlyCarry := fundingSpreadHourly(carrySource)
+	expectedCloseMs := opportunityExpectedCloseTimeMs(carrySource, m.data.System.Execution)
+	mode := opportunityStrategyMode(carrySource)
+	currentFundingRate := sameExchangeCurrentFundingRate(carrySource)
+	rankText, positiveText, negativeText, percentileText := sameExchangeFundingContext(detail, plan, hasPlan)
+	sampleText := sameExchangeFundingSampleText(detail, plan, hasPlan, loading)
+	historyMeanText, supportText, annualizedCarryText, annualizedNetText, longHoldText, longHoldReasonText := sameExchangeLongHoldContext(detail, plan, hasPlan, m.data.System.Strategy)
+	eventRateText, suggestedEventsText, suggestedHoldText, suggestedGrossText, suggestedNetText, holdEstimateSourceText := sameExchangeLongHoldRecommendationContext(detail, plan, hasPlan)
+	basisModeText, basisCostText, basisCarryText, basisPaybackText, basisActionText, basisReasonText, basisThresholdText := sameExchangeBasisContext(detail, item, plan, hasPlan, m.data.System.Strategy)
+	nextFundingGrossPNL := sameExchangeNextFundingGrossPNL(carrySource, plan, hasPlan, m.data.System.Strategy)
+	windowFundingGrossPNL := sameExchangeWindowGrossPNL(carrySource)
+	totalFrictionPNL := sameExchangeTotalFrictionPNL(carrySource)
+	liveRisk := service.SameExchangeLiveRiskInspection{}
+	if hasPlan {
+		if positionItem, ok := m.livePositionByPlanKey(plan.PlanKey); ok {
+			liveRisk = positionItem.Risk
+		}
+	}
+	lines := []string{
+		fmt.Sprintf("%s  %s", ui.accent.Render(item.Symbol), ui.subtle.Render("同所现货多 / 永续空")),
+		ui.panelTitle.Render("选标视角"),
+		strings.Join([]string{
+			renderField("当前永续 funding", renderPctValue(currentFundingRate, 5)),
+			renderField("单轮 funding 毛收益", renderMoneyValue(nextFundingGrossPNL, 3)),
+			renderField("主窗口 funding 收益", renderMoneyValue(windowFundingGrossPNL, 3)),
+			renderField("永续横向排名", toneStyle("accent").Render(orDefault(rankText, "--"))),
+			renderField("现货-永续基差", renderBasisValue(item.BasisBps, item.MaxAllowedBasisBps)),
+			renderField("基差回本", toneStyle("accent").Render(orDefault(basisPaybackText, "--"))),
+		}, "  "),
+		ui.panelTitle.Render("执行视角"),
+		strings.Join([]string{
+			renderField("预计净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
+			renderField("净收益率", renderBpsValue(item.NetExpectedBps, 2)),
+			renderField("当前时均边际", renderPctValue(displayHourlyCarry, 5)),
+			renderField("当前 Carry率", renderPctValue(displayCarryRate, 5)),
+			renderField("总摩擦成本", renderCostSignedValue(totalFrictionPNL, 3)),
+		}, "  "),
+		ui.panelTitle.Render("风险视角"),
+	}
+	lines = append(lines, renderSameExchangeRiskSummary(m.data.System.Strategy, detail, item, plan, hasPlan, liveRisk)...)
+	lines = append(lines,
+		ui.panelTitle.Render("基差视角"),
+		strings.Join([]string{
+			renderField("模型", toneStyle("accent").Render(orDefault(basisModeText, "--"))),
+			renderField("阈值", toneStyle("accent").Render(orDefault(basisThresholdText, "--"))),
+			renderField("基差成本", toneStyle("accent").Render(orDefault(basisCostText, "--"))),
+			renderField("每轮 funding", toneStyle("accent").Render(orDefault(basisCarryText, "--"))),
+			renderField("回本轮数", toneStyle("accent").Render(orDefault(basisPaybackText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("处理动作", toneStyle(sameExchangeBasisActionTone(basisActionText)).Render(orDefault(basisActionText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(basisReasonText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("现货腿", toneStyle("accent").Render(item.LongExchange+" 做多")),
+			renderField("永续腿", toneStyle("accent").Render(item.ShortExchange+" 做空")),
+			renderField("历史正费率", toneStyle("accent").Render(orDefault(positiveText, "--"))),
+			renderField("历史负费率", toneStyle("accent").Render(orDefault(negativeText, "--"))),
+			renderField("历史分位", toneStyle("accent").Render(orDefault(percentileText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("状态", renderStatusValue(item.Status)),
+			renderField("可执行", renderBoolValue(item.EligibleForExecution, false)),
+			renderField("计划", toneStyle(opportunityPlanTone(planLabel)).Render(planLabel)),
+			renderField("当前 funding 窗口", toneStyle("accent").Render(holdingDurationText(item))),
+			renderField("主窗净边际", renderPctValue(displayCarryRate, 5)),
+		}, "  "),
+		"",
+		ui.panelTitle.Render("历史资金费率画像"),
+		strings.Join([]string{
+			renderField("历史样本", toneStyle("accent").Render(sampleText)),
+			renderField("历史正费率占比", toneStyle("accent").Render(orDefault(positiveText, "--"))),
+			renderField("历史负费率占比", toneStyle("accent").Render(orDefault(negativeText, "--"))),
+			renderField("当前费率历史分位", toneStyle("accent").Render(orDefault(percentileText, "--"))),
+		}, "  "),
+		"",
+		ui.panelTitle.Render("历史资金费率明细"),
+		m.renderSameExchangeFundingHistoryDetail(detail, loading, width),
+		"",
+		ui.panelTitle.Render("长期持有评估"),
+		strings.Join([]string{
+			renderField("历史均值 funding", toneStyle("accent").Render(orDefault(historyMeanText, "--"))),
+			renderField("同向历史支持", toneStyle("accent").Render(orDefault(supportText, "--"))),
+			renderField("粗略年化毛收益", toneStyle("accent").Render(orDefault(annualizedCarryText, "--"))),
+			renderField("粗略年化净收益", toneStyle("accent").Render(orDefault(annualizedNetText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("长持判定", toneStyle(sameExchangeLongHoldTone(longHoldText)).Render(orDefault(longHoldText, "--"))),
+			renderField("判定原因", toneStyle("accent").Render(orDefault(longHoldReasonText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("历史预估单轮", toneStyle("accent").Render(orDefault(eventRateText, "--"))),
+			renderField("建议持有", toneStyle("accent").Render(orDefault(suggestedEventsText, "--"))),
+			renderField("建议时长", toneStyle("accent").Render(orDefault(suggestedHoldText, "--"))),
+			renderField("历史预估毛收益", toneStyle("accent").Render(orDefault(suggestedGrossText, "--"))),
+			renderField("历史预估净收益", toneStyle("accent").Render(orDefault(suggestedNetText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("下次永续 funding", renderTimeValue(item.ShortFundingTimeMs, "accent")),
+			renderField("当前 Entry Path 终点", renderTimeValue(item.ProjectedFundingTimeMs, "accent")),
+			renderField("预计离场", renderTimeValue(expectedCloseMs, "accent")),
+			renderField("预计总持有", toneStyle("accent").Render(opportunityExpectedHoldText(carrySource, m.data.System.Execution))),
+			renderField("持有逻辑", toneStyle("accent").Render(sameExchangeHoldLogicText(m.data.System.Strategy))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("离场守则", toneStyle("accent").Render(sameExchangeExitRuleText(m.data.System.Strategy))),
+			renderField("收益口径", toneStyle("accent").Render(orDefault(holdEstimateSourceText, "当前窗口预估"))),
+			renderField("批次", toneStyle("accent").Render(orDefault(item.BatchID, "--"))),
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(mode))),
+			renderField("资金费模式", toneStyle("accent").Render(orDefault(item.FundingComputationMode, "--"))),
+		}, "  "),
+	)
+	if isRollingStrategyMode(mode) {
+		lines = append(lines, strings.Join([]string{
+			renderField("下次 Review", renderTimeValue(opportunityNextReviewTimeMs(carrySource), "accent")),
+			renderField("当前共享结算边界", renderTimeValue(opportunitySyncBoundaryTimeMs(carrySource), "accent")),
+			renderField("当前 Entry Path 段数", toneStyle("accent").Render(fmt.Sprintf("%d 段", opportunityEntryPathSegmentCount(carrySource)))),
+			renderField("Entry Path 截止原因", toneStyle("accent").Render(entryPathStopReasonText(opportunityEntryPathStopReason(carrySource)))),
+		}, "  "))
+	}
+	lines = append(lines,
+		"",
+		ui.panelTitle.Render("现货 / 永续快照"),
+		renderMarketSummary(m.data.Market, width),
+		"",
+		ui.panelTitle.Render("对冲结构"),
+		m.renderLegsDetail(item, detail, hasDetail, loading, width),
+		"",
+		ui.panelTitle.Render("收益拆解"),
+		m.renderPnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width),
+		"",
+		ui.panelTitle.Render("执行计划"),
+		m.renderPlanDetail(item, plan, hasPlan, rec, hasRec, width),
+	)
+	return strings.Join(lines, "\n")
+}
+
 func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, plan entity.ExecutionPlan, hasPlan bool, width int) string {
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	if hasPlan {
+		arbitrageMode = planArbitrageMode(plan, arbitrageMode)
+	}
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangePnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width)
+	}
+	return m.renderCrossExchangePnLBreakdownDetail(item, detail, hasDetail, plan, hasPlan, width)
+}
+
+func (m Model) renderCrossExchangePnLBreakdownDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, plan entity.ExecutionPlan, hasPlan bool, width int) string {
 	carrySource := any(item)
 	if hasDetail && detail != nil {
 		carrySource = *detail
@@ -733,6 +1050,7 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 	currentLongEvents, currentShortEvents := displayedFundingEventCounts(carrySource)
 	notional := opportunityTargetNotional(carryRate, item.GrossFundingPNL, plan, hasPlan, m.data.System.Strategy)
 	strategy := m.data.System.Strategy
+	formulaText := "公式: 净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲"
 
 	lines := []string{
 		clip(strings.Join([]string{
@@ -741,7 +1059,7 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 			renderField("当前时均边际", renderPctValue(hourlyEdge, 5)),
 			renderField("当前事件数", toneStyle("accent").Render(fmt.Sprintf("多头 %d / 空头 %d", currentLongEvents, currentShortEvents))),
 		}, "  "), width),
-		clip(toneStyle("subtle").Render("公式: 净收益 = 资金收益 - 入场手续费 - 出场手续费 - 滑点 - 安全缓冲"), width),
+		clip(toneStyle("subtle").Render(formulaText), width),
 		clip(strings.Join([]string{
 			toneStyle("subtle").Render("代入:"),
 			renderMoneyValue(item.NetExpectedPNL, 3),
@@ -787,7 +1105,110 @@ func (m Model) renderPnLBreakdownDetail(item OpportunityListItem, detail *entity
 }
 
 func (m Model) renderLegsDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, width int) string {
-	lines := []string{renderLegsCompareTable(item, width), ""}
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangeLegsDetail(item, detail, hasDetail, loading, width)
+	}
+	return m.renderCrossExchangeLegsDetail(item, detail, hasDetail, loading, width)
+}
+
+func (m Model) renderSameExchangePnLBreakdownDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, plan entity.ExecutionPlan, hasPlan bool, width int) string {
+	carrySource := any(item)
+	if hasDetail && detail != nil {
+		carrySource = *detail
+	}
+	carryRate := displayedCarryRate(carrySource, m.data.System.Strategy, plan, hasPlan)
+	hourlyEdge := fundingSpreadHourly(carrySource)
+	currentFundingRate := sameExchangeCurrentFundingRate(carrySource)
+	windowFundingGrossPNL := sameExchangeWindowGrossPNL(carrySource)
+	notional := opportunityTargetNotional(carryRate, windowFundingGrossPNL, plan, hasPlan, m.data.System.Strategy)
+	strategy := m.data.System.Strategy
+	rankText, positiveText, negativeText, percentileText := sameExchangeFundingContext(detail, plan, hasPlan)
+	historyMeanText, supportText, annualizedCarryText, annualizedNetText, longHoldText, longHoldReasonText := sameExchangeLongHoldContext(detail, plan, hasPlan, strategy)
+	eventRateText, suggestedEventsText, suggestedHoldText, suggestedGrossText, suggestedNetText, holdEstimateSourceText := sameExchangeLongHoldRecommendationContext(detail, plan, hasPlan)
+	basisModeText, basisCostText, basisCarryText, basisPaybackText, basisActionText, basisReasonText, basisThresholdText := sameExchangeBasisContext(detail, item, plan, hasPlan, strategy)
+	nextFundingGrossPNL := sameExchangeNextFundingGrossPNL(carrySource, plan, hasPlan, strategy)
+	lines := []string{
+		clip(strings.Join([]string{
+			renderField("估算名义", renderUSDTValue(notional, 2)),
+			renderField("当前永续 funding", renderPctValue(currentFundingRate, 5)),
+			renderField("单轮 funding 毛收益", renderMoneyValue(nextFundingGrossPNL, 3)),
+			renderField("主窗口 funding 收益", renderMoneyValue(windowFundingGrossPNL, 3)),
+			renderField("当前时均边际", renderPctValue(hourlyEdge, 5)),
+			renderField("现货-永续基差", renderBasisValue(item.BasisBps, item.MaxAllowedBasisBps)),
+		}, "  "), width),
+		clip(toneStyle("subtle").Render("公式: 净收益 = 永续 funding 收益 - 现货/永续手续费 - 滑点 - 安全缓冲"), width),
+		clip(strings.Join([]string{
+			toneStyle("subtle").Render("代入:"),
+			renderMoneyValue(item.NetExpectedPNL, 3),
+			toneStyle("subtle").Render("="),
+			renderMoneyValue(windowFundingGrossPNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.EntryFeePNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.ExitFeePNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.SlippagePNL, 3),
+			toneStyle("subtle").Render("-"),
+			renderCostAbsValue(item.SafetyBufferPNL, 3),
+		}, " "), width),
+		clip(strings.Join([]string{
+			renderField("主窗口 funding 收益", renderMoneyValue(windowFundingGrossPNL, 3)),
+			renderField("计算", toneStyle("accent").Render(notionalFormulaText(notional, carryRate))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("入场手续费", renderCostSignedValue(item.EntryFeePNL, 3)),
+			renderField("出场手续费", renderCostSignedValue(item.ExitFeePNL, 3)),
+			renderField("滑点预估", renderCostSignedValue(item.SlippagePNL, 3)),
+			renderField("安全缓冲", renderCostSignedValue(item.SafetyBufferPNL, 3)),
+			renderField("净收益", renderMoneyValue(item.NetExpectedPNL, 3)),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("永续横向排名", toneStyle("accent").Render(orDefault(rankText, "--"))),
+			renderField("历史正费率", toneStyle("accent").Render(orDefault(positiveText, "--"))),
+			renderField("历史负费率", toneStyle("accent").Render(orDefault(negativeText, "--"))),
+			renderField("历史分位", toneStyle("accent").Render(orDefault(percentileText, "--"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("历史均值 funding", toneStyle("accent").Render(orDefault(historyMeanText, "--"))),
+			renderField("同向历史支持", toneStyle("accent").Render(orDefault(supportText, "--"))),
+			renderField("粗年化毛收益", toneStyle("accent").Render(orDefault(annualizedCarryText, "--"))),
+			renderField("粗年化净收益", toneStyle("accent").Render(orDefault(annualizedNetText, "--"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("长持判定", toneStyle(sameExchangeLongHoldTone(longHoldText)).Render(orDefault(longHoldText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(longHoldReasonText, "--"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("历史预估单轮", toneStyle("accent").Render(orDefault(eventRateText, "--"))),
+			renderField("建议持有", toneStyle("accent").Render(orDefault(suggestedEventsText, "--"))),
+			renderField("建议时长", toneStyle("accent").Render(orDefault(suggestedHoldText, "--"))),
+			renderField("历史预估毛收益", toneStyle("accent").Render(orDefault(suggestedGrossText, "--"))),
+			renderField("历史预估净收益", toneStyle("accent").Render(orDefault(suggestedNetText, "--"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("离场守则", toneStyle("accent").Render(sameExchangeExitRuleText(strategy))),
+			renderField("手续费模式", toneStyle("accent").Render(feeModeLabel(strategy.EntryMode)+" / "+feeModeLabel(strategy.ExitMode))),
+			renderField("收益口径", toneStyle("accent").Render(orDefault(holdEstimateSourceText, "当前窗口预估"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("基差模型", toneStyle("accent").Render(orDefault(basisModeText, "--"))),
+			renderField("阈值", toneStyle("accent").Render(orDefault(basisThresholdText, "--"))),
+			renderField("基差成本", toneStyle("accent").Render(orDefault(basisCostText, "--"))),
+			renderField("每轮 funding", toneStyle("accent").Render(orDefault(basisCarryText, "--"))),
+			renderField("回本轮数", toneStyle("accent").Render(orDefault(basisPaybackText, "--"))),
+		}, "  "), width),
+		clip(strings.Join([]string{
+			renderField("处理动作", toneStyle(sameExchangeBasisActionTone(basisActionText)).Render(orDefault(basisActionText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(basisReasonText, "--"))),
+		}, "  "), width),
+		clip(toneStyle("subtle").Render("说明: 同所模式优先看永续 funding 的横向高位、历史回落概率，以及扣除手续费和滑点后的净收益空间。"), width),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderCrossExchangeLegsDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, width int) string {
+	lines := []string{renderLegsCompareTable(item, width, service.ArbitrageModeCrossExchange), ""}
 	switch {
 	case hasDetail:
 		lines = append(lines,
@@ -802,7 +1223,64 @@ func (m Model) renderLegsDetail(item OpportunityListItem, detail *entity.Opportu
 	return strings.Join(lines, "\n")
 }
 
-func renderLegsCompareTable(item OpportunityListItem, width int) string {
+func (m Model) renderSameExchangeLegsDetail(item OpportunityListItem, detail *entity.Opportunity, hasDetail bool, loading bool, width int) string {
+	plan, hasPlan := m.bestPlanForOpportunity(item)
+	rankText, positiveText, negativeText, percentileText := sameExchangeFundingContext(detail, plan, hasPlan)
+	historyMeanText, supportText, annualizedCarryText, annualizedNetText, longHoldText, longHoldReasonText := sameExchangeLongHoldContext(detail, plan, hasPlan, m.data.System.Strategy)
+	eventRateText, suggestedEventsText, suggestedHoldText, _, suggestedNetText, holdEstimateSourceText := sameExchangeLongHoldRecommendationContext(detail, plan, hasPlan)
+	lines := []string{
+		strings.Join([]string{
+			renderField("现货腿", toneStyle("good").Render(item.LongExchange+" "+orDefault(item.LongVenueSymbol, "--"))),
+			renderField("方向", toneStyle("accent").Render("BUY")),
+			renderField("买一 / 卖一", toneStyle("accent").Render(priceText(item.LongBidPrice)+" / "+priceText(item.LongAskPrice))),
+			renderField("标记价", toneStyle("accent").Render(priceText(item.LongMarkPrice))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("永续腿", toneStyle("warn").Render(item.ShortExchange+" "+orDefault(item.ShortVenueSymbol, "--"))),
+			renderField("方向", toneStyle("accent").Render("SELL")),
+			renderField("当前 funding", renderPctValue(item.ShortFundingRate, 5)),
+			renderField("下一事件预测", renderPctValue(item.ShortFutureFundingRate, 5)),
+			renderField("下次 funding", renderTimeValue(item.ShortFundingTimeMs, "accent")),
+		}, "  "),
+		strings.Join([]string{
+			renderField("永续横向排名", toneStyle("accent").Render(orDefault(rankText, "--"))),
+			renderField("历史正费率", toneStyle("accent").Render(orDefault(positiveText, "--"))),
+			renderField("历史负费率", toneStyle("accent").Render(orDefault(negativeText, "--"))),
+			renderField("历史分位", toneStyle("accent").Render(orDefault(percentileText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("历史均值 funding", toneStyle("accent").Render(orDefault(historyMeanText, "--"))),
+			renderField("同向历史支持", toneStyle("accent").Render(orDefault(supportText, "--"))),
+			renderField("粗年化毛收益", toneStyle("accent").Render(orDefault(annualizedCarryText, "--"))),
+			renderField("粗年化净收益", toneStyle("accent").Render(orDefault(annualizedNetText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("长持判定", toneStyle(sameExchangeLongHoldTone(longHoldText)).Render(orDefault(longHoldText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(longHoldReasonText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("历史预估单轮", toneStyle("accent").Render(orDefault(eventRateText, "--"))),
+			renderField("建议持有", toneStyle("accent").Render(orDefault(suggestedEventsText, "--"))),
+			renderField("建议时长", toneStyle("accent").Render(orDefault(suggestedHoldText, "--"))),
+			renderField("历史预估净收益", toneStyle("accent").Render(orDefault(suggestedNetText, "--"))),
+			renderField("收益口径", toneStyle("accent").Render(orDefault(holdEstimateSourceText, "当前窗口预估"))),
+		}, "  "),
+	}
+	switch {
+	case hasDetail && detail != nil:
+		lines = append(lines,
+			fmt.Sprintf("%s: %s", ui.subtle.Render("现货腿规则"), toneStyle("accent").Render(clip(ruleSummary(detail.LongFundingRule), width))),
+			fmt.Sprintf("%s: %s", ui.subtle.Render("永续腿规则"), toneStyle("accent").Render(clip(ruleSummary(detail.ShortFundingRule), width))),
+		)
+	case loading:
+		lines = append(lines, ui.subtle.Render("正在加载现货 / 永续 funding 详情..."))
+	default:
+		lines = append(lines, ui.subtle.Render("当前还没有更细的现货 / 永续 funding 规则详情。"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderLegsCompareTable(item OpportunityListItem, width int, arbitrageMode string) string {
 	tableWidth := maxInt(48, width)
 	metricWidth := 10
 	available := tableWidth - metricWidth - 6
@@ -811,12 +1289,18 @@ func renderLegsCompareTable(item OpportunityListItem, width int) string {
 	}
 	longWidth := available / 2
 	shortWidth := available - longWidth
+	longTitle := "做多腿"
+	shortTitle := "做空腿"
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		longTitle = "现货多头腿"
+		shortTitle = "永续空头腿"
+	}
 
 	lines := []string{
 		fmt.Sprintf("%s | %s | %s",
 			ui.subtle.Render(padTablePlain("指标", metricWidth, lipgloss.Left)),
-			ui.good.Render(padTablePlain("做多腿", longWidth, lipgloss.Left)),
-			ui.warn.Render(padTablePlain("做空腿", shortWidth, lipgloss.Left)),
+			ui.good.Render(padTablePlain(longTitle, longWidth, lipgloss.Left)),
+			ui.warn.Render(padTablePlain(shortTitle, shortWidth, lipgloss.Left)),
 		),
 		fmt.Sprintf("%s-+-%s-+-%s",
 			strings.Repeat("-", metricWidth),
@@ -849,6 +1333,14 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 			}, "  "),
 		}, "\n")
 	}
+	arbitrageMode := planArbitrageMode(plan, m.data.System.Strategy.ArbitrageMode)
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangePlanDetail(item, plan, rec, hasRec, width)
+	}
+	return m.renderCrossExchangePlanDetail(item, plan, rec, hasRec, width)
+}
+
+func (m Model) renderCrossExchangePlanDetail(_ OpportunityListItem, plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	lines := []string{
 		renderField("计划", toneStyle("accent").Render(plan.PlanKey)),
 		strings.Join([]string{
@@ -912,6 +1404,126 @@ func (m Model) renderPlanDetail(item OpportunityListItem, plan entity.ExecutionP
 			lines = append(lines, strings.Join([]string{
 				renderField("前驱计划", toneStyle("accent").Render(orDefault(rec.PredecessorPlanKey, "--"))),
 				renderField("后继计划", toneStyle("accent").Render(orDefault(rec.SuccessorPlanKey, "--"))),
+			}, "  "))
+			if strings.TrimSpace(rec.LastReviewReason) != "" {
+				lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
+			}
+		}
+		if strings.TrimSpace(rec.LastError) != "" {
+			lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSameExchangePlanDetail(_ OpportunityListItem, plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
+	longHoldText := sameExchangeLongHoldPlanText(plan, m.data.System.Strategy)
+	longHoldReasonText := sameExchangeLongHoldReasonPlanText(plan, m.data.System.Strategy)
+	eventRateText := perpFundingEstimatedEventRatePlanText(plan)
+	suggestedEventsText := perpFundingSuggestedHoldEventsPlanText(plan)
+	suggestedHoldText := perpFundingSuggestedHoldDurationPlanText(plan)
+	suggestedGrossText := perpFundingSuggestedGrossPNLPlanText(plan)
+	suggestedNetText := perpFundingSuggestedNetPNLPlanText(plan)
+	holdEstimateSourceText := sameExchangeLongHoldEstimateSourceText(nil, plan, true)
+	basisModeText, basisCostText, basisCarryText, basisPaybackText, basisActionText, basisReasonText, basisThresholdText := sameExchangeBasisContext(nil, OpportunityListItem{}, plan, true, m.data.System.Strategy)
+	liveRisk := service.SameExchangeLiveRiskInspection{}
+	if positionItem, ok := m.livePositionByPlanKey(plan.PlanKey); ok {
+		liveRisk = positionItem.Risk
+	}
+	lines := []string{
+		renderField("计划", toneStyle("accent").Render(plan.PlanKey)),
+		strings.Join([]string{
+			renderField("状态", renderStatusValue(plan.Status)),
+			renderField("就绪", renderBoolValue(plan.ReadyNow, false)),
+			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("评分", toneStyle("accent").Render(fmtNumber(plan.Score, 2))),
+			renderField("模式", toneStyle("accent").Render(arbitrageModeText(planArbitrageMode(plan, service.ArbitrageModeSameExchangeSpotPerp)))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("现货腿", toneStyle("good").Render(plan.LongExchange+" "+orDefault(plan.LongVenueSymbol, "--"))),
+			renderField("永续腿", toneStyle("warn").Render(plan.ShortExchange+" "+orDefault(plan.ShortVenueSymbol, "--"))),
+			renderField("现货数量", toneStyle("accent").Render(fmtNumber(plan.LongQty, 6))),
+			renderField("永续数量", toneStyle("accent").Render(fmtNumber(plan.ShortQty, 6))),
+			renderField("仓位偏斜", renderBpsValue(planPositionSkewBps(plan), 2)),
+		}, "  "),
+		strings.Join([]string{
+			renderField("分配资金", renderMoneyValue(plan.CapitalAllocatedUSDT, 2)),
+			renderField("目标名义", renderMoneyValue(plan.TargetNotionalUSDT, 2)),
+			renderField("取整名义", renderMoneyValue(plan.RoundedNotionalUSDT, 2)),
+			renderField("现货价格", toneStyle("accent").Render(priceText(plan.LongEntryPrice))),
+			renderField("永续价格", toneStyle("accent").Render(priceText(plan.ShortEntryPrice))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("永续横向排名", toneStyle("accent").Render(orDefault(fundingRankPlanText(plan), "--"))),
+			renderField("历史正费率", toneStyle("accent").Render(orDefault(perpFundingHistoryPositivePlanText(plan), "--"))),
+			renderField("历史负费率", toneStyle("accent").Render(orDefault(perpFundingHistoryNegativePlanText(plan), "--"))),
+			renderField("历史分位", toneStyle("accent").Render(orDefault(perpFundingHistoricalPercentilePlanText(plan), "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("历史均值 funding", toneStyle("accent").Render(orDefault(perpFundingHistoryMeanPlanText(plan), "--"))),
+			renderField("同向历史支持", toneStyle("accent").Render(orDefault(perpFundingSupportPlanText(plan), "--"))),
+			renderField("粗年化毛收益", toneStyle("accent").Render(orDefault(perpFundingAnnualizedCarryPlanText(plan), "--"))),
+			renderField("粗年化净收益", toneStyle("accent").Render(orDefault(perpFundingAnnualizedNetPlanText(plan), "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("长持判定", toneStyle(sameExchangeLongHoldTone(longHoldText)).Render(orDefault(longHoldText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(longHoldReasonText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("历史预估单轮", toneStyle("accent").Render(orDefault(eventRateText, "--"))),
+			renderField("建议持有", toneStyle("accent").Render(orDefault(suggestedEventsText, "--"))),
+			renderField("建议时长", toneStyle("accent").Render(orDefault(suggestedHoldText, "--"))),
+			renderField("历史预估毛收益", toneStyle("accent").Render(orDefault(suggestedGrossText, "--"))),
+			renderField("历史预估净收益", toneStyle("accent").Render(orDefault(suggestedNetText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("持有逻辑", toneStyle("accent").Render(sameExchangeHoldLogicText(m.data.System.Strategy))),
+			renderField("计划持仓", toneStyle("accent").Render(planExpectedHoldText(plan))),
+			renderField("当前 Entry Path 终点", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
+			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+			renderField("入场截止", renderTimeValue(plan.EntryWindowCloseMs, "accent")),
+		}, "  "),
+		strings.Join([]string{
+			renderField("现货-永续基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
+			renderField("基差模型", toneStyle("accent").Render(orDefault(basisModeText, "--"))),
+			renderField("回本轮数", toneStyle("accent").Render(orDefault(basisPaybackText, "--"))),
+			renderField("基差成本", toneStyle("accent").Render(orDefault(basisCostText, "--"))),
+			renderField("每轮 funding", toneStyle("accent").Render(orDefault(basisCarryText, "--"))),
+			renderField("基差动作", toneStyle(sameExchangeBasisActionTone(basisActionText)).Render(orDefault(basisActionText, "--"))),
+		}, "  "),
+		ui.panelTitle.Render("风险视角"),
+		strings.Join([]string{
+			renderField("基差阈值", toneStyle("accent").Render(orDefault(basisThresholdText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(basisReasonText, "--"))),
+			renderField("离场守则", toneStyle("accent").Render(sameExchangeExitRuleText(m.data.System.Strategy))),
+			renderField("收益口径", toneStyle("accent").Render(orDefault(holdEstimateSourceText, "当前窗口预估"))),
+		}, "  "),
+	}
+	lines = append(lines, renderSameExchangeRiskSummary(m.data.System.Strategy, nil, OpportunityListItem{}, plan, true, liveRisk)...)
+	if isRollingStrategyMode(plan.StrategyMode) {
+		lines = append(lines, strings.Join([]string{
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(plan.StrategyMode))),
+			renderField("下次 Review", renderTimeValue(plan.NextReviewTimeMs, "accent")),
+			renderField("当前共享结算边界", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
+			renderField("当前 Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
+		}, "  "))
+	}
+	if hasRec {
+		lines = append(lines,
+			strings.Join([]string{
+				renderField("执行记录", renderStatusValue(rec.Status)),
+				renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+				renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
+				renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
+				renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
+			}, "  "),
+		)
+		if isRollingStrategyMode(rec.StrategyMode) || isRollingStrategyMode(plan.StrategyMode) {
+			lines = append(lines, strings.Join([]string{
+				renderField("Review 次数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.ReviewCount))),
+				renderField("最近 Review", renderTimeValue(rec.LastReviewAtMs, "accent")),
+				renderField("下次 Review", renderTimeValue(rec.NextReviewTimeMs, "accent")),
+				renderField("当前 Boundary", renderTimeValue(rec.CurrentSyncBoundaryMs, "accent")),
 			}, "  "))
 			if strings.TrimSpace(rec.LastReviewReason) != "" {
 				lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
@@ -994,12 +1606,20 @@ func (m Model) renderOrdersDetail(planKey string, width int) string {
 }
 
 func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
+	arbitrageMode := planArbitrageMode(plan, m.data.System.Strategy.ArbitrageMode)
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangePlanExecutionDetail(plan, rec, hasRec, width)
+	}
+	return m.renderCrossExchangePlanExecutionDetail(plan, rec, hasRec, width)
+}
+
+func (m Model) renderCrossExchangePlanExecutionDetail(plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
 	targetCloseMs := plan.TargetCloseTimeMs
 	if hasRec && rec.TargetCloseTimeMs > 0 {
 		targetCloseMs = rec.TargetCloseTimeMs
 	}
 	lines := []string{
-		fmt.Sprintf("%s  %s", ui.accent.Render(plan.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: plan.LongExchange, ShortExchange: plan.ShortExchange}))),
+		fmt.Sprintf("%s  %s", ui.accent.Render(plan.Symbol), ui.subtle.Render(opportunityDirectionDisplay(entity.Opportunity{LongExchange: plan.LongExchange, ShortExchange: plan.ShortExchange}, service.ArbitrageModeCrossExchange))),
 		strings.Join([]string{
 			renderField("计划", toneStyle("accent").Render(plan.PlanKey)),
 			renderField("就绪", renderBoolValue(plan.ReadyNow, false)),
@@ -1085,12 +1705,145 @@ func (m Model) renderPlanExecutionDetail(plan entity.ExecutionPlan, rec entity.E
 }
 
 func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool, width int) string {
+	arbitrageMode := recordArbitrageMode(rec, m.data.System.Strategy.ArbitrageMode)
+	if hasPlan {
+		arbitrageMode = planArbitrageMode(plan, arbitrageMode)
+	}
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return m.renderSameExchangeExecutionRecordDetail(rec, plan, hasPlan, width)
+	}
+	return m.renderCrossExchangeExecutionRecordDetail(rec, plan, hasPlan, width)
+}
+
+func (m Model) renderSameExchangePlanExecutionDetail(plan entity.ExecutionPlan, rec entity.ExecutionRecord, hasRec bool, width int) string {
+	targetCloseMs := rec.TargetCloseTimeMs
+	if targetCloseMs <= 0 {
+		targetCloseMs = plan.TargetCloseTimeMs
+	}
+	longHoldText := sameExchangeLongHoldPlanText(plan, m.data.System.Strategy)
+	longHoldReasonText := sameExchangeLongHoldReasonPlanText(plan, m.data.System.Strategy)
+	basisModeText, basisCostText, basisCarryText, basisPaybackText, basisActionText, basisReasonText, basisThresholdText := sameExchangeBasisContext(nil, OpportunityListItem{}, plan, true, m.data.System.Strategy)
+	liveRisk := service.SameExchangeLiveRiskInspection{}
+	if positionItem, ok := m.livePositionByPlanKey(plan.PlanKey); ok {
+		liveRisk = positionItem.Risk
+	}
+	lines := []string{
+		fmt.Sprintf("%s  %s", ui.accent.Render(plan.Symbol), ui.subtle.Render("现货多 / 永续空")),
+		strings.Join([]string{
+			renderField("计划", toneStyle("accent").Render(plan.PlanKey)),
+			renderField("就绪", renderBoolValue(plan.ReadyNow, false)),
+			renderField("状态", renderStatusValue(plan.Status)),
+			renderField("预期收益", renderMoneyValue(plan.NetExpectedPNL, 3)),
+			renderField("模式", toneStyle("accent").Render(arbitrageModeText(planArbitrageMode(plan, service.ArbitrageModeSameExchangeSpotPerp)))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("现货腿", toneStyle("good").Render(plan.LongExchange+" "+orDefault(plan.LongVenueSymbol, "--"))),
+			renderField("永续腿", toneStyle("warn").Render(plan.ShortExchange+" "+orDefault(plan.ShortVenueSymbol, "--"))),
+			renderField("现货数量", toneStyle("accent").Render(fmtNumber(plan.LongQty, 6))),
+			renderField("永续数量", toneStyle("accent").Render(fmtNumber(plan.ShortQty, 6))),
+			renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, true))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("永续横向排名", toneStyle("accent").Render(orDefault(fundingRankPlanText(plan), "--"))),
+			renderField("历史正费率", toneStyle("accent").Render(orDefault(perpFundingHistoryPositivePlanText(plan), "--"))),
+			renderField("历史负费率", toneStyle("accent").Render(orDefault(perpFundingHistoryNegativePlanText(plan), "--"))),
+			renderField("历史分位", toneStyle("accent").Render(orDefault(perpFundingHistoricalPercentilePlanText(plan), "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("历史均值 funding", toneStyle("accent").Render(orDefault(perpFundingHistoryMeanPlanText(plan), "--"))),
+			renderField("同向历史支持", toneStyle("accent").Render(orDefault(perpFundingSupportPlanText(plan), "--"))),
+			renderField("粗年化毛收益", toneStyle("accent").Render(orDefault(perpFundingAnnualizedCarryPlanText(plan), "--"))),
+			renderField("粗年化净收益", toneStyle("accent").Render(orDefault(perpFundingAnnualizedNetPlanText(plan), "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("长持判定", toneStyle(sameExchangeLongHoldTone(longHoldText)).Render(orDefault(longHoldText, "--"))),
+			renderField("原因", toneStyle("accent").Render(orDefault(longHoldReasonText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("基差模型", toneStyle("accent").Render(orDefault(basisModeText, "--"))),
+			renderField("基差阈值", toneStyle("accent").Render(orDefault(basisThresholdText, "--"))),
+			renderField("基差成本", toneStyle("accent").Render(orDefault(basisCostText, "--"))),
+			renderField("每轮 funding", toneStyle("accent").Render(orDefault(basisCarryText, "--"))),
+			renderField("回本轮数", toneStyle("accent").Render(orDefault(basisPaybackText, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("持有逻辑", toneStyle("accent").Render(sameExchangeHoldLogicText(m.data.System.Strategy))),
+			renderField("计划持仓", toneStyle("accent").Render(planExpectedHoldText(plan))),
+			renderField("目标平仓", renderTimeValue(targetCloseMs, "accent")),
+			renderField("距计划平仓", renderRemainingTimeValue(targetCloseMs)),
+			renderField("离场守则", toneStyle("accent").Render(sameExchangeExitRuleText(m.data.System.Strategy))),
+			renderField("基差动作", toneStyle(sameExchangeBasisActionTone(basisActionText)).Render(orDefault(basisActionText, "--"))),
+		}, "  "),
+		ui.panelTitle.Render("风险视角"),
+	}
+	lines = append(lines, renderSameExchangeRiskSummary(m.data.System.Strategy, nil, OpportunityListItem{}, plan, true, liveRisk)...)
+	lines = append(lines,
+		strings.Join([]string{
+			renderField("基差原因", toneStyle("accent").Render(orDefault(basisReasonText, "--"))),
+		}, "  "),
+	)
+	if isRollingStrategyMode(plan.StrategyMode) || (hasRec && isRollingStrategyMode(rec.StrategyMode)) {
+		lines = append(lines, strings.Join([]string{
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(plan.StrategyMode))),
+			renderField("下次 Review", renderTimeValue(plan.NextReviewTimeMs, "accent")),
+			renderField("当前 Boundary", renderTimeValue(plan.SyncBoundaryTimeMs, "accent")),
+			renderField("当前 Entry Path", toneStyle("accent").Render(fmt.Sprintf("%d 段 / %s", plan.EntryPathSegmentCount, entryPathStopReasonText(plan.EntryPathStopReason)))),
+		}, "  "))
+	}
+	if opp, ok := m.matchingOpportunityForPlan(plan); ok {
+		lines = append(lines, strings.Join([]string{
+			renderField("关联机会", toneStyle("accent").Render(opportunityKey(opp))),
+			renderField("机会状态", renderStatusValue(opp.Status)),
+			renderField("当前 funding 窗口", toneStyle("accent").Render(holdingDurationText(opp))),
+		}, "  "))
+	}
+	if hasRec {
+		lines = append(lines, strings.Join([]string{
+			renderField("执行记录", renderStatusValue(rec.Status)),
+			renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+			renderField("自动平仓", renderBoolValue(rec.AutoClose, false)),
+			renderField("开仓时间", renderTimeValue(rec.OpenedAtMs, "accent")),
+			renderField("平仓时间", renderTimeValue(rec.ClosedAtMs, "accent")),
+			renderField("预计总持有", toneStyle("accent").Render(executionPlannedHoldText(rec, plan, true))),
+		}, "  "))
+		lines = append(lines, strings.Join([]string{
+			renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
+			renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
+			renderField("最近迁移", renderTimeValue(rec.LastTransitionAtMs, "accent")),
+			renderField("事件", toneStyle("accent").Render(orDefault(rec.LastTransitionEvent, "--"))),
+		}, "  "))
+		if isRollingStrategyMode(rec.StrategyMode) || isRollingStrategyMode(plan.StrategyMode) {
+			lines = append(lines, strings.Join([]string{
+				renderField("Review 次数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.ReviewCount))),
+				renderField("最近 Review", renderTimeValue(rec.LastReviewAtMs, "accent")),
+				renderField("下次 Review", renderTimeValue(rec.NextReviewTimeMs, "accent")),
+				renderField("当前 Boundary", renderTimeValue(rec.CurrentSyncBoundaryMs, "accent")),
+			}, "  "))
+			if strings.TrimSpace(rec.LastReviewReason) != "" {
+				lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
+			}
+		}
+		if strings.TrimSpace(rec.StatusReason) != "" {
+			lines = append(lines, renderField("原因", toneStyle("warn").Render(clip(rec.StatusReason, width))))
+		}
+		if strings.TrimSpace(rec.LastError) != "" {
+			lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
+		}
+		if positionItem, ok := m.livePositionByPlanKey(plan.PlanKey); ok {
+			lines = append(lines, "", ui.panelTitle.Render("交易所持仓"), m.renderLivePositionDetail(positionItem, width))
+		}
+	}
+	lines = append(lines, "", ui.panelTitle.Render("订单记录"), m.renderOrdersDetail(plan.PlanKey, width))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderCrossExchangeExecutionRecordDetail(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool, width int) string {
 	targetCloseMs := rec.TargetCloseTimeMs
 	if targetCloseMs <= 0 && hasPlan {
 		targetCloseMs = plan.TargetCloseTimeMs
 	}
 	lines := []string{
-		fmt.Sprintf("%s  %s", ui.accent.Render(rec.Symbol), ui.subtle.Render(opportunityDirection(entity.Opportunity{LongExchange: rec.LongExchange, ShortExchange: rec.ShortExchange}))),
+		fmt.Sprintf("%s  %s", ui.accent.Render(rec.Symbol), ui.subtle.Render(opportunityDirectionDisplay(entity.Opportunity{LongExchange: rec.LongExchange, ShortExchange: rec.ShortExchange}, service.ArbitrageModeCrossExchange))),
 		strings.Join([]string{
 			renderField("计划", toneStyle("accent").Render(rec.PlanKey)),
 			renderField("状态", renderStatusValue(rec.Status)),
@@ -1145,6 +1898,99 @@ func (m Model) renderExecutionRecordDetail(rec entity.ExecutionRecord, plan enti
 			renderField("当前 Entry Path 终点", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
 			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
 		}, "  "))
+	}
+	if positionItem, ok := m.livePositionByPlanKey(rec.PlanKey); ok {
+		lines = append(lines, "", ui.panelTitle.Render("交易所持仓"), m.renderLivePositionDetail(positionItem, width))
+	}
+	lines = append(lines, "", ui.panelTitle.Render("订单记录"), m.renderOrdersDetail(rec.PlanKey, width))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSameExchangeExecutionRecordDetail(rec entity.ExecutionRecord, plan entity.ExecutionPlan, hasPlan bool, width int) string {
+	targetCloseMs := rec.TargetCloseTimeMs
+	if targetCloseMs <= 0 && hasPlan {
+		targetCloseMs = plan.TargetCloseTimeMs
+	}
+	planKey := rec.PlanKey
+	if hasPlan && strings.TrimSpace(plan.PlanKey) != "" {
+		planKey = plan.PlanKey
+	}
+	liveRisk := service.SameExchangeLiveRiskInspection{}
+	if positionItem, ok := m.livePositionByPlanKey(rec.PlanKey); ok {
+		liveRisk = positionItem.Risk
+	}
+	lines := []string{
+		fmt.Sprintf("%s  %s", ui.accent.Render(rec.Symbol), ui.subtle.Render("现货多 / 永续空")),
+		strings.Join([]string{
+			renderField("计划", toneStyle("accent").Render(planKey)),
+			renderField("状态", renderStatusValue(rec.Status)),
+			renderField("实盘", renderBoolValue(rec.LiveTrading, true)),
+			renderField("自动平仓", renderBoolValue(rec.AutoClose, false)),
+			renderField("模式", toneStyle("accent").Render(arbitrageModeText(service.ArbitrageModeSameExchangeSpotPerp))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("占用名义", renderAllocatedNotionalValue(executionAllocatedNotional(rec, plan, hasPlan))),
+			renderField("开仓时间", renderTimeValue(rec.OpenedAtMs, "accent")),
+			renderField("平仓时间", renderTimeValue(rec.ClosedAtMs, "accent")),
+			renderField("最近迁移", renderTimeValue(rec.LastTransitionAtMs, "accent")),
+			renderField("事件", toneStyle("accent").Render(orDefault(rec.LastTransitionEvent, "--"))),
+		}, "  "),
+		strings.Join([]string{
+			renderField("持有逻辑", toneStyle("accent").Render(sameExchangeHoldLogicText(m.data.System.Strategy))),
+			renderField("计划持仓", toneStyle("accent").Render(executionPlannedHoldText(rec, plan, hasPlan))),
+			renderField("目标平仓", renderTimeValue(targetCloseMs, "accent")),
+			renderField("距计划平仓", renderRemainingTimeValue(targetCloseMs)),
+			renderField("离场守则", toneStyle("accent").Render(sameExchangeExitRuleText(m.data.System.Strategy))),
+		}, "  "),
+		ui.panelTitle.Render("风险视角"),
+	}
+	lines = append(lines, renderSameExchangeRiskSummary(m.data.System.Strategy, nil, OpportunityListItem{}, plan, hasPlan, liveRisk)...)
+	if hasPlan {
+		basisModeText, basisCostText, basisCarryText, basisPaybackText, basisActionText, basisReasonText, basisThresholdText := sameExchangeBasisContext(nil, OpportunityListItem{}, plan, true, m.data.System.Strategy)
+		lines = append(lines, strings.Join([]string{
+			renderField("现货腿", toneStyle("good").Render(plan.LongExchange+" "+orDefault(plan.LongVenueSymbol, "--"))),
+			renderField("永续腿", toneStyle("warn").Render(plan.ShortExchange+" "+orDefault(plan.ShortVenueSymbol, "--"))),
+			renderField("永续横向排名", toneStyle("accent").Render(orDefault(fundingRankPlanText(plan), "--"))),
+			renderField("历史正费率", toneStyle("accent").Render(orDefault(perpFundingHistoryPositivePlanText(plan), "--"))),
+			renderField("历史负费率", toneStyle("accent").Render(orDefault(perpFundingHistoryNegativePlanText(plan), "--"))),
+			renderField("历史分位", toneStyle("accent").Render(orDefault(perpFundingHistoricalPercentilePlanText(plan), "--"))),
+		}, "  "))
+		lines = append(lines, strings.Join([]string{
+			renderField("现货-永续基差", renderBpsValue(plan.CrossVenueBasisBps, 2)),
+			renderField("基差模型", toneStyle("accent").Render(orDefault(basisModeText, "--"))),
+			renderField("基差阈值", toneStyle("accent").Render(orDefault(basisThresholdText, "--"))),
+			renderField("基差成本", toneStyle("accent").Render(orDefault(basisCostText, "--"))),
+			renderField("每轮 funding", toneStyle("accent").Render(orDefault(basisCarryText, "--"))),
+			renderField("回本轮数", toneStyle("accent").Render(orDefault(basisPaybackText, "--"))),
+			renderField("基差动作", toneStyle(sameExchangeBasisActionTone(basisActionText)).Render(orDefault(basisActionText, "--"))),
+		}, "  "))
+		lines = append(lines, strings.Join([]string{
+			renderField("基差原因", toneStyle("accent").Render(orDefault(basisReasonText, "--"))),
+			renderField("当前 Entry Path 终点", renderTimeValue(plan.ProjectedFundingTimeMs, "accent")),
+			renderField("目标平仓", renderTimeValue(plan.TargetCloseTimeMs, "accent")),
+		}, "  "))
+	}
+	lines = append(lines, strings.Join([]string{
+		renderField("开仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.OpenOrderCount))),
+		renderField("平仓单数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.CloseOrderCount))),
+	}, "  "))
+	if isRollingStrategyMode(rec.StrategyMode) || (hasPlan && isRollingStrategyMode(plan.StrategyMode)) {
+		lines = append(lines, strings.Join([]string{
+			renderField("策略模式", toneStyle("accent").Render(strategyModeText(orDefault(rec.StrategyMode, plan.StrategyMode)))),
+			renderField("Review 次数", toneStyle("accent").Render(fmt.Sprintf("%d", rec.ReviewCount))),
+			renderField("下次 Review", renderTimeValue(rec.NextReviewTimeMs, "accent")),
+			renderField("当前 Boundary", renderTimeValue(rec.CurrentSyncBoundaryMs, "accent")),
+			renderField("最近 Review", renderTimeValue(rec.LastReviewAtMs, "accent")),
+		}, "  "))
+		if strings.TrimSpace(rec.LastReviewReason) != "" {
+			lines = append(lines, renderField("Review 说明", toneStyle("warn").Render(clip(rec.LastReviewReason, width))))
+		}
+	}
+	if strings.TrimSpace(rec.StatusReason) != "" {
+		lines = append(lines, renderField("原因", toneStyle("warn").Render(clip(rec.StatusReason, width))))
+	}
+	if strings.TrimSpace(rec.LastError) != "" {
+		lines = append(lines, renderField("最后错误", toneStyle("bad").Render(clip(rec.LastError, width))))
 	}
 	if positionItem, ok := m.livePositionByPlanKey(rec.PlanKey); ok {
 		lines = append(lines, "", ui.panelTitle.Render("交易所持仓"), m.renderLivePositionDetail(positionItem, width))
@@ -1320,6 +2166,49 @@ func renderMarketSummary(snapshot service.SymbolMarketState, width int) string {
 	return clip(strings.Join(lines, "\n"), width*maxInt(1, len(lines)))
 }
 
+func (m Model) renderExecutionPlanListBlock(item entity.ExecutionPlan, arbitrageMode string, marker string) string {
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return strings.Join([]string{
+			fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirectionDisplay(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}, service.ArbitrageModeSameExchangeSpotPerp), 25), alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 10)),
+			fmt.Sprintf("    %-22s 就绪 %-3s 状态 %-18s", clip(opportunityPairDisplay(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}, service.ArbitrageModeSameExchangeSpotPerp), 22), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
+			fmt.Sprintf("    排名 %-10s 历史+ %-12s 历史- %-12s", clip(orDefault(fundingRankPlanText(item), "--"), 10), clip(orDefault(perpFundingHistoryPositivePlanText(item), "--"), 12), clip(orDefault(perpFundingHistoryNegativePlanText(item), "--"), 12)),
+		}, "\n")
+	}
+	return strings.Join([]string{
+		fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirectionDisplay(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}, service.ArbitrageModeCrossExchange), 25), alignRightValue(renderMoneyValue(item.NetExpectedPNL, 3), 10)),
+		fmt.Sprintf("    %-22s 就绪 %-3s 状态 %-18s", clip(opportunityPairDisplay(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}, service.ArbitrageModeCrossExchange), 22), boolWord(item.ReadyNow), clip(statusText(item.Status), 18)),
+		fmt.Sprintf("    计划 %-16s 名义 %-12s", clip(item.PlanKey, 16), clip(fmtMoney(targetNotional(item), 2), 12)),
+	}, "\n")
+}
+
+func (m Model) renderExecutionRecordListBlock(item entity.ExecutionRecord, arbitrageMode string, marker string, allocatedText string) string {
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		plan, hasPlan := m.planByKey(item.PlanKey)
+		rankText, posText, negText := "--", "--", "--"
+		if hasPlan {
+			if value := fundingRankPlanText(plan); value != "" {
+				rankText = value
+			}
+			if value := perpFundingHistoryPositivePlanText(plan); value != "" {
+				posText = value
+			}
+			if value := perpFundingHistoryNegativePlanText(plan); value != "" {
+				negText = value
+			}
+		}
+		return strings.Join([]string{
+			fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirectionDisplay(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}, service.ArbitrageModeSameExchangeSpotPerp), 25), statusText(item.Status)),
+			fmt.Sprintf("    计划 %-24s 实盘 %-3s 自动平仓 %-3s", clip(item.PlanKey, 24), boolWord(item.LiveTrading), boolWord(item.AutoClose)),
+			fmt.Sprintf("    占用 %-12s 排名 %-8s 历史+ %-10s 历史- %-10s", clip(allocatedText, 12), clip(rankText, 8), clip(posText, 10), clip(negText, 10)),
+		}, "\n")
+	}
+	return strings.Join([]string{
+		fmt.Sprintf("%s %-7s %-25s %s", marker, clip(item.Symbol, 7), clip(opportunityDirectionDisplay(entity.Opportunity{LongExchange: item.LongExchange, ShortExchange: item.ShortExchange}, service.ArbitrageModeCrossExchange), 25), statusText(item.Status)),
+		fmt.Sprintf("    计划 %-28s 实盘 %-3s 自动平仓 %-3s", clip(item.PlanKey, 28), boolWord(item.LiveTrading), boolWord(item.AutoClose)),
+		fmt.Sprintf("    占用 %-14s 开仓 %s  平仓 %s", clip(allocatedText, 14), clip(fmtTime(item.OpenedAtMs), 19), clip(fmtTime(item.ClosedAtMs), 19)),
+	}, "\n")
+}
+
 func ruleSummary(rule entity.OpportunityFundingRule) string {
 	parts := []string{
 		orDefault(rule.Exchange, "--"),
@@ -1331,10 +2220,934 @@ func ruleSummary(rule entity.OpportunityFundingRule) string {
 	if strings.TrimSpace(rule.ForecastConfidence) != "" {
 		parts = append(parts, "置信度="+rule.ForecastConfidence)
 	}
+	if rank := fundingRankText(rule); rank != "--" {
+		parts = append(parts, "横向排名="+rank)
+	}
+	if history := fundingHistoryPositiveText(rule); history != "--" {
+		parts = append(parts, "历史正费率="+history)
+	}
+	if history := fundingHistoryNegativeText(rule); history != "--" {
+		parts = append(parts, "历史负费率="+history)
+	}
+	if percentile := fundingHistoricalPercentileText(rule); percentile != "--" {
+		parts = append(parts, "历史分位="+percentile)
+	}
+	if historyMean := fundingHistoryMeanText(rule); historyMean != "--" {
+		parts = append(parts, "历史均值="+historyMean)
+	}
+	if support := fundingHistoricalSupportText(rule); support != "--" {
+		parts = append(parts, "同向支持="+support)
+	}
+	if annualizedNet := fundingAnnualizedNetText(rule); annualizedNet != "--" {
+		parts = append(parts, "粗年化净="+annualizedNet)
+	}
+	if decision := sameExchangeLongHoldRuleText(rule); decision != "--" {
+		parts = append(parts, "长持="+decision)
+	}
 	if strings.TrimSpace(rule.MetadataSummary) != "" {
 		parts = append(parts, rule.MetadataSummary)
 	}
 	return strings.Join(parts, " | ")
+}
+
+func fundingRankPlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingRank <= 0 || plan.PerpFundingRankTotal <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("#%d/%d", plan.PerpFundingRank, plan.PerpFundingRankTotal)
+}
+
+func perpFundingHistoryPositivePlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.1f%% / %d", plan.PerpFundingHistoryPositiveRatio*100, plan.PerpFundingHistorySampleCount)
+}
+
+func perpFundingHistoryNegativePlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.1f%% / %d", plan.PerpFundingHistoryNegativeRatio*100, plan.PerpFundingHistorySampleCount)
+}
+
+func perpFundingHistoricalPercentilePlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.1f%%", plan.PerpFundingCurrentHistoricalPercentile*100)
+}
+
+func perpFundingHistoryMeanPlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmtPctRatio(plan.PerpFundingHistoryMeanRate, 5)
+}
+
+func perpFundingSupportPlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.1f%% / %d", plan.PerpFundingHistoricalSupportRatio*100, plan.PerpFundingHistorySampleCount)
+}
+
+func perpFundingAnnualizedCarryPlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmtPctRatio(plan.PerpFundingEstimatedAnnualizedCarryRate, 2)
+}
+
+func perpFundingAnnualizedNetPlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 {
+		return ""
+	}
+	return fmtPctRatio(plan.PerpFundingEstimatedAnnualizedNetRate, 2)
+}
+
+func perpFundingEstimatedEventRatePlanText(plan entity.ExecutionPlan) string {
+	if plan.PerpFundingHistorySampleCount <= 0 || plan.PerpFundingEstimatedEventRate == 0 {
+		return ""
+	}
+	return fmtPctRatio(plan.PerpFundingEstimatedEventRate, 5)
+}
+
+func perpFundingSuggestedHoldEventsPlanText(plan entity.ExecutionPlan) string {
+	if plan.SameExchangeLongHoldSuggestedFundingEvents <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d 轮", plan.SameExchangeLongHoldSuggestedFundingEvents)
+}
+
+func perpFundingSuggestedHoldDurationPlanText(plan entity.ExecutionPlan) string {
+	if plan.SameExchangeLongHoldSuggestedHoldHours <= 0 {
+		return ""
+	}
+	return formatHoldHours(plan.SameExchangeLongHoldSuggestedHoldHours)
+}
+
+func perpFundingSuggestedGrossPNLPlanText(plan entity.ExecutionPlan) string {
+	if plan.SameExchangeLongHoldSuggestedFundingEvents <= 0 {
+		return ""
+	}
+	return renderMoneyValue(plan.SameExchangeLongHoldSuggestedGrossFundingPNL, 3)
+}
+
+func perpFundingSuggestedNetPNLPlanText(plan entity.ExecutionPlan) string {
+	if plan.SameExchangeLongHoldSuggestedFundingEvents <= 0 {
+		return ""
+	}
+	return renderMoneyValue(plan.SameExchangeLongHoldSuggestedNetPNL, 3)
+}
+
+func sameExchangeLongHoldPlanText(plan entity.ExecutionPlan, strategy StrategyStatus) string {
+	if plan.PerpFundingHistorySampleCount <= 0 && strings.TrimSpace(plan.SameExchangeLongHoldReason) == "" {
+		return ""
+	}
+	if plan.SameExchangeLongHoldEligible {
+		return "适合长期持有"
+	}
+	if strategy.SameExchangeRequireLongHoldEligible {
+		return "不建议开仓"
+	}
+	return "不建议长期持有"
+}
+
+func sameExchangeLongHoldReasonPlanText(plan entity.ExecutionPlan, strategy StrategyStatus) string {
+	if plan.PerpFundingHistorySampleCount <= 0 && strings.TrimSpace(plan.SameExchangeLongHoldReason) == "" {
+		return ""
+	}
+	return sameExchangeLongHoldReasonLabel(plan.SameExchangeLongHoldReason, strategy)
+}
+
+func sameExchangeFundingContext(detail *entity.Opportunity, plan entity.ExecutionPlan, hasPlan bool) (string, string, string, string) {
+	rule := sameExchangePerpRule(detail)
+	rankText := ""
+	if value := fundingRankText(rule); value != "--" {
+		rankText = value
+	} else if hasPlan {
+		rankText = fundingRankPlanText(plan)
+	}
+
+	positiveText := ""
+	if value := fundingHistoryPositiveText(rule); value != "--" {
+		positiveText = value
+	} else if hasPlan {
+		positiveText = perpFundingHistoryPositivePlanText(plan)
+	}
+
+	negativeText := ""
+	if value := fundingHistoryNegativeText(rule); value != "--" {
+		negativeText = value
+	} else if hasPlan {
+		negativeText = perpFundingHistoryNegativePlanText(plan)
+	}
+
+	percentileText := ""
+	if value := fundingHistoricalPercentileText(rule); value != "--" {
+		percentileText = value
+	} else if hasPlan {
+		percentileText = perpFundingHistoricalPercentilePlanText(plan)
+	}
+	return rankText, positiveText, negativeText, percentileText
+}
+
+func sameExchangeLongHoldContext(detail *entity.Opportunity, plan entity.ExecutionPlan, hasPlan bool, strategy StrategyStatus) (string, string, string, string, string, string) {
+	rule := sameExchangePerpRule(detail)
+	historyMeanText := ""
+	if value := fundingHistoryMeanText(rule); value != "--" {
+		historyMeanText = value
+	} else if hasPlan {
+		historyMeanText = perpFundingHistoryMeanPlanText(plan)
+	}
+
+	supportText := ""
+	if value := fundingHistoricalSupportText(rule); value != "--" {
+		supportText = value
+	} else if hasPlan {
+		supportText = perpFundingSupportPlanText(plan)
+	}
+
+	annualizedCarryText := ""
+	if value := fundingAnnualizedCarryText(rule); value != "--" {
+		annualizedCarryText = value
+	} else if hasPlan {
+		annualizedCarryText = perpFundingAnnualizedCarryPlanText(plan)
+	}
+
+	annualizedNetText := ""
+	if value := fundingAnnualizedNetText(rule); value != "--" {
+		annualizedNetText = value
+	} else if hasPlan {
+		annualizedNetText = perpFundingAnnualizedNetPlanText(plan)
+	}
+
+	longHoldText := ""
+	if value := sameExchangeLongHoldRuleDisplay(rule, strategy); value != "--" {
+		longHoldText = value
+	} else if hasPlan {
+		longHoldText = sameExchangeLongHoldPlanText(plan, strategy)
+	}
+
+	longHoldReasonText := ""
+	if value := sameExchangeLongHoldRuleReasonText(rule, strategy); value != "--" {
+		longHoldReasonText = value
+	} else if hasPlan {
+		longHoldReasonText = sameExchangeLongHoldReasonPlanText(plan, strategy)
+	}
+
+	return historyMeanText, supportText, annualizedCarryText, annualizedNetText, longHoldText, longHoldReasonText
+}
+
+func sameExchangeLongHoldRecommendationContext(detail *entity.Opportunity, plan entity.ExecutionPlan, hasPlan bool) (string, string, string, string, string, string) {
+	rule := sameExchangePerpRule(detail)
+
+	eventRateText := ""
+	if value := fundingEstimatedEventRateText(rule); value != "--" {
+		eventRateText = value
+	} else if hasPlan {
+		eventRateText = perpFundingEstimatedEventRatePlanText(plan)
+	}
+
+	holdEventsText := ""
+	if value := fundingSuggestedHoldEventsText(rule); value != "--" {
+		holdEventsText = value
+	} else if hasPlan {
+		holdEventsText = perpFundingSuggestedHoldEventsPlanText(plan)
+	}
+
+	holdDurationText := ""
+	if value := fundingSuggestedHoldDurationText(rule); value != "--" {
+		holdDurationText = value
+	} else if hasPlan {
+		holdDurationText = perpFundingSuggestedHoldDurationPlanText(plan)
+	}
+
+	suggestedGrossText := ""
+	if value := fundingSuggestedGrossPNLText(rule); value != "--" {
+		suggestedGrossText = value
+	} else if hasPlan {
+		suggestedGrossText = perpFundingSuggestedGrossPNLPlanText(plan)
+	}
+
+	suggestedNetText := ""
+	if value := fundingSuggestedNetPNLText(rule); value != "--" {
+		suggestedNetText = value
+	} else if hasPlan {
+		suggestedNetText = perpFundingSuggestedNetPNLPlanText(plan)
+	}
+
+	sourceText := sameExchangeLongHoldEstimateSourceText(detail, plan, hasPlan)
+	return eventRateText, holdEventsText, holdDurationText, suggestedGrossText, suggestedNetText, sourceText
+}
+
+func sameExchangeBasisContext(detail *entity.Opportunity, item OpportunityListItem, plan entity.ExecutionPlan, hasPlan bool, strategy StrategyStatus) (string, string, string, string, string, string, string) {
+	usesPayback := false
+	costBps := 0.0
+	carryPerEventBps := 0.0
+	paybackEvents := 0.0
+	allowed := true
+	reason := ""
+	sizeMultiplier := 0.0
+
+	switch {
+	case detail != nil && sameExchangeBasisDataPresent(detail.SameExchangeBasisReason, detail.SameExchangeBasisUsesPaybackModel, detail.SameExchangeBasisCostBps, detail.SameExchangeBasisCarryPerEventBps, detail.SameExchangeBasisPaybackFundingEvents, detail.SameExchangeBasisRiskSizeMultiplier):
+		usesPayback = detail.SameExchangeBasisUsesPaybackModel
+		costBps = detail.SameExchangeBasisCostBps
+		carryPerEventBps = detail.SameExchangeBasisCarryPerEventBps
+		paybackEvents = detail.SameExchangeBasisPaybackFundingEvents
+		allowed = detail.SameExchangeBasisAllowed
+		reason = detail.SameExchangeBasisReason
+		sizeMultiplier = detail.SameExchangeBasisRiskSizeMultiplier
+	case sameExchangeBasisDataPresent(item.SameExchangeBasisReason, item.SameExchangeBasisUsesPaybackModel, item.SameExchangeBasisCostBps, item.SameExchangeBasisCarryPerEventBps, item.SameExchangeBasisPaybackFundingEvents, item.SameExchangeBasisRiskSizeMultiplier):
+		usesPayback = item.SameExchangeBasisUsesPaybackModel
+		costBps = item.SameExchangeBasisCostBps
+		carryPerEventBps = item.SameExchangeBasisCarryPerEventBps
+		paybackEvents = item.SameExchangeBasisPaybackFundingEvents
+		allowed = item.SameExchangeBasisAllowed
+		reason = item.SameExchangeBasisReason
+		sizeMultiplier = item.SameExchangeBasisRiskSizeMultiplier
+	case hasPlan && sameExchangeBasisDataPresent(plan.SameExchangeBasisReason, plan.SameExchangeBasisUsesPaybackModel, plan.SameExchangeBasisCostBps, plan.SameExchangeBasisCarryPerEventBps, plan.SameExchangeBasisPaybackFundingEvents, plan.SameExchangeBasisRiskSizeMultiplier):
+		usesPayback = plan.SameExchangeBasisUsesPaybackModel
+		costBps = plan.SameExchangeBasisCostBps
+		carryPerEventBps = plan.SameExchangeBasisCarryPerEventBps
+		paybackEvents = plan.SameExchangeBasisPaybackFundingEvents
+		allowed = plan.SameExchangeBasisAllowed
+		reason = plan.SameExchangeBasisReason
+		sizeMultiplier = plan.SameExchangeBasisRiskSizeMultiplier
+	default:
+		return "--", "--", "--", "--", "--", "--", "--"
+	}
+
+	modeText := "短持硬阈值"
+	maxAllowedBasisBps := item.MaxAllowedBasisBps
+	if maxAllowedBasisBps <= 0 && hasPlan {
+		maxAllowedBasisBps = strategyAllowedBasisThresholdBps(strategy, plan.FundingWindowHours)
+	}
+	thresholdText := fmtSignedBps(maxAllowedBasisBps, 2)
+	if usesPayback {
+		modeText = "长持回本轮数"
+		thresholdText = fmt.Sprintf("max %.2f 轮 / extreme %.2f 轮", strategy.SameExchangeMaxBasisPaybackEvents, strategy.SameExchangeExtremeBasisPaybackEvents)
+	}
+
+	costText := "--"
+	if math.Abs(costBps) > 1e-9 {
+		costText = fmtSignedBps(costBps, 2)
+	}
+	carryText := "--"
+	if math.Abs(carryPerEventBps) > 1e-9 {
+		carryText = fmtSignedBps(carryPerEventBps, 2)
+	}
+	paybackText := "--"
+	if paybackEvents > 0 {
+		paybackText = fmt.Sprintf("%.2f 轮", paybackEvents)
+	}
+	actionText := sameExchangeBasisActionLabel(usesPayback, allowed, sizeMultiplier, reason, strategy)
+	reasonText := sameExchangeBasisReasonLabel(reason, strategy)
+	return modeText, costText, carryText, paybackText, actionText, reasonText, thresholdText
+}
+
+func strategyAllowedBasisThresholdBps(strategy StrategyStatus, fundingWindowHours float64) float64 {
+	base := strategy.MaxSpreadBps
+	if base <= 0 {
+		base = 12
+	}
+	multiplier := strategy.DynamicMaxSpreadMultiplier
+	if multiplier < 1 {
+		multiplier = 1
+	}
+	refHours := strategy.DynamicMaxSpreadReferenceHours
+	if refHours <= 0 {
+		refHours = strategy.HoldHours
+	}
+	if refHours <= 0 {
+		return base
+	}
+	ratio := fundingWindowHours / refHours
+	if ratio > 1 {
+		ratio = 1
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	return base * (1 + (multiplier-1)*ratio)
+}
+
+func sameExchangeBasisDataPresent(reason string, usesPayback bool, costBps, carryPerEventBps, paybackEvents, sizeMultiplier float64) bool {
+	return strings.TrimSpace(reason) != "" ||
+		usesPayback ||
+		math.Abs(costBps) > 1e-9 ||
+		math.Abs(carryPerEventBps) > 1e-9 ||
+		math.Abs(paybackEvents) > 1e-9 ||
+		sizeMultiplier > 0
+}
+
+func sameExchangeBasisReasonLabel(reason string, strategy StrategyStatus) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "", "eligible":
+		return "基差成本可以被 funding 覆盖"
+	case "short_window_too_wide":
+		return "短持窗口下基差偏宽，优先缩仓而非直接拒绝"
+	case "payback_carry_missing":
+		return "每轮 funding 毛收益 <= 0，无法覆盖基差"
+	case "payback_too_high":
+		return fmt.Sprintf("回本轮数 > %.2f，收益回收偏慢", strategy.SameExchangeMaxBasisPaybackEvents)
+	case "extreme_payback":
+		return fmt.Sprintf("回本轮数 > %.2f，先降仓", strategy.SameExchangeExtremeBasisPaybackEvents)
+	default:
+		return reason
+	}
+}
+
+func sameExchangeBasisActionLabel(usesPayback bool, allowed bool, sizeMultiplier float64, reason string, strategy StrategyStatus) string {
+	if !usesPayback {
+		if strings.EqualFold(strings.TrimSpace(reason), "short_window_too_wide") {
+			if sizeMultiplier > 0 && sizeMultiplier < 1 {
+				return fmt.Sprintf("短持基差偏宽，降仓至 %.0f%%", sizeMultiplier*100)
+			}
+			return "短持基差偏宽，谨慎开仓"
+		}
+		if !allowed {
+			return "短持基差超限"
+		}
+		return "短持基差通过"
+	}
+	if !allowed {
+		switch strings.ToLower(strings.TrimSpace(reason)) {
+		case "payback_carry_missing":
+			return "每轮 funding 不足，拒绝开仓"
+		case "payback_too_high":
+			return fmt.Sprintf("回本 > %.2f 轮，拒绝开仓", strategy.SameExchangeMaxBasisPaybackEvents)
+		default:
+			return "回本轮数超限"
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(reason), "payback_carry_missing") {
+		return "每轮 funding 不足，谨慎开仓"
+	}
+	if strings.EqualFold(strings.TrimSpace(reason), "payback_too_high") {
+		if sizeMultiplier > 0 && sizeMultiplier < 1 {
+			return fmt.Sprintf("回本偏慢，降仓至 %.0f%%", sizeMultiplier*100)
+		}
+		return fmt.Sprintf("回本 > %.2f 轮，谨慎开仓", strategy.SameExchangeMaxBasisPaybackEvents)
+	}
+	if sizeMultiplier > 0 && sizeMultiplier < 1 {
+		return fmt.Sprintf("极端基差，降仓至 %.0f%%", sizeMultiplier*100)
+	}
+	return "回本轮数可覆盖"
+}
+
+func sameExchangeBasisActionTone(action string) string {
+	switch {
+	case strings.Contains(action, "拒绝"), strings.Contains(action, "超限"):
+		return "bad"
+	case strings.Contains(action, "降仓"), strings.Contains(action, "谨慎"):
+		return "warn"
+	case action == "", action == "--":
+		return "subtle"
+	default:
+		return "good"
+	}
+}
+
+func sameExchangeFundingSampleText(detail *entity.Opportunity, plan entity.ExecutionPlan, hasPlan bool, loading bool) string {
+	samples := 0
+	if detail != nil && detail.ShortFundingRule.HistorySampleCount > 0 {
+		samples = detail.ShortFundingRule.HistorySampleCount
+	} else if hasPlan {
+		samples = plan.PerpFundingHistorySampleCount
+	}
+	if samples > 0 {
+		return fmt.Sprintf("%d 个周期", samples)
+	}
+	if loading {
+		return "加载中"
+	}
+	return "--"
+}
+
+func (m Model) renderCrossExchangeFundingHistoryDetail(detail *entity.Opportunity, loading bool, width int) string {
+	if detail == nil {
+		if loading {
+			return ui.subtle.Render("正在加载历史 funding 明细...")
+		}
+		return ui.subtle.Render("当前机会暂无历史 funding 明细。")
+	}
+	return strings.Join([]string{
+		renderFundingHistorySeriesBlock("多头腿最近 funding", detail.LongFundingRule, width),
+		"",
+		renderFundingHistorySeriesBlock("空头腿最近 funding", detail.ShortFundingRule, width),
+	}, "\n")
+}
+
+func (m Model) renderSameExchangeFundingHistoryDetail(detail *entity.Opportunity, loading bool, width int) string {
+	if detail == nil {
+		if loading {
+			return ui.subtle.Render("正在加载历史 funding 明细...")
+		}
+		return ui.subtle.Render("当前机会暂无历史 funding 明细。")
+	}
+	return strings.Join([]string{
+		renderSpotFundingHistorySeriesBlock("现货腿最近 funding", detail.LongFundingRule, sameExchangePerpRule(detail), width),
+		"",
+		renderFundingHistorySeriesBlock("永续腿最近 funding", sameExchangePerpRule(detail), width),
+	}, "\n")
+}
+
+func renderSpotFundingHistorySeriesBlock(title string, spotRule entity.OpportunityFundingRule, perpRule entity.OpportunityFundingRule, width int) string {
+	lines := []string{
+		toneStyle("accent").Render(title),
+		clip(strings.Join([]string{
+			renderField("展示语义", toneStyle("accent").Render("现货锚定腿 / synthetic zero funding")),
+			renderField("交易所 / 合约", toneStyle("accent").Render(orDefault(spotRule.Exchange, "--")+" / "+orDefault(spotRule.VenueSymbol, "--"))),
+			renderField("收益锚点", renderTimeValue(perpRule.NextFundingTimeMs, "accent")),
+		}, "  "), width),
+		ui.subtle.Render("现货腿不直接产生 funding 事件；这里保留 0 funding 锚定语义，方便把收益兑现点与永续腿结算时间对齐。"),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderFundingHistorySeriesBlock(title string, rule entity.OpportunityFundingRule, width int) string {
+	lines := []string{toneStyle("accent").Render(title)}
+	if isSpotFundingRule(rule) {
+		lines = append(lines, ui.subtle.Render("该腿为现货锚定腿，不直接产生历史 funding 事件。"))
+		return strings.Join(lines, "\n")
+	}
+
+	series := displayedFundingHistorySeries(rule)
+	sampleCount := rule.HistorySampleCount
+	if sampleCount < len(series) {
+		sampleCount = len(series)
+	}
+	if len(series) == 0 {
+		if sampleCount > 0 {
+			lines = append(lines, ui.subtle.Render("历史 funding 画像已就绪，但最近 funding 明细序列暂未同步完成。"))
+		} else {
+			lines = append(lines, ui.subtle.Render("暂无历史 funding 明细。"))
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines, clip(strings.Join([]string{
+		renderField("交易所 / 合约", toneStyle("accent").Render(orDefault(rule.Exchange, "--")+" / "+orDefault(rule.VenueSymbol, "--"))),
+		renderField("最近明细", toneStyle("accent").Render(fmt.Sprintf("%d 条", len(series)))),
+		renderField("历史正费率", toneStyle("accent").Render(orDefault(fundingHistoryPositiveText(rule), "--"))),
+		renderField("历史负费率", toneStyle("accent").Render(orDefault(fundingHistoryNegativeText(rule), "--"))),
+	}, "  "), width))
+	lines = append(lines, ui.subtle.Render("时间                 费率           标记价"))
+	for _, point := range series {
+		markPrice := "--"
+		if point.MarkPrice > 0 {
+			markPrice = priceText(point.MarkPrice)
+		}
+		line := fmt.Sprintf("%-20s %-14s %-12s",
+			clip(fmtTime(point.FundingTimeMs), 20),
+			fmtPctRatio(point.FundingRate, 5),
+			markPrice,
+		)
+		lines = append(lines, toneStyle(signedNumberTone(point.FundingRate)).Render(clip(line, width)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func displayedFundingHistorySeries(rule entity.OpportunityFundingRule) []entity.OpportunityFundingHistoryPoint {
+	if len(rule.HistorySeries) == 0 {
+		return nil
+	}
+	items := append([]entity.OpportunityFundingHistoryPoint(nil), rule.HistorySeries...)
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].FundingTimeMs > items[j].FundingTimeMs
+	})
+	if len(items) > 8 {
+		items = items[:8]
+	}
+	return items
+}
+
+func isSpotFundingRule(rule entity.OpportunityFundingRule) bool {
+	return strings.EqualFold(strings.TrimSpace(rule.ClampSource), "spot_synthetic_zero")
+}
+
+func sameExchangeCurrentFundingRate(item any) float64 {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.ShortFundingRate
+	case OpportunityListItem:
+		return v.ShortFundingRate
+	default:
+		return 0
+	}
+}
+
+func sameExchangeWindowGrossPNL(item any) float64 {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.GrossFundingPNL
+	case OpportunityListItem:
+		return v.GrossFundingPNL
+	default:
+		return 0
+	}
+}
+
+func sameExchangeTotalFrictionPNL(item any) float64 {
+	switch v := item.(type) {
+	case entity.Opportunity:
+		return v.EntryFeePNL + v.ExitFeePNL + v.SlippagePNL + v.SafetyBufferPNL
+	case OpportunityListItem:
+		return v.EntryFeePNL + v.ExitFeePNL + v.SlippagePNL + v.SafetyBufferPNL
+	default:
+		return 0
+	}
+}
+
+func sameExchangeNextFundingGrossPNL(item any, plan entity.ExecutionPlan, hasPlan bool, strategy StrategyStatus) float64 {
+	rate := sameExchangeCurrentFundingRate(item)
+	if math.Abs(rate) <= 1e-9 {
+		return 0
+	}
+	notional := opportunityTargetNotional(rate, sameExchangeWindowGrossPNL(item), plan, hasPlan, strategy)
+	if notional <= 0 {
+		return 0
+	}
+	return notional * rate
+}
+
+func sameExchangePerpRule(detail *entity.Opportunity) entity.OpportunityFundingRule {
+	if detail == nil {
+		return entity.OpportunityFundingRule{}
+	}
+	return detail.ShortFundingRule
+}
+
+func sameExchangeHoldLogicText(strategy StrategyStatus) string {
+	if strings.EqualFold(strings.TrimSpace(strategy.HoldSelectionMode), "dynamic_profit") {
+		return "收益驱动动态持有"
+	}
+	return holdSelectionModeText(strategy.HoldSelectionMode)
+}
+
+func sameExchangeExitRuleText(strategy StrategyStatus) string {
+	parts := make([]string, 0, 3)
+	if strategy.SameExchangeCloseOnNegativeFunding {
+		parts = append(parts, "永续 funding 转负即复核")
+	}
+	if strategy.SameExchangeHistoryNegativeExitThreshold > 0 {
+		parts = append(parts, fmt.Sprintf("历史负费率>=%.1f%%", strategy.SameExchangeHistoryNegativeExitThreshold*100))
+	}
+	if strategy.SameExchangeExitRequirePositiveClosePNL {
+		parts = append(parts, "平仓净收益>="+fmtMoney(strategy.SameExchangeExitMinClosePNL, 3))
+	} else {
+		parts = append(parts, "允许收益回撤离场")
+	}
+	return strings.Join(parts, " / ")
+}
+
+func fundingHistoryMeanText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmtPctRatio(rule.HistoryMeanRate, 5)
+}
+
+func fundingHistoricalSupportText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("%.1f%% / %d", rule.HistoricalSupportRatio*100, rule.HistorySampleCount)
+}
+
+func fundingAnnualizedCarryText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmtPctRatio(rule.EstimatedAnnualizedCarryRate, 2)
+}
+
+func fundingAnnualizedNetText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmtPctRatio(rule.EstimatedAnnualizedNetRate, 2)
+}
+
+func fundingEstimatedEventRateText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 || rule.EstimatedEventRate == 0 {
+		return "--"
+	}
+	return fmtPctRatio(rule.EstimatedEventRate, 5)
+}
+
+func fundingSuggestedHoldEventsText(rule entity.OpportunityFundingRule) string {
+	if rule.SuggestedFundingEvents <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("%d 轮", rule.SuggestedFundingEvents)
+}
+
+func fundingSuggestedHoldDurationText(rule entity.OpportunityFundingRule) string {
+	if rule.SuggestedHoldHours <= 0 {
+		return "--"
+	}
+	return formatHoldHours(rule.SuggestedHoldHours)
+}
+
+func fundingSuggestedGrossPNLText(rule entity.OpportunityFundingRule) string {
+	if rule.SuggestedFundingEvents <= 0 {
+		return "--"
+	}
+	return renderMoneyValue(rule.SuggestedGrossFundingPNL, 3)
+}
+
+func fundingSuggestedNetPNLText(rule entity.OpportunityFundingRule) string {
+	if rule.SuggestedFundingEvents <= 0 {
+		return "--"
+	}
+	return renderMoneyValue(rule.SuggestedNetPNL, 3)
+}
+
+func sameExchangeLongHoldRuleText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 && strings.TrimSpace(rule.LongHoldReason) == "" {
+		return "--"
+	}
+	if rule.LongHoldEligible {
+		return "适合长期持有"
+	}
+	return "不建议长期持有"
+}
+
+func sameExchangeLongHoldRuleDisplay(rule entity.OpportunityFundingRule, strategy StrategyStatus) string {
+	if rule.HistorySampleCount <= 0 && strings.TrimSpace(rule.LongHoldReason) == "" {
+		return "--"
+	}
+	if rule.LongHoldEligible {
+		return "适合长期持有"
+	}
+	if strategy.SameExchangeRequireLongHoldEligible {
+		return "不建议开仓"
+	}
+	return "不建议长期持有"
+}
+
+func sameExchangeLongHoldRuleReasonText(rule entity.OpportunityFundingRule, strategy StrategyStatus) string {
+	if rule.HistorySampleCount <= 0 && strings.TrimSpace(rule.LongHoldReason) == "" {
+		return "--"
+	}
+	return sameExchangeLongHoldReasonLabel(rule.LongHoldReason, strategy)
+}
+
+func sameExchangeLongHoldReasonLabel(reason string, strategy StrategyStatus) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "", "eligible":
+		return "满足长期持有门槛"
+	case "funding_not_positive":
+		return "当前永续 funding <= 0"
+	case "history_samples_low":
+		return fmt.Sprintf("历史样本 < %d", strategy.SameExchangeMinHistorySampleCount)
+	case "support_ratio_low":
+		return fmt.Sprintf("同向历史支持 < %.1f%%", strategy.SameExchangeMinHistoricalSupportRatio*100)
+	case "annualized_net_rate_low":
+		return fmt.Sprintf("粗年化净收益 < %.1f%%", strategy.SameExchangeMinAnnualizedNetRate*100)
+	case "projected_net_pnl_low":
+		return "建议持有期净收益仍不足"
+	case "missing_funding_interval":
+		return "缺少 funding 间隔"
+	case "missing_notional":
+		return "缺少可用名义"
+	default:
+		return reason
+	}
+}
+
+func sameExchangeLongHoldTone(label string) string {
+	switch strings.TrimSpace(label) {
+	case "适合长期持有":
+		return "good"
+	case "", "--":
+		return "subtle"
+	default:
+		return "warn"
+	}
+}
+
+func sameExchangeLongHoldEstimateSourceText(detail *entity.Opportunity, plan entity.ExecutionPlan, hasPlan bool) string {
+	if detail != nil && detail.SameExchangeLongHoldUsingHistoryEstimate {
+		return "已切换到历史长持预估"
+	}
+	if hasPlan && plan.SameExchangeLongHoldUsingHistoryEstimate {
+		return "已切换到历史长持预估"
+	}
+	rule := sameExchangePerpRule(detail)
+	if rule.SuggestedFundingEvents > 0 {
+		return "历史长持建议可用"
+	}
+	if hasPlan && plan.SameExchangeLongHoldSuggestedFundingEvents > 0 {
+		return "历史长持建议可用"
+	}
+	return ""
+}
+
+func formatHoldHours(hours float64) string {
+	if hours <= 0 {
+		return "--"
+	}
+	if hours >= 24 {
+		return fmt.Sprintf("%.1f h / %.2f 天", hours, hours/24)
+	}
+	return fmt.Sprintf("%.1f h", hours)
+}
+
+func sameExchangePriceRiskContext(detail *entity.Opportunity, item OpportunityListItem, plan entity.ExecutionPlan, hasPlan bool) (bool, string, float64, float64, float64) {
+	if detail != nil {
+		return detail.SameExchangePriceRiskAllowed,
+			detail.SameExchangePriceRiskReason,
+			detail.SameExchangePriceShockRatio,
+			detail.SameExchangePriceShockCurrentMarkPrice,
+			detail.SameExchangePriceShockBaselineMarkPrice
+	}
+	if hasPlan {
+		return plan.SameExchangePriceRiskAllowed,
+			plan.SameExchangePriceRiskReason,
+			plan.SameExchangePriceShockRatio,
+			plan.SameExchangePriceShockCurrentMarkPrice,
+			plan.SameExchangePriceShockBaselineMarkPrice
+	}
+	return item.SameExchangePriceRiskAllowed,
+		item.SameExchangePriceRiskReason,
+		item.SameExchangePriceShockRatio,
+		item.SameExchangePriceShockCurrentMarkPrice,
+		item.SameExchangePriceShockBaselineMarkPrice
+}
+
+func renderSameExchangeRiskSummary(strategy StrategyStatus, detail *entity.Opportunity, item OpportunityListItem, plan entity.ExecutionPlan, hasPlan bool, liveRisk service.SameExchangeLiveRiskInspection) []string {
+	priceAllowed, priceReason, shockRatio, currentMark, baselineMark := sameExchangePriceRiskContext(detail, item, plan, hasPlan)
+	if liveRisk.Enabled {
+		priceAllowed = liveRisk.PriceShockAllowed
+		priceReason = liveRisk.PriceShockReason
+		if liveRisk.PriceShockRatio != 0 {
+			shockRatio = liveRisk.PriceShockRatio
+		}
+		if liveRisk.PriceShockCurrentMarkPrice > 0 {
+			currentMark = liveRisk.PriceShockCurrentMarkPrice
+		}
+		if liveRisk.PriceShockBaselineMarkPrice > 0 {
+			baselineMark = liveRisk.PriceShockBaselineMarkPrice
+		}
+	}
+	priceGuardText := "监控中"
+	if priceAllowed {
+		priceGuardText = "安全"
+	} else if strings.TrimSpace(priceReason) != "" {
+		priceGuardText = priceRiskReasonLabel(priceReason)
+	}
+	lines := []string{
+		strings.Join([]string{
+			renderField("1h 价格冲击", toneStyle(signedNumberTone(shockRatio)).Render(fmtPctRatio(shockRatio, 2))),
+			renderField("风控阈值", toneStyle("accent").Render(fmtPctRatio(strategy.SameExchangeMax1hPriceShockRatio, 2))),
+			renderField("基准标记价", toneStyle("accent").Render(priceText(baselineMark))),
+			renderField("当前标记价", toneStyle("accent").Render(priceText(currentMark))),
+			renderField("价格风控", toneStyle(riskGuardTone(priceAllowed, priceReason)).Render(priceGuardText)),
+		}, "  "),
+	}
+	if liveRisk.Enabled {
+		lines = append(lines, strings.Join([]string{
+			renderField("爆仓价", toneStyle("accent").Render(priceText(liveRisk.LiquidationPrice))),
+			renderField("爆仓距离", toneStyle(liquidationDistanceTone(liveRisk.LiquidationDistanceRatio, liveRisk)).Render(liquidationDistanceText(liveRisk.LiquidationDistanceRatio))),
+			renderField("保护单", toneStyle(protectiveOrderTone(liveRisk)).Render(sameExchangeProtectiveStatusText(liveRisk))),
+			renderField("保护价", toneStyle("accent").Render(priceText(liveRisk.ProtectiveOrderStopPrice))),
+			renderField("保护更新时间", renderTimeValue(liveRisk.ProtectiveOrderUpdatedAtMs, "accent")),
+		}, "  "))
+		if strings.TrimSpace(liveRisk.ProtectiveOrderErrorMessage) != "" {
+			lines = append(lines, renderField("保护单说明", toneStyle("warn").Render(liveRisk.ProtectiveOrderErrorMessage)))
+		}
+	}
+	if strings.TrimSpace(priceReason) != "" && !priceAllowed {
+		lines = append(lines, renderField("风险说明", toneStyle("warn").Render(priceRiskReasonLabel(priceReason))))
+	}
+	return lines
+}
+
+func priceRiskReasonLabel(reason string) string {
+	switch normalizeTUIStatus(reason) {
+	case "max_1h_price_shock":
+		return "1h 拉升过快"
+	case "eligible", "":
+		return "--"
+	default:
+		return reason
+	}
+}
+
+func riskGuardTone(allowed bool, reason string) string {
+	if allowed {
+		return "good"
+	}
+	if strings.TrimSpace(reason) != "" {
+		return "bad"
+	}
+	return "warn"
+}
+
+func sameExchangeProtectiveStatusText(risk service.SameExchangeLiveRiskInspection) string {
+	status := normalizeTUIStatus(risk.ProtectiveOrderStatus)
+	switch {
+	case !risk.Enabled:
+		return "--"
+	case status == "":
+		return "未挂保护单"
+	case risk.ProtectiveOrderArmed:
+		return "已挂保护单"
+	case status == "filled":
+		return "已触发"
+	case status == "canceled" || status == "cancelled":
+		return "已撤销"
+	case status == "error":
+		return "保护单失败"
+	default:
+		return strings.ToUpper(strings.TrimSpace(risk.ProtectiveOrderStatus))
+	}
+}
+
+func protectiveOrderTone(risk service.SameExchangeLiveRiskInspection) string {
+	status := normalizeTUIStatus(risk.ProtectiveOrderStatus)
+	switch {
+	case !risk.Enabled:
+		return "subtle"
+	case risk.ProtectiveOrderArmed:
+		return "good"
+	case status == "filled":
+		return "warn"
+	case status == "error":
+		return "bad"
+	default:
+		return "subtle"
+	}
+}
+
+func liquidationDistanceText(ratio float64) string {
+	if ratio <= 0 {
+		return "--"
+	}
+	return fmtPctRatio(ratio, 2)
+}
+
+func liquidationDistanceTone(ratio float64, risk service.SameExchangeLiveRiskInspection) string {
+	if ratio <= 0 {
+		return "subtle"
+	}
+	switch {
+	case risk.EmergencyLiqDistanceRatio > 0 && ratio <= risk.EmergencyLiqDistanceRatio:
+		return "bad"
+	case risk.ReduceLiqDistanceRatio > 0 && ratio <= risk.ReduceLiqDistanceRatio:
+		return "warn"
+	default:
+		return "good"
+	}
+}
+
+func normalizeTUIStatus(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func midpoint(bid, ask float64) float64 {
@@ -1576,8 +3389,12 @@ func statusText(status string) string {
 		return "价差过小"
 	case "basis_too_wide":
 		return "基差过宽"
+	case "price_risk_guard":
+		return "价格异动风控"
 	case "not_profitable":
 		return "收益不足"
+	case "long_hold_guard":
+		return "长持条件不足"
 	case "stale_data":
 		return "数据过期"
 	case "outside_entry_window":
@@ -1826,15 +3643,30 @@ func livePositionSummaryText(summary string) string {
 	}
 }
 
+func livePositionLegLabels(arbitrageMode string) (string, string) {
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return "现货腿", "永续腿"
+	}
+	return "多头腿", "空头腿"
+}
+
 func (m Model) renderLivePositionDetail(item service.LivePositionCandidate, width int) string {
+	arbitrageMode := recordArbitrageMode(item.Execution, m.data.System.Strategy.ArbitrageMode)
+	if item.Plan != nil {
+		arbitrageMode = planArbitrageMode(*item.Plan, arbitrageMode)
+	}
+	longLabel, shortLabel := livePositionLegLabels(arbitrageMode)
 	lines := []string{
 		strings.Join([]string{
 			renderField("同步", toneStyle(livePositionStatusTone(item.SyncStatus)).Render(livePositionStatusLabel(item.SyncStatus))),
 			renderField("摘要", toneStyle(livePositionStatusTone(item.SyncStatus)).Render(clip(livePositionSummaryText(item.Summary), maxInt(10, width-18)))),
 		}, "  "),
 	}
-	lines = append(lines, m.renderLivePositionLegDetail("多头腿", item.LongLeg))
-	lines = append(lines, m.renderLivePositionLegDetail("空头腿", item.ShortLeg))
+	if item.Risk.Enabled {
+		lines = append(lines, renderSameExchangeRiskSummary(m.data.System.Strategy, nil, OpportunityListItem{}, valueOrZeroPlan(item.Plan), item.Plan != nil, item.Risk)...)
+	}
+	lines = append(lines, m.renderLivePositionLegDetail(longLabel, item.LongLeg))
+	lines = append(lines, m.renderLivePositionLegDetail(shortLabel, item.ShortLeg))
 	return strings.Join(lines, "\n")
 }
 
@@ -1851,10 +3683,29 @@ func (m Model) renderLivePositionLegDetail(label string, leg service.LivePositio
 		renderField("数量", renderPositionQtyValue(leg.Position.Quantity)),
 		renderField("开仓价", toneStyle("accent").Render(priceText(leg.Position.EntryPrice))),
 		renderField("标记价", toneStyle("accent").Render(priceText(leg.Position.MarkPrice))),
+		renderField("爆仓价", toneStyle("accent").Render(priceText(leg.Position.LiquidationPrice))),
+		renderField("爆仓距离", toneStyle("accent").Render(liquidationDistanceText(livePositionLiquidationDistanceRatio(leg.Position)))),
 		renderField("浮盈亏", renderMoneyValue(leg.Position.UnrealizedPnL, 3)),
 		renderField("可见", renderBoolValue(leg.HasPosition, false)),
 		renderField("方向正确", renderBoolValue(leg.DirectionOK, false)),
 	}, "  ")
+}
+
+func valueOrZeroPlan(plan *entity.ExecutionPlan) entity.ExecutionPlan {
+	if plan == nil {
+		return entity.ExecutionPlan{}
+	}
+	return *plan
+}
+
+func livePositionLiquidationDistanceRatio(pos exchange.Position) float64 {
+	if pos.MarkPrice <= 0 || pos.LiquidationPrice <= 0 || math.Abs(pos.Quantity) <= 1e-9 {
+		return 0
+	}
+	if pos.Quantity < 0 {
+		return math.Max(0, (pos.LiquidationPrice-pos.MarkPrice)/pos.MarkPrice)
+	}
+	return math.Max(0, (pos.MarkPrice-pos.LiquidationPrice)/pos.MarkPrice)
 }
 
 func renderTimeValue(ms int64, tone string) string {
@@ -1901,7 +3752,7 @@ func statusTone(status string) string {
 		return "subtle"
 	case "eligible", "ready", "opened", "closed", "dry_run_opened", "dry_run_closed", "filled", "no_position":
 		return "good"
-	case "watching", "pending_open", "pending_close", "open_partial_failed", "close_partial_failed", "open_hedging", "close_hedging", "outside_entry_window", "pending", "submitted", "new", "partially_filled", "partially_filled_canceled":
+	case "watching", "pending_open", "pending_close", "open_partial_failed", "close_partial_failed", "open_hedging", "close_hedging", "outside_entry_window", "pending", "submitted", "new", "partially_filled", "partially_filled_canceled", "long_hold_guard":
 		return "warn"
 	default:
 		return "bad"

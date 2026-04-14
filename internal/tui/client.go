@@ -31,6 +31,7 @@ type apiEnvelope[T any] struct {
 
 type StrategyStatus struct {
 	Mode                                       string                        `json:"mode"`
+	ArbitrageMode                              string                        `json:"arbitrage_mode"`
 	Enabled                                    bool                          `json:"enabled"`
 	HoldHours                                  float64                       `json:"hold_hours"`
 	HoldSelectionMode                          string                        `json:"hold_selection_mode"`
@@ -49,11 +50,26 @@ type StrategyStatus struct {
 	Leverage                                   float64                       `json:"leverage"`
 	FeesByExchange                             map[string]exchange.FeeConfig `json:"fees_by_exchange"`
 	FundingHistoryLookback                     string                        `json:"funding_history_lookback"`
+	FundingRateHistoryLookback                 string                        `json:"funding_rate_history_lookback"`
+	FundingRateHistorySyncInterval             string                        `json:"funding_rate_history_sync_interval"`
 	FundingSmoothingCurrentWeight              float64                       `json:"funding_smoothing_current_weight"`
 	DynamicCandidateLimit                      int                           `json:"dynamic_candidate_limit"`
 	RotationBatchSize                          int                           `json:"rotation_batch_size"`
 	RotationInterval                           string                        `json:"rotation_interval"`
 	DeepScanHoldDuration                       string                        `json:"deep_scan_hold_duration"`
+	SameExchangeRequireLongHoldEligible        bool                          `json:"same_exchange_require_long_hold_eligible"`
+	SameExchangeMinHistorySampleCount          int                           `json:"same_exchange_min_history_sample_count"`
+	SameExchangeMinHistoricalSupportRatio      float64                       `json:"same_exchange_min_historical_support_ratio"`
+	SameExchangeMinAnnualizedNetRate           float64                       `json:"same_exchange_min_annualized_net_rate"`
+	SameExchangeBasisLongHoldWindowHours       float64                       `json:"same_exchange_basis_long_hold_window_hours"`
+	SameExchangeMaxBasisPaybackEvents          float64                       `json:"same_exchange_max_basis_payback_events"`
+	SameExchangeCloseOnNegativeFunding         bool                          `json:"same_exchange_close_on_negative_funding"`
+	SameExchangeHistoryNegativeExitThreshold   float64                       `json:"same_exchange_history_negative_exit_threshold"`
+	SameExchangeExitRequirePositiveClosePNL    bool                          `json:"same_exchange_exit_require_positive_close_pnl"`
+	SameExchangeExitMinClosePNL                float64                       `json:"same_exchange_exit_min_close_pnl"`
+	SameExchangeExtremeBasisPaybackEvents      float64                       `json:"same_exchange_extreme_basis_payback_events"`
+	SameExchangeExtremeBasisSizeMultiplier     float64                       `json:"same_exchange_extreme_basis_size_multiplier"`
+	SameExchangeMax1hPriceShockRatio           float64                       `json:"same_exchange_max_1h_price_shock_ratio"`
 	CoreSymbols                                []string                      `json:"core_symbols"`
 	RollingReviewSettleGracePeriod             string                        `json:"rolling_review_settle_grace_period"`
 	RollingReviewFreshSnapshotMaxWait          string                        `json:"rolling_review_fresh_snapshot_max_wait"`

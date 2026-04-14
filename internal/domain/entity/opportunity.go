@@ -29,17 +29,43 @@ type OpportunityProjection struct {
 }
 
 type OpportunityFundingRule struct {
-	Exchange             string  `json:"exchange"`
-	VenueSymbol          string  `json:"venue_symbol"`
-	FundingIntervalHours int     `json:"funding_interval_hours"`
-	NextFundingTimeMs    int64   `json:"next_funding_time_ms"`
-	CurrentFundingRate   float64 `json:"current_funding_rate"`
-	ClampSource          string  `json:"clamp_source"`
-	EffectiveFloorRate   float64 `json:"effective_floor_rate"`
-	EffectiveCapRate     float64 `json:"effective_cap_rate"`
-	ForecastRegime       string  `json:"forecast_regime"`
-	ForecastConfidence   string  `json:"forecast_confidence"`
-	MetadataSummary      string  `json:"metadata_summary"`
+	Exchange                     string                           `json:"exchange"`
+	VenueSymbol                  string                           `json:"venue_symbol"`
+	FundingIntervalHours         int                              `json:"funding_interval_hours"`
+	NextFundingTimeMs            int64                            `json:"next_funding_time_ms"`
+	CurrentFundingRate           float64                          `json:"current_funding_rate"`
+	CurrentFundingRank           int                              `json:"current_funding_rank,omitempty"`
+	CurrentFundingRankTotal      int                              `json:"current_funding_rank_total,omitempty"`
+	CurrentFundingRankPercentile float64                          `json:"current_funding_rank_percentile,omitempty"`
+	HistorySampleCount           int                              `json:"history_sample_count,omitempty"`
+	HistoryMeanRate              float64                          `json:"history_mean_rate,omitempty"`
+	HistoryNegativeRatio         float64                          `json:"history_negative_ratio,omitempty"`
+	HistoryPositiveRatio         float64                          `json:"history_positive_ratio,omitempty"`
+	HistoricalSupportRatio       float64                          `json:"historical_support_ratio,omitempty"`
+	CurrentHistoricalPercentile  float64                          `json:"current_historical_percentile,omitempty"`
+	EstimatedEventRate           float64                          `json:"estimated_event_rate,omitempty"`
+	EstimatedAnnualizedCarryRate float64                          `json:"estimated_annualized_carry_rate,omitempty"`
+	EstimatedAnnualizedNetRate   float64                          `json:"estimated_annualized_net_rate,omitempty"`
+	SuggestedFundingEvents       int                              `json:"suggested_funding_events,omitempty"`
+	SuggestedHoldHours           float64                          `json:"suggested_hold_hours,omitempty"`
+	SuggestedFundingTimeMs       int64                            `json:"suggested_funding_time_ms,omitempty"`
+	SuggestedGrossFundingPNL     float64                          `json:"suggested_gross_funding_pnl,omitempty"`
+	SuggestedNetPNL              float64                          `json:"suggested_net_pnl,omitempty"`
+	LongHoldEligible             bool                             `json:"long_hold_eligible,omitempty"`
+	LongHoldReason               string                           `json:"long_hold_reason,omitempty"`
+	ClampSource                  string                           `json:"clamp_source"`
+	EffectiveFloorRate           float64                          `json:"effective_floor_rate"`
+	EffectiveCapRate             float64                          `json:"effective_cap_rate"`
+	ForecastRegime               string                           `json:"forecast_regime"`
+	ForecastConfidence           string                           `json:"forecast_confidence"`
+	MetadataSummary              string                           `json:"metadata_summary"`
+	HistorySeries                []OpportunityFundingHistoryPoint `json:"history_series,omitempty"`
+}
+
+type OpportunityFundingHistoryPoint struct {
+	FundingTimeMs int64   `json:"funding_time_ms"`
+	FundingRate   float64 `json:"funding_rate"`
+	MarkPrice     float64 `json:"mark_price,omitempty"`
 }
 
 // OpportunityFundingSegment 用于把 rolling_cycle_aligned 模式拆出来的每个 settlement 段直接持久化。
@@ -104,21 +130,39 @@ type Opportunity struct {
 	LongMarkPrice  float64 `json:"long_mark_price"`
 	ShortMarkPrice float64 `json:"short_mark_price"`
 
-	GrossFundingPNL        float64 `json:"gross_funding_pnl"`
-	EntryFeePNL            float64 `json:"entry_fee_pnl"`
-	ExitFeePNL             float64 `json:"exit_fee_pnl"`
-	SlippagePNL            float64 `json:"slippage_pnl"`
-	SafetyBufferPNL        float64 `json:"safety_buffer_pnl"`
-	EntryPenaltyBps        float64 `json:"entry_penalty_bps"`
-	ExitPenaltyBps         float64 `json:"exit_penalty_bps"`
-	HedgePenaltyBps        float64 `json:"hedge_penalty_bps"`
-	ExecutionPenaltyBps    float64 `json:"execution_penalty_bps"`
-	ExecutionPenaltyModel  string  `gorm:"size:64" json:"execution_penalty_model"`
-	ExecutionPenaltyBucket string  `gorm:"size:64" json:"execution_penalty_bucket"`
-	NetExpectedPNL         float64 `gorm:"index:idx_opp_batch_score_pnl_time,priority:3,sort:desc" json:"net_expected_pnl"`
-	NetExpectedBps         float64 `json:"net_expected_bps"`
-	BasisBps               float64 `json:"basis_bps"`
-	MaxAllowedBasisBps     float64 `json:"max_allowed_basis_bps"`
+	GrossFundingPNL                              float64 `json:"gross_funding_pnl"`
+	EntryFeePNL                                  float64 `json:"entry_fee_pnl"`
+	ExitFeePNL                                   float64 `json:"exit_fee_pnl"`
+	SlippagePNL                                  float64 `json:"slippage_pnl"`
+	SafetyBufferPNL                              float64 `json:"safety_buffer_pnl"`
+	EntryPenaltyBps                              float64 `json:"entry_penalty_bps"`
+	ExitPenaltyBps                               float64 `json:"exit_penalty_bps"`
+	HedgePenaltyBps                              float64 `json:"hedge_penalty_bps"`
+	ExecutionPenaltyBps                          float64 `json:"execution_penalty_bps"`
+	ExecutionPenaltyModel                        string  `gorm:"size:64" json:"execution_penalty_model"`
+	ExecutionPenaltyBucket                       string  `gorm:"size:64" json:"execution_penalty_bucket"`
+	NetExpectedPNL                               float64 `gorm:"index:idx_opp_batch_score_pnl_time,priority:3,sort:desc" json:"net_expected_pnl"`
+	NetExpectedBps                               float64 `json:"net_expected_bps"`
+	BasisBps                                     float64 `json:"basis_bps"`
+	MaxAllowedBasisBps                           float64 `json:"max_allowed_basis_bps"`
+	SameExchangePriceRiskAllowed                 bool    `json:"same_exchange_price_risk_allowed"`
+	SameExchangePriceRiskReason                  string  `gorm:"size:64" json:"same_exchange_price_risk_reason,omitempty"`
+	SameExchangePriceShockCurrentMarkPrice       float64 `json:"same_exchange_price_shock_current_mark_price"`
+	SameExchangePriceShockBaselineMarkPrice      float64 `json:"same_exchange_price_shock_baseline_mark_price"`
+	SameExchangePriceShockRatio                  float64 `json:"same_exchange_price_shock_ratio"`
+	SameExchangeBasisUsesPaybackModel            bool    `json:"same_exchange_basis_uses_payback_model"`
+	SameExchangeBasisCostBps                     float64 `json:"same_exchange_basis_cost_bps"`
+	SameExchangeBasisCarryPerEventBps            float64 `json:"same_exchange_basis_carry_per_event_bps"`
+	SameExchangeBasisPaybackFundingEvents        float64 `json:"same_exchange_basis_payback_funding_events"`
+	SameExchangeBasisAllowed                     bool    `json:"same_exchange_basis_allowed"`
+	SameExchangeBasisReason                      string  `gorm:"size:64" json:"same_exchange_basis_reason"`
+	SameExchangeBasisRiskSizeMultiplier          float64 `json:"same_exchange_basis_risk_size_multiplier"`
+	SameExchangeLongHoldUsingHistoryEstimate     bool    `json:"same_exchange_long_hold_using_history_estimate"`
+	SameExchangeLongHoldSuggestedFundingEvents   int     `json:"same_exchange_long_hold_suggested_funding_events,omitempty"`
+	SameExchangeLongHoldSuggestedHoldHours       float64 `json:"same_exchange_long_hold_suggested_hold_hours,omitempty"`
+	SameExchangeLongHoldSuggestedFundingTimeMs   int64   `json:"same_exchange_long_hold_suggested_funding_time_ms,omitempty"`
+	SameExchangeLongHoldSuggestedGrossFundingPNL float64 `json:"same_exchange_long_hold_suggested_gross_funding_pnl,omitempty"`
+	SameExchangeLongHoldSuggestedNetPNL          float64 `json:"same_exchange_long_hold_suggested_net_pnl,omitempty"`
 
 	Score float64 `gorm:"index:idx_opp_batch_score_pnl_time,priority:2,sort:desc" json:"score"`
 

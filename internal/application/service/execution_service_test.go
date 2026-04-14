@@ -130,7 +130,19 @@ type testPlanRepo struct {
 }
 
 func (r *testPlanRepo) SaveBatch(_ context.Context, _, _ string, items []entity.ExecutionPlan) error {
-	r.items = append([]entity.ExecutionPlan(nil), items...)
+	for _, item := range items {
+		updated := false
+		for i := range r.items {
+			if r.items[i].PlanKey == item.PlanKey {
+				r.items[i] = item
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			r.items = append(r.items, item)
+		}
+	}
 	return nil
 }
 
@@ -215,6 +227,7 @@ type testTradeAdapter struct {
 	accountErr   error
 	positionErr  error
 	placed       []exchange.TradeOrderRequest
+	protected    []exchange.TradeOrderRequest
 	closed       []exchange.TradeOrderRequest
 	canceled     []exchange.OrderLookupRequest
 	closeResp    exchange.TradeOrderResult
@@ -266,6 +279,12 @@ func (a *testTradeAdapter) PlaceOrder(ctx context.Context, req exchange.TradeOrd
 		return exchange.TradeOrderResult{}, a.placeErr
 	}
 	return exchange.TradeOrderResult{Status: "NEW", ClientOrderID: req.ClientOrderID}, nil
+}
+func (a *testTradeAdapter) PlaceProtectiveStop(ctx context.Context, req exchange.TradeOrderRequest) (exchange.TradeOrderResult, error) {
+	a.mu.Lock()
+	a.protected = append(a.protected, req)
+	a.mu.Unlock()
+	return exchange.TradeOrderResult{Status: "NEW", ClientOrderID: req.ClientOrderID, VenueOrderID: "protect-1"}, nil
 }
 func (a *testTradeAdapter) ClosePosition(_ context.Context, req exchange.TradeOrderRequest) (exchange.TradeOrderResult, error) {
 	a.mu.Lock()
@@ -1352,6 +1371,135 @@ func TestReconcileLivePositions_DoesNotClosePendingOpenAwaitingFill(t *testing.T
 	}
 }
 
+func TestInspectLivePositions_FlagsSizeMismatch(t *testing.T) {
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:       "plan-size-mismatch",
+				Symbol:        "BTC",
+				Status:        executionStateOpened,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longsize",
+				ShortExchange: "shortsize",
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:          "plan-size-mismatch",
+				Symbol:           "BTC",
+				LongExchange:     "longsize",
+				ShortExchange:    "shortsize",
+				LongVenueSymbol:  "BTCUSDT",
+				ShortVenueSymbol: "BTCUSDT",
+				LongQty:          2,
+				ShortQty:         2,
+			},
+		},
+	}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"longsize":  &testTradeAdapter{name: "longsize", enabled: true, position: exchange.Position{Exchange: "longsize", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: 2}},
+		"shortsize": &testTradeAdapter{name: "shortsize", enabled: true, position: exchange.Position{Exchange: "shortsize", Symbol: "BTC", VenueSymbol: "BTCUSDT", Quantity: -1.4}},
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.ExecutionPositionMonitorMaxQtyDeviationRatio = 0.1
+
+	inspection, err := svc.InspectLivePositions(context.Background())
+	if err != nil {
+		t.Fatalf("expected inspect live positions to succeed, got %v", err)
+	}
+	if inspection.SizeMismatch != 1 {
+		t.Fatalf("expected 1 size_mismatch, got %+v", inspection)
+	}
+	if len(inspection.Candidates) != 1 {
+		t.Fatalf("expected 1 live position candidate, got %d", len(inspection.Candidates))
+	}
+	if got := inspection.Candidates[0].SyncStatus; got != "size_mismatch" {
+		t.Fatalf("expected sync status size_mismatch, got %q", got)
+	}
+	if inspection.Candidates[0].ShortLeg.SizeOK {
+		t.Fatal("expected short leg size check to fail")
+	}
+}
+
+func TestReconcileLivePositions_ForceClosesSingleLegExposure(t *testing.T) {
+	now := time.Now().UTC()
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:       "plan-single-leg-close",
+				Symbol:        "ETH",
+				Status:        executionStateOpened,
+				LiveTrading:   true,
+				AutoClose:     true,
+				LongExchange:  "longsolo",
+				ShortExchange: "shortsolo",
+			},
+		},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{
+			{
+				PlanKey:             "plan-single-leg-close",
+				Symbol:              "ETH",
+				LongExchange:        "longsolo",
+				ShortExchange:       "shortsolo",
+				LongVenueSymbol:     "ETHUSDT",
+				ShortVenueSymbol:    "ETHUSDT",
+				LongQty:             2,
+				ShortQty:            2,
+				LongEntryPrice:      100,
+				ShortEntryPrice:     100,
+				RoundedNotionalUSDT: 200,
+				TargetNotionalUSDT:  200,
+				EntryMode:           "taker",
+				ExitMode:            "taker",
+			},
+		},
+	}
+	longAdapter := &testTradeAdapter{name: "longsolo", enabled: true, position: exchange.Position{Exchange: "longsolo", Symbol: "ETH", VenueSymbol: "ETHUSDT", Quantity: 2}}
+	shortAdapter := &testTradeAdapter{name: "shortsolo", enabled: true, position: exchange.Position{Exchange: "shortsolo", Symbol: "ETH", VenueSymbol: "ETHUSDT", Quantity: 0}}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"longsolo":  longAdapter,
+		"shortsolo": shortAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.ExecutionPositionMonitorForceCloseOnSingleLeg = true
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longsolo", Symbol: "ETH", VenueSymbol: "ETHUSDT", TickSize: "0.01", StepSize: "0.001"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortsolo", Symbol: "ETH", VenueSymbol: "ETHUSDT", TickSize: "0.01", StepSize: "0.001"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longsolo", Symbol: "ETH", VenueSymbol: "ETHUSDT", BidPrice: 100, AskPrice: 100.1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortsolo", Symbol: "ETH", VenueSymbol: "ETHUSDT", BidPrice: 99.9, AskPrice: 100.0, EventTimeMs: now.UnixMilli()})
+
+	reconciled, err := svc.ReconcileLivePositions(context.Background())
+	if err != nil {
+		t.Fatalf("expected reconcile to succeed, got %v", err)
+	}
+	if reconciled != 1 {
+		t.Fatalf("expected 1 reconciled execution, got %d", reconciled)
+	}
+
+	rec, err := execRepo.FindByPlanKey(context.Background(), "plan-single-leg-close")
+	if err != nil {
+		t.Fatalf("expected load record to succeed, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected closed record to exist")
+	}
+	if rec.Status != executionStateClosed {
+		t.Fatalf("expected single-leg record to be closed, got %q", rec.Status)
+	}
+	if !strings.Contains(rec.StatusReason, "single_leg") {
+		t.Fatalf("expected status reason to mention single_leg, got %q", rec.StatusReason)
+	}
+	if len(longAdapter.closed) != 1 || len(shortAdapter.closed) != 1 {
+		t.Fatalf("expected force close to hit both venues, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+}
+
 func TestSweepLiveAutoClose_ClosesRetryCloseCandidates(t *testing.T) {
 	now := time.Now().UTC()
 	orderRepo := &testOrderRepo{}
@@ -1961,6 +2109,59 @@ func TestApplyExternalOrderEvent_UpdatesExecutionFromPendingOpenToOpened(t *test
 	}
 }
 
+func TestApplyExternalOrderEvent_ProtectiveStopDoesNotAdvanceExecutionState(t *testing.T) {
+	orderRepo := &testOrderRepo{
+		items: []entity.OrderRecord{
+			{
+				ID:              1,
+				PlanKey:         "plan-ext-protect",
+				ExecutionStatus: "opened",
+				Phase:           sameExchangeProtectPhase,
+				LegRole:         sameExchangeProtectLegRole,
+				Exchange:        "binance",
+				Symbol:          "BTC",
+				ClientOrderID:   "protect-1",
+				Status:          "NEW",
+				ExecutedQty:     0,
+			},
+		},
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey: "plan-ext-protect",
+				Status:  executionStateOpened,
+			},
+		},
+	}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{})
+	svc.execRepo = execRepo
+
+	rec, err := svc.ApplyExternalOrderEvent(context.Background(), ExternalOrderEvent{
+		Source:        "user_stream",
+		Exchange:      "binance",
+		ClientOrderID: "protect-1",
+		Status:        "FILLED",
+		ExecutedQty:   1,
+		AveragePrice:  108,
+		Terminal:      true,
+		OccurredAtMs:  999002,
+	})
+	if err != nil {
+		t.Fatalf("expected protective stop event apply to succeed, got %v", err)
+	}
+	if rec == nil || rec.Status != executionStateOpened {
+		t.Fatalf("expected execution state to stay opened, got %+v", rec)
+	}
+	order, err := orderRepo.FindByExternalOrderID(context.Background(), "binance", "protect-1", "")
+	if err != nil {
+		t.Fatalf("expected protective order lookup to succeed, got %v", err)
+	}
+	if order == nil || order.Status != "FILLED" {
+		t.Fatalf("expected protective order to update, got %+v", order)
+	}
+}
+
 func TestApplyExternalOrderEvent_UnknownOrderReturnsError(t *testing.T) {
 	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
 	svc.execRepo = &testExecRepo{}
@@ -2506,6 +2707,290 @@ func TestOpenByPlanKey_MissingPlanReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestOpenPlan_SameExchangeArmsPerpProtectiveStop(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	spotAdapter := &testTradeAdapter{
+		name:    "binance_spot",
+		enabled: true,
+		account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500},
+	}
+	perpAdapter := &testTradeAdapter{
+		name:    "binance",
+		enabled: true,
+		account: exchange.AccountSnapshot{Equity: 2000, AvailableBalance: 1500},
+		position: exchange.Position{
+			Exchange:         "binance",
+			Symbol:           "BTC",
+			VenueSymbol:      "BTCUSDT",
+			Quantity:         -1,
+			MarkPrice:        100.1,
+			LiquidationPrice: 130,
+		},
+	}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"binance_spot": spotAdapter,
+		"binance":      perpAdapter,
+	})
+	svc.execRepo = &testExecRepo{}
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.MinNetPNL = 0.1
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", VenueAssetID: "BTC", StepSize: "0.001", MinQty: "0.001", MinNotional: "10", ContractType: "SPOT"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinQty: "0.001", MinNotional: "10", ContractType: "PERPETUAL"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100, AskPrice: 100.1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.1, AskPrice: 100.2, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		MarkPrice:            100.1,
+		FundingRate:          0.001,
+		FundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-same-protect",
+		ArbitrageMode:    ArbitrageModeSameExchangeSpotPerp,
+		Symbol:           "BTC",
+		LongExchange:     "binance_spot",
+		ShortExchange:    "binance",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          1,
+		ShortQty:         1,
+		LongEntryPrice:   100.1,
+		ShortEntryPrice:  100.1,
+		EntryMode:        "taker",
+		ExitMode:         "taker",
+	}
+
+	rec, err := svc.openPlan(context.Background(), plan, "manual", true)
+	if err != nil {
+		t.Fatalf("expected same-exchange open to succeed, got %v", err)
+	}
+	if rec == nil || rec.Status != executionStateOpened {
+		t.Fatalf("expected opened execution record, got %+v", rec)
+	}
+	if len(perpAdapter.protected) != 1 {
+		t.Fatalf("expected one perp protective stop, got %d", len(perpAdapter.protected))
+	}
+	if len(spotAdapter.protected) != 0 {
+		t.Fatalf("expected no spot protective stop, got %d", len(spotAdapter.protected))
+	}
+	req := perpAdapter.protected[0]
+	if req.OrderType != "STOP_MARKET" || !req.ReduceOnly || req.Side != "BUY" {
+		t.Fatalf("unexpected protective stop request %+v", req)
+	}
+	if req.StopPrice <= 100.1 {
+		t.Fatalf("expected protective stop to stay above current mark for short close, got %+v", req)
+	}
+	if len(orderRepo.items) != 3 {
+		t.Fatalf("expected 3 order records including protective stop, got %d", len(orderRepo.items))
+	}
+	if orderRepo.items[2].Phase != sameExchangeProtectPhase {
+		t.Fatalf("expected third order record to be protective stop, got %+v", orderRepo.items[2])
+	}
+}
+
+func TestClosePlan_CancelsSameExchangeProtectiveStopAfterClose(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{
+		items: []entity.OrderRecord{
+			{
+				ID:            1,
+				PlanKey:       "plan-same-close-protect",
+				Phase:         sameExchangeProtectPhase,
+				LegRole:       sameExchangeProtectLegRole,
+				Exchange:      "binance",
+				Symbol:        "BTC",
+				VenueSymbol:   "BTCUSDT",
+				ClientOrderID: "protect-cli",
+				VenueOrderID:  "protect-order",
+				Status:        "NEW",
+			},
+		},
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{{
+			PlanKey:     "plan-same-close-protect",
+			Status:      executionStateOpened,
+			LiveTrading: true,
+		}},
+	}
+	spotAdapter := &testTradeAdapter{name: "binance_spot", enabled: true}
+	perpAdapter := &testTradeAdapter{name: "binance", enabled: true}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"binance_spot": spotAdapter,
+		"binance":      perpAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", VenueAssetID: "BTC", StepSize: "0.001", MinQty: "0.001", ContractType: "SPOT"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinQty: "0.001", ContractType: "PERPETUAL"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100, AskPrice: 100.1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.1, AskPrice: 100.2, EventTimeMs: now.UnixMilli()})
+
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-same-close-protect",
+		ArbitrageMode:    ArbitrageModeSameExchangeSpotPerp,
+		Symbol:           "BTC",
+		LongExchange:     "binance_spot",
+		ShortExchange:    "binance",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+		LongQty:          1,
+		ShortQty:         1,
+		LongEntryPrice:   100.1,
+		ShortEntryPrice:  100.1,
+		EntryMode:        "taker",
+		ExitMode:         "taker",
+	}
+
+	rec, err := svc.closePlan(context.Background(), plan, "manual", true)
+	if err != nil {
+		t.Fatalf("expected close to succeed, got %v", err)
+	}
+	if rec == nil || rec.Status != executionStateClosed {
+		t.Fatalf("expected closed execution record, got %+v", rec)
+	}
+	if len(perpAdapter.canceled) != 1 {
+		t.Fatalf("expected protective stop cancel request, got %d", len(perpAdapter.canceled))
+	}
+	if orderRepo.items[0].Status != "CANCELED" {
+		t.Fatalf("expected protective order record to be marked canceled, got %+v", orderRepo.items[0])
+	}
+}
+
+func TestInspectLivePositions_SameExchangeIncludesRiskAndProtectiveStatus(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{
+		items: []entity.OrderRecord{{
+			ID:             1,
+			PlanKey:        "plan-live-risk",
+			Phase:          sameExchangeProtectPhase,
+			LegRole:        sameExchangeProtectLegRole,
+			Exchange:       "binance",
+			Symbol:         "BTC",
+			VenueSymbol:    "BTCUSDT",
+			ClientOrderID:  "protect-cli",
+			Status:         "NEW",
+			RequestedPrice: 118,
+			TimestampModel: entity.TimestampModel{
+				CreatedAt: now.Add(-time.Minute),
+				UpdatedAt: now,
+			},
+		}},
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{{
+			PlanKey:       "plan-live-risk",
+			Symbol:        "BTC",
+			LongExchange:  "binance_spot",
+			ShortExchange: "binance",
+			ArbitrageMode: ArbitrageModeSameExchangeSpotPerp,
+			Status:        executionStateOpened,
+			LiveTrading:   true,
+			AutoClose:     true,
+		}},
+	}
+	planRepo := &testPlanRepo{
+		items: []entity.ExecutionPlan{{
+			PlanKey:          "plan-live-risk",
+			Symbol:           "BTC",
+			LongExchange:     "binance_spot",
+			ShortExchange:    "binance",
+			LongVenueSymbol:  "BTCUSDT",
+			ShortVenueSymbol: "BTCUSDT",
+			LongQty:          1,
+			ShortQty:         1,
+			ArbitrageMode:    ArbitrageModeSameExchangeSpotPerp,
+		}},
+	}
+	spotAdapter := &testTradeAdapter{
+		name:    "binance_spot",
+		enabled: true,
+		position: exchange.Position{
+			Exchange:    "binance_spot",
+			Symbol:      "BTC",
+			VenueSymbol: "BTCUSDT",
+			Quantity:    1,
+			MarkPrice:   110,
+		},
+	}
+	perpAdapter := &testTradeAdapter{
+		name:    "binance",
+		enabled: true,
+		position: exchange.Position{
+			Exchange:         "binance",
+			Symbol:           "BTC",
+			VenueSymbol:      "BTCUSDT",
+			Quantity:         -1,
+			MarkPrice:        110,
+			LiquidationPrice: 121,
+		},
+	}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"binance_spot": spotAdapter,
+		"binance":      perpAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.marketRepo = &testMarketDataRepo{
+		funding: []entity.FundingSnapshot{{
+			Exchange:             "binance",
+			Symbol:               "BTC",
+			VenueSymbol:          "BTCUSDT",
+			FundingRate:          0.01,
+			FundingTimeMs:        now.Add(time.Hour).UnixMilli(),
+			FundingIntervalHours: 8,
+			MarkPrice:            100,
+			EventTimeMs:          now.Add(-50 * time.Minute).UnixMilli(),
+		}},
+	}
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.cfg.SameExchangeMax1hPriceShockRatio = 0.08
+	svc.cfg.SameExchangeReduceLiqDistanceRatio = 0.10
+	svc.cfg.SameExchangeEmergencyLiqDistanceRatio = 0.08
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "SPOT"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 109.9, AskPrice: 110, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 110, AskPrice: 110.1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          0.01,
+		FundingTimeMs:        now.Add(time.Hour).UnixMilli(),
+		FundingIntervalHours: 8,
+		MarkPrice:            110,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	inspection, err := svc.InspectLivePositions(context.Background())
+	if err != nil {
+		t.Fatalf("InspectLivePositions error = %v", err)
+	}
+	if len(inspection.Candidates) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(inspection.Candidates))
+	}
+	risk := inspection.Candidates[0].Risk
+	if !risk.Enabled {
+		t.Fatalf("expected same-exchange risk to be enabled, got %+v", risk)
+	}
+	if !risk.ProtectiveOrderArmed || risk.ProtectiveOrderStatus != "NEW" {
+		t.Fatalf("expected active protective order, got %+v", risk)
+	}
+	if risk.PriceShockRatio < 0.09 || risk.PriceShockRatio > 0.11 {
+		t.Fatalf("expected price shock ratio around 10%%, got %+v", risk)
+	}
+	if risk.LiquidationDistanceRatio <= 0 {
+		t.Fatalf("expected liquidation distance ratio, got %+v", risk)
+	}
+}
+
 func TestCloseByPlanKey_MissingPlanReturnsNotFound(t *testing.T) {
 	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
 	svc.planRepo = &testPlanRepo{}
@@ -2589,6 +3074,206 @@ func TestRunAutoClose_TriggersDrawdownGuardForLivePositions(t *testing.T) {
 	}
 	if rec.ClosedAtMs == 0 {
 		t.Fatal("expected close timestamp to be recorded")
+	}
+}
+
+func TestEvaluateCloseDecision_SameExchangeNegativeFundingExitRequiresProfit(t *testing.T) {
+	now := time.Now().UTC()
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.cfg.SameExchangeCloseOnNegativeFunding = true
+	svc.cfg.SameExchangeHistoryNegativeExitThreshold = 0.5
+	svc.cfg.SameExchangeExitRequirePositiveClosePNL = true
+	svc.cfg.SameExchangeExitMinClosePNL = 0.5
+
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "SPOT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 101.5, AskPrice: 101.6, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 98.4, AskPrice: 98.5, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          -0.0008,
+		FundingTimeMs:        now.Add(time.Hour).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	plan := &entity.ExecutionPlan{
+		PlanKey:                                "plan-same-exit",
+		ArbitrageMode:                          ArbitrageModeSameExchangeSpotPerp,
+		Symbol:                                 "BTC",
+		LongExchange:                           "binance_spot",
+		ShortExchange:                          "binance",
+		LongVenueSymbol:                        "BTCUSDT",
+		ShortVenueSymbol:                       "BTCUSDT",
+		LongQty:                                1,
+		ShortQty:                               1,
+		LongEntryPrice:                         100,
+		ShortEntryPrice:                        100,
+		ExitFeePNL:                             0.2,
+		SlippagePNL:                            0.2,
+		PerpFundingHistorySampleCount:          12,
+		PerpFundingHistoryNegativeRatio:        0.67,
+		PerpFundingCurrentHistoricalPercentile: 0.92,
+	}
+	rec := entity.ExecutionRecord{
+		PlanKey:     plan.PlanKey,
+		Status:      executionStateOpened,
+		LiveTrading: true,
+		AutoClose:   true,
+	}
+
+	decision, err := svc.evaluateCloseDecision(context.Background(), now, rec, plan)
+	if err != nil {
+		t.Fatalf("expected same-exchange close decision without error, got %v", err)
+	}
+	if !decision.shouldClose {
+		t.Fatalf("expected negative funding + positive pnl to trigger close, got %+v", decision)
+	}
+	if decision.trigger != "auto_negative_funding_exit" {
+		t.Fatalf("expected auto_negative_funding_exit trigger, got %+v", decision)
+	}
+
+	svc.cfg.SameExchangeExitMinClosePNL = 5
+	decision, err = svc.evaluateCloseDecision(context.Background(), now, rec, plan)
+	if err != nil {
+		t.Fatalf("expected profitable threshold re-check without error, got %v", err)
+	}
+	if decision.shouldClose {
+		t.Fatalf("expected close to be skipped when estimated close pnl is below threshold, got %+v", decision)
+	}
+}
+
+func TestEvaluateCloseDecision_SameExchangeLiquidationGuardTriggersEmergencyClose(t *testing.T) {
+	now := time.Now().UTC()
+	spotAdapter := &testTradeAdapter{name: "binance_spot", enabled: true, account: exchange.AccountSnapshot{AvailableBalance: 1000}}
+	perpAdapter := &testTradeAdapter{
+		name:    "binance",
+		enabled: true,
+		account: exchange.AccountSnapshot{Equity: 1000, AvailableBalance: 400},
+		position: exchange.Position{
+			Exchange:         "binance",
+			Symbol:           "BTC",
+			VenueSymbol:      "BTCUSDT",
+			Quantity:         -1,
+			MarkPrice:        100,
+			LiquidationPrice: 107,
+		},
+	}
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"binance_spot": spotAdapter,
+		"binance":      perpAdapter,
+	})
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.cfg.SameExchangeReduceLiqDistanceRatio = 0.10
+	svc.cfg.SameExchangeEmergencyLiqDistanceRatio = 0.08
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "SPOT"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL"})
+
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-same-liq",
+		ArbitrageMode:    ArbitrageModeSameExchangeSpotPerp,
+		Symbol:           "BTC",
+		LongExchange:     "binance_spot",
+		ShortExchange:    "binance",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+	}
+	rec := entity.ExecutionRecord{
+		PlanKey:     plan.PlanKey,
+		Status:      executionStateOpened,
+		LiveTrading: true,
+		AutoClose:   true,
+	}
+
+	decision, err := svc.evaluateCloseDecision(context.Background(), now, rec, plan)
+	if err != nil {
+		t.Fatalf("expected liquidation guard decision without error, got %v", err)
+	}
+	if !decision.shouldClose {
+		t.Fatalf("expected emergency liquidation guard to trigger close, got %+v", decision)
+	}
+	if decision.trigger != "auto_liquidation_guard_emergency" {
+		t.Fatalf("expected auto_liquidation_guard_emergency trigger, got %+v", decision)
+	}
+}
+
+func TestEvaluateCloseDecision_SameExchangePriceShockGuardTriggersClose(t *testing.T) {
+	now := time.Now().UTC()
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{
+		"binance_spot": &testTradeAdapter{name: "binance_spot", enabled: true},
+		"binance":      &testTradeAdapter{name: "binance", enabled: true},
+	})
+	svc.marketRepo = &testMarketDataRepo{
+		funding: []entity.FundingSnapshot{
+			{
+				Exchange:    "binance",
+				Symbol:      "BTC",
+				MarkPrice:   100,
+				EventTimeMs: now.Add(-50 * time.Minute).UnixMilli(),
+			},
+			{
+				Exchange:    "binance",
+				Symbol:      "BTC",
+				MarkPrice:   103,
+				EventTimeMs: now.Add(-10 * time.Minute).UnixMilli(),
+			},
+		},
+	}
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.cfg.SameExchangeMax1hPriceShockRatio = 0.08
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "SPOT"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "PERPETUAL"})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance_spot",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		MarkPrice:            109,
+		FundingRate:          0,
+		FundingTimeMs:        now.Add(2 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		MarkPrice:            109,
+		FundingRate:          0.001,
+		FundingTimeMs:        now.Add(2 * time.Hour).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 108.9, AskPrice: 109.1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 109.0, AskPrice: 109.2, EventTimeMs: now.UnixMilli()})
+
+	plan := &entity.ExecutionPlan{
+		PlanKey:          "plan-same-price-shock",
+		ArbitrageMode:    ArbitrageModeSameExchangeSpotPerp,
+		Symbol:           "BTC",
+		LongExchange:     "binance_spot",
+		ShortExchange:    "binance",
+		LongVenueSymbol:  "BTCUSDT",
+		ShortVenueSymbol: "BTCUSDT",
+	}
+	rec := entity.ExecutionRecord{
+		PlanKey:     plan.PlanKey,
+		Status:      executionStateOpened,
+		LiveTrading: true,
+		AutoClose:   true,
+	}
+
+	decision, err := svc.evaluateCloseDecision(context.Background(), now, rec, plan)
+	if err != nil {
+		t.Fatalf("expected price shock guard decision without error, got %v", err)
+	}
+	if !decision.shouldClose {
+		t.Fatalf("expected price shock guard to trigger close, got %+v", decision)
+	}
+	if decision.trigger != "auto_price_shock_guard" {
+		t.Fatalf("expected auto_price_shock_guard trigger, got %+v", decision)
 	}
 }
 
@@ -2847,5 +3532,390 @@ func TestRunRollingMonitor_FlipClosesCurrentAndOpensSuccessor(t *testing.T) {
 	}
 	if len(longAdapter.placed) != 1 || len(shortAdapter.placed) != 1 {
 		t.Fatalf("expected successor open to place one order on each venue, got aster=%d binance=%d", len(longAdapter.placed), len(shortAdapter.placed))
+	}
+}
+
+func TestBuildRollingSuccessorPlan_PreservesSameExchangeFundingContext(t *testing.T) {
+	now := time.Now().UTC()
+	svc := newTestExecutionService(&testOrderRepo{}, map[string]exchange.TradeAdapter{})
+	svc.cfg.StrategyMode = StrategyModeRollingCycleAligned
+	svc.cfg.ArbitrageMode = ArbitrageModeSameExchangeSpotPerp
+	svc.cfg.RollingReviewSettleGracePeriod = 15 * time.Second
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", ContractType: "SPOT", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", StepSize: "0.001", MinNotional: "10", ContractType: "PERPETUAL", FundingIntervalHours: 8})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 99.9, AskPrice: 100.0, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.1, AskPrice: 100.2, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		FundingRate:          0.001,
+		FundingTimeMs:        now.Add(time.Hour).UnixMilli(),
+		FundingIntervalHours: 8,
+		EventTimeMs:          now.UnixMilli(),
+	})
+
+	currentPlan := entity.ExecutionPlan{
+		PlanKey:                                      "plan-same-roll",
+		OpportunityBatchID:                           "batch-1",
+		Symbol:                                       "BTC",
+		RollingGroupKey:                              buildRollingGroupKey("BTC", "binance_spot", "binance"),
+		ArbitrageMode:                                ArbitrageModeSameExchangeSpotPerp,
+		LongExchange:                                 "binance_spot",
+		ShortExchange:                                "binance",
+		EntryMode:                                    "taker",
+		ExitMode:                                     "taker",
+		TargetLeverage:                               1,
+		CapitalAllocatedUSDT:                         1000,
+		RoundedNotionalUSDT:                          1000,
+		TargetNotionalUSDT:                           1000,
+		EntryFeePNL:                                  0.2,
+		ExitFeePNL:                                   0.2,
+		SlippagePNL:                                  0.1,
+		SafetyBufferPNL:                              0.1,
+		PerpFundingRank:                              2,
+		PerpFundingRankTotal:                         10,
+		PerpFundingRankPercentile:                    0.9,
+		PerpFundingHistorySampleCount:                12,
+		PerpFundingHistoryMeanRate:                   0.0002,
+		PerpFundingHistoryNegativeRatio:              0.67,
+		PerpFundingHistoryPositiveRatio:              0.33,
+		PerpFundingHistoricalSupportRatio:            0.67,
+		PerpFundingCurrentHistoricalPercentile:       0.92,
+		PerpFundingEstimatedEventRate:                0.001,
+		PerpFundingEstimatedAnnualizedCarryRate:      0.42,
+		PerpFundingEstimatedAnnualizedNetRate:        0.31,
+		SameExchangeLongHoldEligible:                 false,
+		SameExchangeLongHoldReason:                   "support_ratio_low",
+		SameExchangeLongHoldSuggestedFundingEvents:   4,
+		SameExchangeLongHoldSuggestedHoldHours:       26,
+		SameExchangeLongHoldSuggestedFundingTimeMs:   now.Add(26 * time.Hour).UnixMilli(),
+		SameExchangeLongHoldSuggestedGrossFundingPNL: 4.0,
+		SameExchangeLongHoldSuggestedNetPNL:          3.4,
+	}
+	rec := entity.ExecutionRecord{
+		AllocatedNotionalUSDT: 1000,
+	}
+	decision := rollingMonitorDecision{
+		DesiredLongExchange:  "binance_spot",
+		DesiredShortExchange: "binance",
+		NextReviewTimeMs:     now.Add(30 * time.Minute).UnixMilli(),
+		SyncBoundaryTimeMs:   now.Add(30 * time.Minute).UnixMilli(),
+		ReverseDirectionProjection: fundingProjection{
+			CarryRate:              0.001,
+			FundingWindowHours:     1,
+			ProjectedFundingTimeMs: now.Add(time.Hour).UnixMilli(),
+		},
+	}
+
+	plan, err := svc.buildRollingSuccessorPlan(now, rec, currentPlan, decision)
+	if err != nil {
+		t.Fatalf("expected successor plan build to succeed, got %v", err)
+	}
+	if plan == nil {
+		t.Fatal("expected successor plan to be built")
+	}
+	if plan.ArbitrageMode != ArbitrageModeSameExchangeSpotPerp {
+		t.Fatalf("expected successor plan to keep same-exchange arbitrage mode, got %s", plan.ArbitrageMode)
+	}
+	if plan.PerpFundingHistorySampleCount != currentPlan.PerpFundingHistorySampleCount {
+		t.Fatalf("expected successor plan to keep history sample count %d, got %d", currentPlan.PerpFundingHistorySampleCount, plan.PerpFundingHistorySampleCount)
+	}
+	if plan.PerpFundingHistoryNegativeRatio != currentPlan.PerpFundingHistoryNegativeRatio {
+		t.Fatalf("expected successor plan to keep negative ratio %.4f, got %.4f", currentPlan.PerpFundingHistoryNegativeRatio, plan.PerpFundingHistoryNegativeRatio)
+	}
+	if plan.PerpFundingCurrentHistoricalPercentile != currentPlan.PerpFundingCurrentHistoricalPercentile {
+		t.Fatalf("expected successor plan to keep percentile %.4f, got %.4f", currentPlan.PerpFundingCurrentHistoricalPercentile, plan.PerpFundingCurrentHistoricalPercentile)
+	}
+	if plan.PerpFundingEstimatedAnnualizedNetRate < 0.419 || plan.PerpFundingEstimatedAnnualizedNetRate > 0.420 {
+		t.Fatalf("expected successor plan to recalculate annualized net rate near 0.4194, got %.4f", plan.PerpFundingEstimatedAnnualizedNetRate)
+	}
+	if plan.SameExchangeLongHoldReason != "eligible" {
+		t.Fatalf("expected successor plan to recompute long-hold reason to eligible, got %q", plan.SameExchangeLongHoldReason)
+	}
+}
+
+func TestRunActiveReplacement_ReplacesWeakLivePlanWhenImprovementCoversCosts(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	currentPlan := entity.ExecutionPlan{
+		PlanKey:                      "plan-live-old",
+		Symbol:                       "BTC",
+		LongExchange:                 "longex",
+		ShortExchange:                "shortex",
+		LongVenueSymbol:              "BTCUSDT",
+		ShortVenueSymbol:             "BTCUSDT",
+		Status:                       "ready",
+		ReadyNow:                     true,
+		LongQty:                      10,
+		ShortQty:                     10,
+		LongEntryPrice:               100,
+		ShortEntryPrice:              100,
+		RoundedNotionalUSDT:          1000,
+		TargetNotionalUSDT:           1000,
+		EntryMode:                    "taker",
+		ExitMode:                     "taker",
+		EntryFeePNL:                  0.3,
+		ExitFeePNL:                   0.3,
+		SlippagePNL:                  0.2,
+		SafetyBufferPNL:              0.2,
+		ExitPenaltyBps:               1,
+		ProjectedFundingTimeMs:       now.Add(1 * time.Hour).UnixMilli(),
+		RequiredEntryByFundingTimeMs: now.Add(20 * time.Minute).UnixMilli(),
+		LongFundingEventCount:        1,
+		ShortFundingEventCount:       1,
+		FundingWindowHours:           1,
+		EntryWindowOpenMs:            now.Add(-time.Minute).UnixMilli(),
+		EntryWindowCloseMs:           now.Add(time.Minute).UnixMilli(),
+		TargetCloseTimeMs:            now.Add(1 * time.Hour).UnixMilli(),
+	}
+	successorPlan := entity.ExecutionPlan{
+		PlanKey:                      "plan-ready-new",
+		Symbol:                       "ETH",
+		LongExchange:                 "longex",
+		ShortExchange:                "shortex",
+		LongVenueSymbol:              "ETHUSDT",
+		ShortVenueSymbol:             "ETHUSDT",
+		Status:                       "ready",
+		ReadyNow:                     true,
+		LongQty:                      10,
+		ShortQty:                     10,
+		LongEntryPrice:               100,
+		ShortEntryPrice:              100,
+		RoundedNotionalUSDT:          1000,
+		TargetNotionalUSDT:           1000,
+		EntryMode:                    "taker",
+		ExitMode:                     "taker",
+		EntryFeePNL:                  0.4,
+		ExitFeePNL:                   0.4,
+		SlippagePNL:                  0.3,
+		SafetyBufferPNL:              0.2,
+		EntryPenaltyBps:              1,
+		ExitPenaltyBps:               1,
+		ProjectedFundingTimeMs:       now.Add(1 * time.Hour).UnixMilli(),
+		RequiredEntryByFundingTimeMs: now.Add(20 * time.Minute).UnixMilli(),
+		LongFundingEventCount:        1,
+		ShortFundingEventCount:       1,
+		FundingWindowHours:           1,
+		EntryWindowOpenMs:            now.Add(-time.Minute).UnixMilli(),
+		EntryWindowCloseMs:           now.Add(time.Minute).UnixMilli(),
+		TargetCloseTimeMs:            now.Add(1 * time.Hour).UnixMilli(),
+		NetExpectedPNL:               4.2,
+		Score:                        42,
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:               currentPlan.PlanKey,
+				Symbol:                currentPlan.Symbol,
+				Status:                executionStateOpened,
+				LiveTrading:           true,
+				AutoClose:             true,
+				LongExchange:          currentPlan.LongExchange,
+				ShortExchange:         currentPlan.ShortExchange,
+				AllocatedNotionalUSDT: 1000,
+			},
+		},
+	}
+	planRepo := &testPlanRepo{items: []entity.ExecutionPlan{currentPlan, successorPlan}}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"longex":  longAdapter,
+		"shortex": shortAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.Execution.AutoEntry = true
+	svc.cfg.Execution.AutoClose = true
+	svc.cfg.Execution.MaxLivePlans = 1
+	svc.cfg.Execution.MaxLatestPlans = 10
+	svc.cfg.ExecutionReplacementEnabled = true
+	svc.cfg.ExecutionReplacementOnlyWhenConstrained = true
+	svc.cfg.ExecutionReplacementRequireNetImprovement = true
+	svc.cfg.ExecutionReplacementMinNetImprovementPNL = 1.0
+	svc.cfg.ExecutionReplacementExtraSafetyBufferUSDT = 0.2
+	svc.cfg.EntryLeadTime = 2 * time.Hour
+	svc.cfg.EntryCutoffTime = 10 * time.Second
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "ETH", VenueSymbol: "ETHUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "ETH", VenueSymbol: "ETHUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "ETH", VenueSymbol: "ETHUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "ETH", VenueSymbol: "ETHUSDT", BidPrice: 100.02, AskPrice: 100.03, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: -0.0005, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: 0.0015, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "longex", Symbol: "ETH", VenueSymbol: "ETHUSDT", FundingRate: -0.0015, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "shortex", Symbol: "ETH", VenueSymbol: "ETHUSDT", FundingRate: 0.0040, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+
+	svc.runActiveReplacement(context.Background())
+
+	oldRec, err := svc.execRepo.FindByPlanKey(context.Background(), currentPlan.PlanKey)
+	if err != nil {
+		t.Fatalf("expected old record lookup to succeed, got %v", err)
+	}
+	if oldRec == nil || oldRec.Status != executionStateClosed {
+		t.Fatalf("expected current record to be closed, got %+v", oldRec)
+	}
+	if oldRec.SuccessorPlanKey != successorPlan.PlanKey {
+		t.Fatalf("expected successor plan key %s, got %s", successorPlan.PlanKey, oldRec.SuccessorPlanKey)
+	}
+
+	newRec, err := svc.execRepo.FindByPlanKey(context.Background(), successorPlan.PlanKey)
+	if err != nil {
+		t.Fatalf("expected successor record lookup to succeed, got %v", err)
+	}
+	if newRec == nil || newRec.Status != executionStateOpened {
+		t.Fatalf("expected successor record to be opened, got %+v", newRec)
+	}
+	if newRec.PredecessorPlanKey != currentPlan.PlanKey {
+		t.Fatalf("expected predecessor plan key %s, got %s", currentPlan.PlanKey, newRec.PredecessorPlanKey)
+	}
+	if len(longAdapter.closed) != 1 || len(shortAdapter.closed) != 1 {
+		t.Fatalf("expected replacement close to hit both venues, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+	if len(longAdapter.placed) != 1 || len(shortAdapter.placed) != 1 {
+		t.Fatalf("expected successor open to place one order on each venue, got long=%d short=%d", len(longAdapter.placed), len(shortAdapter.placed))
+	}
+}
+
+func TestRunActiveReplacement_SkipsWhenImprovementBelowThreshold(t *testing.T) {
+	now := time.Now().UTC()
+	orderRepo := &testOrderRepo{}
+	currentPlan := entity.ExecutionPlan{
+		PlanKey:                      "plan-live-stay",
+		Symbol:                       "BTC",
+		LongExchange:                 "longex",
+		ShortExchange:                "shortex",
+		LongVenueSymbol:              "BTCUSDT",
+		ShortVenueSymbol:             "BTCUSDT",
+		Status:                       "ready",
+		ReadyNow:                     true,
+		LongQty:                      10,
+		ShortQty:                     10,
+		LongEntryPrice:               100,
+		ShortEntryPrice:              100,
+		RoundedNotionalUSDT:          1000,
+		TargetNotionalUSDT:           1000,
+		EntryMode:                    "taker",
+		ExitMode:                     "taker",
+		EntryFeePNL:                  0.3,
+		ExitFeePNL:                   0.3,
+		SlippagePNL:                  0.2,
+		SafetyBufferPNL:              0.2,
+		ExitPenaltyBps:               1,
+		ProjectedFundingTimeMs:       now.Add(1 * time.Hour).UnixMilli(),
+		RequiredEntryByFundingTimeMs: now.Add(20 * time.Minute).UnixMilli(),
+		LongFundingEventCount:        1,
+		ShortFundingEventCount:       1,
+		FundingWindowHours:           1,
+		EntryWindowOpenMs:            now.Add(-time.Minute).UnixMilli(),
+		EntryWindowCloseMs:           now.Add(time.Minute).UnixMilli(),
+		TargetCloseTimeMs:            now.Add(1 * time.Hour).UnixMilli(),
+	}
+	successorPlan := entity.ExecutionPlan{
+		PlanKey:                      "plan-not-good-enough",
+		Symbol:                       "ETH",
+		LongExchange:                 "longex",
+		ShortExchange:                "shortex",
+		LongVenueSymbol:              "ETHUSDT",
+		ShortVenueSymbol:             "ETHUSDT",
+		Status:                       "ready",
+		ReadyNow:                     true,
+		LongQty:                      10,
+		ShortQty:                     10,
+		LongEntryPrice:               100,
+		ShortEntryPrice:              100,
+		RoundedNotionalUSDT:          1000,
+		TargetNotionalUSDT:           1000,
+		EntryMode:                    "taker",
+		ExitMode:                     "taker",
+		EntryFeePNL:                  0.7,
+		ExitFeePNL:                   0.7,
+		SlippagePNL:                  0.5,
+		SafetyBufferPNL:              0.4,
+		EntryPenaltyBps:              1,
+		ExitPenaltyBps:               1,
+		ProjectedFundingTimeMs:       now.Add(1 * time.Hour).UnixMilli(),
+		RequiredEntryByFundingTimeMs: now.Add(20 * time.Minute).UnixMilli(),
+		LongFundingEventCount:        1,
+		ShortFundingEventCount:       1,
+		FundingWindowHours:           1,
+		EntryWindowOpenMs:            now.Add(-time.Minute).UnixMilli(),
+		EntryWindowCloseMs:           now.Add(time.Minute).UnixMilli(),
+		TargetCloseTimeMs:            now.Add(1 * time.Hour).UnixMilli(),
+		NetExpectedPNL:               1.9,
+		Score:                        19,
+	}
+	execRepo := &testExecRepo{
+		items: []entity.ExecutionRecord{
+			{
+				PlanKey:               currentPlan.PlanKey,
+				Symbol:                currentPlan.Symbol,
+				Status:                executionStateOpened,
+				LiveTrading:           true,
+				AutoClose:             true,
+				LongExchange:          currentPlan.LongExchange,
+				ShortExchange:         currentPlan.ShortExchange,
+				AllocatedNotionalUSDT: 1000,
+			},
+		},
+	}
+	planRepo := &testPlanRepo{items: []entity.ExecutionPlan{currentPlan, successorPlan}}
+	longAdapter := &testTradeAdapter{name: "longex", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	shortAdapter := &testTradeAdapter{name: "shortex", enabled: true, account: exchange.AccountSnapshot{Equity: 5000, AvailableBalance: 3000}}
+	svc := newTestExecutionService(orderRepo, map[string]exchange.TradeAdapter{
+		"longex":  longAdapter,
+		"shortex": shortAdapter,
+	})
+	svc.execRepo = execRepo
+	svc.planRepo = planRepo
+	svc.cfg.Execution.Enabled = true
+	svc.cfg.Execution.AutoEntry = true
+	svc.cfg.Execution.AutoClose = true
+	svc.cfg.Execution.MaxLivePlans = 1
+	svc.cfg.Execution.MaxLatestPlans = 10
+	svc.cfg.ExecutionReplacementEnabled = true
+	svc.cfg.ExecutionReplacementOnlyWhenConstrained = true
+	svc.cfg.ExecutionReplacementRequireNetImprovement = true
+	svc.cfg.ExecutionReplacementMinNetImprovementPNL = 2.5
+	svc.cfg.ExecutionReplacementExtraSafetyBufferUSDT = 0.2
+	svc.cfg.EntryLeadTime = 2 * time.Hour
+	svc.cfg.EntryCutoffTime = 10 * time.Second
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "longex", Symbol: "ETH", VenueSymbol: "ETHUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertSymbol(entity.Symbol{Exchange: "shortex", Symbol: "ETH", VenueSymbol: "ETHUSDT", TickSize: "0.01", StepSize: "0.001", MinNotional: "10"})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "longex", Symbol: "ETH", VenueSymbol: "ETHUSDT", BidPrice: 100.00, AskPrice: 100.01, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "shortex", Symbol: "ETH", VenueSymbol: "ETHUSDT", BidPrice: 100.02, AskPrice: 100.03, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "longex", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: -0.0005, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "shortex", Symbol: "BTC", VenueSymbol: "BTCUSDT", FundingRate: 0.0015, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "longex", Symbol: "ETH", VenueSymbol: "ETHUSDT", FundingRate: -0.0009, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+	svc.store.UpsertFunding(entity.FundingSnapshot{Exchange: "shortex", Symbol: "ETH", VenueSymbol: "ETHUSDT", FundingRate: 0.0027, FundingTimeMs: now.Add(1 * time.Hour).UnixMilli(), FundingIntervalHours: 1, EventTimeMs: now.UnixMilli()})
+
+	svc.runActiveReplacement(context.Background())
+
+	rec, err := svc.execRepo.FindByPlanKey(context.Background(), currentPlan.PlanKey)
+	if err != nil {
+		t.Fatalf("expected current record lookup to succeed, got %v", err)
+	}
+	if rec == nil || rec.Status != executionStateOpened {
+		t.Fatalf("expected current record to stay opened, got %+v", rec)
+	}
+	if nextRec, err := svc.execRepo.FindByPlanKey(context.Background(), successorPlan.PlanKey); err != nil {
+		t.Fatalf("expected successor lookup to succeed, got %v", err)
+	} else if nextRec != nil {
+		t.Fatalf("expected no successor execution record to be created, got %+v", nextRec)
+	}
+	if len(longAdapter.closed) != 0 || len(shortAdapter.closed) != 0 {
+		t.Fatalf("expected no replacement close orders, got long=%d short=%d", len(longAdapter.closed), len(shortAdapter.closed))
+	}
+	if len(longAdapter.placed) != 0 || len(shortAdapter.placed) != 0 {
+		t.Fatalf("expected no replacement open orders, got long=%d short=%d", len(longAdapter.placed), len(shortAdapter.placed))
 	}
 }

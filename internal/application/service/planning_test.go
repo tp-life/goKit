@@ -161,3 +161,309 @@ func TestBuildExecutionPlans_RollingModeTargetsFirstReviewTime(t *testing.T) {
 		t.Fatalf("expected rolling target close to follow first review time, got %d want %d", plan.TargetCloseTimeMs, want)
 	}
 }
+
+func TestBuildExecutionPlans_SameExchangeCopiesLongHoldMetrics(t *testing.T) {
+	now := time.Now().UTC()
+	runner := &StrategyRunner{
+		cfg: Config{
+			ArbitrageMode:      ArbitrageModeSameExchangeSpotPerp,
+			TotalCapitalUSDT:   1000,
+			CapitalUtilization: 1,
+			Leverage:           1,
+		}.normalize(),
+		store: NewMarketStore(),
+	}
+
+	runner.store.UpsertSymbol(entity.Symbol{
+		Exchange:     "binance_spot",
+		Symbol:       "BTC",
+		VenueSymbol:  "BTCUSDT",
+		StepSize:     "0.001",
+		MinQty:       "0.001",
+		MinNotional:  "10",
+		ContractType: "SPOT",
+	})
+	runner.store.UpsertSymbol(entity.Symbol{
+		Exchange:             "binance",
+		Symbol:               "BTC",
+		VenueSymbol:          "BTCUSDT",
+		StepSize:             "0.001",
+		MinQty:               "0.001",
+		MinNotional:          "10",
+		ContractType:         "PERPETUAL",
+		FundingIntervalHours: 8,
+	})
+	runner.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", AskPrice: 100, BidPrice: 99.9, EventTimeMs: now.UnixMilli()})
+	runner.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", AskPrice: 100.2, BidPrice: 100.1, EventTimeMs: now.UnixMilli()})
+
+	opportunities := []entity.Opportunity{
+		{
+			Symbol:                       "BTC",
+			LongExchange:                 "binance_spot",
+			ShortExchange:                "binance",
+			Status:                       OpportunityStatusEligible,
+			EligibleForExecution:         true,
+			NetExpectedPNL:               3,
+			GrossFundingPNL:              5,
+			EntryFeePNL:                  0.4,
+			ExitFeePNL:                   0.4,
+			SlippagePNL:                  0.2,
+			SafetyBufferPNL:              0.1,
+			EarliestFundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+			LatestFundingTimeMs:          now.Add(2 * time.Minute).UnixMilli(),
+			RequiredEntryByFundingTimeMs: now.Add(2 * time.Minute).UnixMilli(),
+			ShortFundingRule: entity.OpportunityFundingRule{
+				HistorySampleCount:           20,
+				HistoryMeanRate:              0.0002,
+				HistoricalSupportRatio:       0.7,
+				EstimatedEventRate:           0.001,
+				EstimatedAnnualizedCarryRate: 0.45,
+				EstimatedAnnualizedNetRate:   0.39,
+				SuggestedFundingEvents:       5,
+				SuggestedHoldHours:           34,
+				SuggestedFundingTimeMs:       now.Add(34 * time.Hour).UnixMilli(),
+				SuggestedGrossFundingPNL:     5.0,
+				SuggestedNetPNL:              3.9,
+				LongHoldEligible:             true,
+				LongHoldReason:               "eligible",
+			},
+			SameExchangeLongHoldUsingHistoryEstimate: true,
+		},
+	}
+
+	plans := runner.buildExecutionPlans(now, "batch-same", opportunities)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+
+	plan := plans[0]
+	if plan.PerpFundingHistoryMeanRate != 0.0002 {
+		t.Fatalf("expected history mean rate to be copied, got %.6f", plan.PerpFundingHistoryMeanRate)
+	}
+	if plan.PerpFundingHistoricalSupportRatio != 0.7 {
+		t.Fatalf("expected support ratio to be copied, got %.4f", plan.PerpFundingHistoricalSupportRatio)
+	}
+	if plan.PerpFundingEstimatedEventRate != 0.001 {
+		t.Fatalf("expected estimated event rate to be copied, got %.6f", plan.PerpFundingEstimatedEventRate)
+	}
+	if plan.PerpFundingEstimatedAnnualizedNetRate < 0.44 || plan.PerpFundingEstimatedAnnualizedNetRate > 0.46 {
+		t.Fatalf("expected annualized net rate to be recalculated near 0.45, got %.4f", plan.PerpFundingEstimatedAnnualizedNetRate)
+	}
+	if !plan.SameExchangeLongHoldEligible {
+		t.Fatal("expected long-hold eligibility to be copied")
+	}
+	if !plan.SameExchangeLongHoldUsingHistoryEstimate {
+		t.Fatal("expected plan to keep historical long-hold estimate flag")
+	}
+	if plan.SameExchangeLongHoldSuggestedFundingEvents != 5 {
+		t.Fatalf("expected suggested funding events to be copied, got %d", plan.SameExchangeLongHoldSuggestedFundingEvents)
+	}
+	if plan.SameExchangeLongHoldSuggestedHoldHours != 34 {
+		t.Fatalf("expected suggested hold hours to be copied, got %.2f", plan.SameExchangeLongHoldSuggestedHoldHours)
+	}
+	if plan.SameExchangeLongHoldSuggestedNetPNL <= 0 {
+		t.Fatalf("expected suggested net pnl to stay positive after scaling, got %.4f", plan.SameExchangeLongHoldSuggestedNetPNL)
+	}
+}
+
+func TestBuildExecutionPlans_SameExchangeExtremeFundingDownsizesPlan(t *testing.T) {
+	now := time.Now().UTC()
+	runner := &StrategyRunner{
+		cfg: Config{
+			ArbitrageMode:      ArbitrageModeSameExchangeSpotPerp,
+			TotalCapitalUSDT:   1000,
+			CapitalUtilization: 1,
+			Leverage:           2,
+			SameExchange: StrategySameExchangeConfig{
+				Risk: StrategySameExchangeRiskConfig{
+					MaxPerpLeverage:              1.5,
+					FundingExtremePercentile:     0.95,
+					ExtremeFundingNegativeRatio:  0.50,
+					ExtremeFundingSizeMultiplier: 0.50,
+				},
+			},
+		}.normalize(),
+		store: NewMarketStore(),
+	}
+
+	runner.store.UpsertSymbol(entity.Symbol{
+		Exchange:     "binance_spot",
+		Symbol:       "BTC",
+		VenueSymbol:  "BTCUSDT",
+		StepSize:     "0.001",
+		MinQty:       "0.001",
+		MinNotional:  "10",
+		ContractType: "SPOT",
+	})
+	runner.store.UpsertSymbol(entity.Symbol{
+		Exchange:     "binance",
+		Symbol:       "BTC",
+		VenueSymbol:  "BTCUSDT",
+		StepSize:     "0.001",
+		MinQty:       "0.001",
+		MinNotional:  "10",
+		ContractType: "PERPETUAL",
+	})
+	runner.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", AskPrice: 100, BidPrice: 99.9, EventTimeMs: now.UnixMilli()})
+	runner.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", AskPrice: 100.2, BidPrice: 100.1, EventTimeMs: now.UnixMilli()})
+
+	opportunities := []entity.Opportunity{
+		{
+			Symbol:                       "BTC",
+			LongExchange:                 "binance_spot",
+			ShortExchange:                "binance",
+			Status:                       OpportunityStatusEligible,
+			EligibleForExecution:         true,
+			NetExpectedPNL:               3,
+			GrossFundingPNL:              6,
+			EntryFeePNL:                  0.4,
+			ExitFeePNL:                   0.4,
+			SlippagePNL:                  0.2,
+			SafetyBufferPNL:              0.1,
+			EarliestFundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+			LatestFundingTimeMs:          now.Add(2 * time.Minute).UnixMilli(),
+			RequiredEntryByFundingTimeMs: now.Add(2 * time.Minute).UnixMilli(),
+			ShortFundingRule: entity.OpportunityFundingRule{
+				HistorySampleCount:          18,
+				HistoryNegativeRatio:        0.62,
+				CurrentHistoricalPercentile: 0.98,
+			},
+		},
+	}
+
+	plans := runner.buildExecutionPlans(now, "batch-risk", opportunities)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+
+	plan := plans[0]
+	if plan.TargetLeverage != 1.5 {
+		t.Fatalf("expected same-exchange leverage cap 1.5, got %.2f", plan.TargetLeverage)
+	}
+	if plan.TargetNotionalUSDT != 500 {
+		t.Fatalf("expected target notional to be down-sized to 500, got %.2f", plan.TargetNotionalUSDT)
+	}
+	if plan.CapitalAllocatedUSDT != 500 {
+		t.Fatalf("expected capital allocation to be down-sized to 500, got %.2f", plan.CapitalAllocatedUSDT)
+	}
+}
+
+func TestBuildExecutionPlans_SameExchangeExtremeBasisDownsizesPlan(t *testing.T) {
+	now := time.Now().UTC()
+	runner := &StrategyRunner{
+		cfg: Config{
+			ArbitrageMode:      ArbitrageModeSameExchangeSpotPerp,
+			TotalCapitalUSDT:   1000,
+			CapitalUtilization: 1,
+			SameExchange: StrategySameExchangeConfig{
+				Entry: StrategySameExchangeEntryConfig{
+					BasisLongHoldWindowHours: 12,
+					MaxBasisPaybackEvents:    4,
+				},
+				Risk: StrategySameExchangeRiskConfig{
+					ExtremeBasisPaybackEvents:  1.8,
+					ExtremeBasisSizeMultiplier: 0.65,
+				},
+			},
+		}.normalize(),
+		store: NewMarketStore(),
+	}
+
+	runner.store.UpsertSymbol(entity.Symbol{
+		Exchange:     "binance_spot",
+		Symbol:       "BTC",
+		VenueSymbol:  "BTCUSDT",
+		StepSize:     "0.001",
+		MinQty:       "0.001",
+		MinNotional:  "10",
+		ContractType: "SPOT",
+	})
+	runner.store.UpsertSymbol(entity.Symbol{
+		Exchange:     "binance",
+		Symbol:       "BTC",
+		VenueSymbol:  "BTCUSDT",
+		StepSize:     "0.001",
+		MinQty:       "0.001",
+		MinNotional:  "10",
+		ContractType: "PERPETUAL",
+	})
+	runner.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance_spot", Symbol: "BTC", AskPrice: 100, BidPrice: 99.9, EventTimeMs: now.UnixMilli()})
+	runner.store.UpsertBookTop(entity.BookTopSnapshot{Exchange: "binance", Symbol: "BTC", AskPrice: 100.45, BidPrice: 100.4, EventTimeMs: now.UnixMilli()})
+
+	opportunities := []entity.Opportunity{
+		{
+			Symbol:                       "BTC",
+			LongExchange:                 "binance_spot",
+			ShortExchange:                "binance",
+			Status:                       OpportunityStatusEligible,
+			EligibleForExecution:         true,
+			NetExpectedPNL:               5,
+			GrossFundingPNL:              9,
+			EntryFeePNL:                  0.5,
+			ExitFeePNL:                   0.5,
+			SlippagePNL:                  0.5,
+			SafetyBufferPNL:              0.5,
+			FundingWindowHours:           24,
+			LongFundingEventCount:        0,
+			ShortFundingEventCount:       3,
+			EarliestFundingTimeMs:        now.Add(2 * time.Minute).UnixMilli(),
+			LatestFundingTimeMs:          now.Add(24 * time.Hour).UnixMilli(),
+			RequiredEntryByFundingTimeMs: now.Add(2 * time.Minute).UnixMilli(),
+			ProjectedFundingTimeMs:       now.Add(24 * time.Hour).UnixMilli(),
+		},
+	}
+
+	plans := runner.buildExecutionPlans(now, "batch-basis-risk", opportunities)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+
+	plan := plans[0]
+	if plan.TargetNotionalUSDT != 650 {
+		t.Fatalf("expected target notional to be down-sized to 650, got %.2f", plan.TargetNotionalUSDT)
+	}
+	if plan.CapitalAllocatedUSDT != 650 {
+		t.Fatalf("expected capital allocation to be down-sized to 650, got %.2f", plan.CapitalAllocatedUSDT)
+	}
+	if !plan.SameExchangeBasisUsesPaybackModel {
+		t.Fatalf("expected plan to record payback-model basis evaluation, got %+v", plan)
+	}
+	if plan.SameExchangeBasisReason != sameExchangeBasisReasonExtremePayback {
+		t.Fatalf("expected basis reason %s, got %s", sameExchangeBasisReasonExtremePayback, plan.SameExchangeBasisReason)
+	}
+	if plan.SameExchangeBasisPaybackFundingEvents <= 1.8 {
+		t.Fatalf("expected payback events above extreme threshold, got %.4f", plan.SameExchangeBasisPaybackFundingEvents)
+	}
+	if plan.SameExchangeBasisRiskSizeMultiplier != 0.65 {
+		t.Fatalf("expected basis risk size multiplier 0.65, got %.4f", plan.SameExchangeBasisRiskSizeMultiplier)
+	}
+}
+
+func TestIsOpportunityEligible_SameExchangeRequiresLongHoldEligibility(t *testing.T) {
+	now := time.Now().UTC()
+	runner := &StrategyRunner{
+		cfg: Config{
+			ArbitrageMode: ArbitrageModeSameExchangeSpotPerp,
+			SameExchange: StrategySameExchangeConfig{
+				Entry: StrategySameExchangeEntryConfig{
+					RequireLongHoldEligible: boolPtr(true),
+				},
+			},
+		}.normalize(),
+	}
+
+	opp := entity.Opportunity{
+		Status:                OpportunityStatusEligible,
+		EligibleForExecution:  true,
+		NetExpectedPNL:        3,
+		EarliestFundingTimeMs: now.Add(2 * time.Minute).UnixMilli(),
+		ShortFundingRule: entity.OpportunityFundingRule{
+			LongHoldEligible: false,
+			LongHoldReason:   "support_ratio_low",
+		},
+	}
+
+	if runner.isOpportunityEligible(now, opp) {
+		t.Fatal("expected same-exchange opportunity to be rejected when long-hold guard fails")
+	}
+}

@@ -35,24 +35,24 @@ func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.
 		return fmt.Errorf("nil execution plan")
 	}
 
-	longMeta, okLongMeta := s.store.Symbol(plan.LongExchange, plan.Symbol)
-	shortMeta, okShortMeta := s.store.Symbol(plan.ShortExchange, plan.Symbol)
-	longFunding, okLongFunding := s.store.LatestFunding(plan.LongExchange, plan.Symbol)
-	shortFunding, okShortFunding := s.store.LatestFunding(plan.ShortExchange, plan.Symbol)
-	longBook, okLongBook := s.store.LatestBookTop(plan.LongExchange, plan.Symbol)
-	shortBook, okShortBook := s.store.LatestBookTop(plan.ShortExchange, plan.Symbol)
-	if !(okLongMeta && okShortMeta && okLongFunding && okShortFunding && okLongBook && okShortBook) {
+	guardCfg := s.cfg
+	guardCfg.ArbitrageMode = normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange))
+	snapshots, ok := loadPairMarketSnapshot(s.store, guardCfg, plan.Symbol, plan.LongExchange, plan.ShortExchange)
+	if !ok {
 		return fmt.Errorf("open revalidation: missing latest symbol/funding/book snapshot for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
 	}
+	longMeta, shortMeta := snapshots.LongMeta, snapshots.ShortMeta
+	longFunding, shortFunding := snapshots.LongFunding, snapshots.ShortFunding
+	longBook, shortBook := snapshots.LongBook, snapshots.ShortBook
 
-	if isSnapshotStaleForConfig(s.cfg, now, longFunding.EventTimeMs) ||
-		isSnapshotStaleForConfig(s.cfg, now, shortFunding.EventTimeMs) ||
-		isSnapshotStaleForConfig(s.cfg, now, longBook.EventTimeMs) ||
-		isSnapshotStaleForConfig(s.cfg, now, shortBook.EventTimeMs) {
+	if isSnapshotStaleForConfig(guardCfg, now, longFunding.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, shortFunding.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, longBook.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, shortBook.EventTimeMs) {
 		return fmt.Errorf("open revalidation: market data is stale for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
 	}
 
-	currentProjection, ok := projectFundingCarryForPlanRevalidation(s.cfg, now, plan, longFunding, shortFunding)
+	currentProjection, ok := projectFundingCarryForPlanRevalidation(guardCfg, now, plan, longFunding, shortFunding)
 	if !ok || currentProjection.CarryRate <= 0 {
 		return fmt.Errorf("open revalidation: current funding carry is no longer positive for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
 	}
@@ -60,14 +60,8 @@ func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.
 	// 它的语义不是普通的“离结算点足够近才允许第一次开仓”。
 	// 因此 successor reopen 会保留 funding/basis/余额复核，但跳过通用 entry window 门槛。
 	if !shouldBypassRollingEntryWindowRevalidation(*plan, trigger) &&
-		!isWithinEntryWindowForConfig(now, currentProjection.RequiredEntryByFundingTimeMs, s.cfg.EntryLeadTime, s.cfg.EntryCutoffTime) {
+		!isWithinEntryWindowForConfig(now, currentProjection.RequiredEntryByFundingTimeMs, guardCfg.EntryLeadTime, guardCfg.EntryCutoffTime) {
 		return fmt.Errorf("open revalidation: current opportunity is outside entry window for %s %s/%s", plan.Symbol, plan.LongExchange, plan.ShortExchange)
-	}
-
-	currentBasisBps := crossVenueBasisBps(longBook.AskPrice, shortBook.BidPrice)
-	maxAllowedBasisBps := allowedBasisThresholdBpsForConfig(s.cfg, currentProjection.FundingWindowHours)
-	if math.Abs(currentBasisBps) > maxAllowedBasisBps {
-		return fmt.Errorf("open revalidation: current basis %.4f bps exceeds dynamic limit %.4f bps", currentBasisBps, maxAllowedBasisBps)
 	}
 
 	currentLongNotional := plan.LongQty * longBook.AskPrice
@@ -75,15 +69,40 @@ func (s *ExecutionService) revalidatePlanBeforeOpen(now time.Time, plan *entity.
 	if currentLongNotional <= 0 || currentShortNotional <= 0 {
 		return fmt.Errorf("open revalidation: invalid current notional for %s", plan.Symbol)
 	}
+	currentNotional := math.Min(currentLongNotional, currentShortNotional)
+	currentBasisBps := crossVenueBasisBps(longBook.AskPrice, shortBook.BidPrice)
+	maxAllowedBasisBps := allowedBasisThresholdBpsForConfig(guardCfg, currentProjection.FundingWindowHours)
+	if guardCfg.ArbitrageMode == ArbitrageModeSameExchangeSpotPerp {
+		perpExchange := plan.ShortExchange
+		perpFunding := shortFunding
+		if isPerpetualSymbol(longMeta) && !isPerpetualSymbol(shortMeta) {
+			perpExchange = plan.LongExchange
+			perpFunding = longFunding
+		}
+		priceAssessment := assessSameExchangePriceRisk(
+			context.Background(),
+			guardCfg,
+			s.marketRepo,
+			plan.ArbitrageMode,
+			perpExchange,
+			plan.Symbol,
+			perpFunding,
+			now,
+		)
+		if !priceAssessment.Allowed {
+			return fmt.Errorf("open revalidation: %s", sameExchangePriceRiskRejectReason(guardCfg, priceAssessment))
+		}
+	} else if math.Abs(currentBasisBps) > maxAllowedBasisBps {
+		return fmt.Errorf("open revalidation: current basis %.4f bps exceeds dynamic limit %.4f bps", math.Abs(currentBasisBps), maxAllowedBasisBps)
+	}
+
 	if currentLongNotional < parseFloat(longMeta.MinNotional) || currentShortNotional < parseFloat(shortMeta.MinNotional) {
 		return fmt.Errorf("open revalidation: current rounded notional falls below venue minimum for %s", plan.Symbol)
 	}
-
-	currentNotional := math.Min(currentLongNotional, currentShortNotional)
 	currentGrossFundingPNL := currentNotional * currentProjection.CarryRate
 	currentNetExpectedPNL := currentGrossFundingPNL - plan.EntryFeePNL - plan.ExitFeePNL - plan.SlippagePNL - plan.SafetyBufferPNL
-	if currentNetExpectedPNL < s.cfg.MinNetPNL {
-		return fmt.Errorf("open revalidation: current net pnl %.4f below minimum %.4f", currentNetExpectedPNL, s.cfg.MinNetPNL)
+	if currentNetExpectedPNL < guardCfg.MinNetPNL {
+		return fmt.Errorf("open revalidation: current net pnl %.4f below minimum %.4f", currentNetExpectedPNL, guardCfg.MinNetPNL)
 	}
 	return nil
 }
@@ -149,6 +168,21 @@ func (s *ExecutionService) evaluateCloseDecision(ctx context.Context, now time.T
 		return decision, nil
 	}
 	if decision, ok, err := s.evaluateBalanceGuard(ctx, plan); err != nil {
+		return executionCloseDecision{}, err
+	} else if ok {
+		return decision, nil
+	}
+	if decision, ok, err := s.evaluateSameExchangeLiquidationGuard(ctx, plan); err != nil {
+		return executionCloseDecision{}, err
+	} else if ok {
+		return decision, nil
+	}
+	if decision, ok, err := s.evaluateSameExchangePriceShockGuard(ctx, now, plan); err != nil {
+		return executionCloseDecision{}, err
+	} else if ok {
+		return decision, nil
+	}
+	if decision, ok, err := s.evaluateSameExchangeFundingExitGuard(now, plan); err != nil {
 		return executionCloseDecision{}, err
 	} else if ok {
 		return decision, nil
@@ -232,7 +266,25 @@ func (s *ExecutionService) evaluateBalanceGuard(ctx context.Context, plan *entit
 		return executionCloseDecision{}, false, nil
 	}
 
-	for _, exchangeName := range []string{plan.LongExchange, plan.ShortExchange} {
+	legs := []struct {
+		exchange string
+		meta     entity.Symbol
+	}{
+		{exchange: plan.LongExchange},
+		{exchange: plan.ShortExchange},
+	}
+	for i := range legs {
+		meta, ok := s.store.Symbol(legs[i].exchange, plan.Symbol)
+		if ok {
+			legs[i].meta = meta
+		}
+	}
+
+	for _, leg := range legs {
+		exchangeName := leg.exchange
+		if isSpotSymbol(leg.meta) {
+			continue
+		}
 		adapter := s.trades[normalizeVenueName(exchangeName)]
 		if adapter == nil || !adapter.Enabled() {
 			return executionCloseDecision{}, false, fmt.Errorf("close guard balance: trade adapter %s disabled", exchangeName)
@@ -256,6 +308,170 @@ func (s *ExecutionService) evaluateBalanceGuard(ctx context.Context, plan *entit
 		}
 	}
 	return executionCloseDecision{}, false, nil
+}
+
+func (s *ExecutionService) evaluateSameExchangeLiquidationGuard(ctx context.Context, plan *entity.ExecutionPlan) (executionCloseDecision, bool, error) {
+	if plan == nil {
+		return executionCloseDecision{}, false, nil
+	}
+	arbitrageMode := normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange))
+	if arbitrageMode != ArbitrageModeSameExchangeSpotPerp {
+		return executionCloseDecision{}, false, nil
+	}
+	if s.cfg.SameExchangeReduceLiqDistanceRatio <= 0 && s.cfg.SameExchangeEmergencyLiqDistanceRatio <= 0 {
+		return executionCloseDecision{}, false, nil
+	}
+
+	longMeta, _ := s.store.Symbol(plan.LongExchange, plan.Symbol)
+	shortMeta, _ := s.store.Symbol(plan.ShortExchange, plan.Symbol)
+	perpExchange := plan.ShortExchange
+	perpVenueSymbol := plan.ShortVenueSymbol
+	perpAssetID := shortMeta.VenueAssetID
+	if isPerpetualSymbol(longMeta) && !isPerpetualSymbol(shortMeta) {
+		perpExchange = plan.LongExchange
+		perpVenueSymbol = plan.LongVenueSymbol
+		perpAssetID = longMeta.VenueAssetID
+	}
+
+	adapter := s.trades[strings.ToLower(strings.TrimSpace(perpExchange))]
+	if adapter == nil || !adapter.Enabled() {
+		return executionCloseDecision{}, false, fmt.Errorf("close guard liquidation: trade adapter %s disabled", perpExchange)
+	}
+	pos, err := adapter.GetPosition(ctx, plan.Symbol, perpVenueSymbol, perpAssetID)
+	if err != nil {
+		s.registerAPIFailure(perpExchange)
+		return executionCloseDecision{}, false, fmt.Errorf("close guard liquidation %s failed: %w", perpExchange, err)
+	}
+	s.registerAPISuccess(perpExchange)
+	if math.Abs(pos.Quantity) <= 1e-9 || pos.LiquidationPrice <= 0 || pos.MarkPrice <= 0 {
+		return executionCloseDecision{}, false, nil
+	}
+
+	liqDistance := positionLiquidationDistanceRatio(pos)
+	if liqDistance <= 0 {
+		return executionCloseDecision{}, false, nil
+	}
+	if s.cfg.SameExchangeEmergencyLiqDistanceRatio > 0 && liqDistance <= s.cfg.SameExchangeEmergencyLiqDistanceRatio {
+		return executionCloseDecision{
+			shouldClose: true,
+			trigger:     "auto_liquidation_guard_emergency",
+			reason: fmt.Sprintf(
+				"%s liquidation distance %.4f <= emergency threshold %.4f (mark %.4f, liq %.4f)",
+				perpExchange,
+				liqDistance,
+				s.cfg.SameExchangeEmergencyLiqDistanceRatio,
+				pos.MarkPrice,
+				pos.LiquidationPrice,
+			),
+		}, true, nil
+	}
+	if s.cfg.SameExchangeReduceLiqDistanceRatio > 0 && liqDistance <= s.cfg.SameExchangeReduceLiqDistanceRatio {
+		return executionCloseDecision{
+			shouldClose: true,
+			trigger:     "auto_liquidation_guard_reduce",
+			reason: fmt.Sprintf(
+				"%s liquidation distance %.4f <= reduce threshold %.4f (mark %.4f, liq %.4f)",
+				perpExchange,
+				liqDistance,
+				s.cfg.SameExchangeReduceLiqDistanceRatio,
+				pos.MarkPrice,
+				pos.LiquidationPrice,
+			),
+		}, true, nil
+	}
+	return executionCloseDecision{}, false, nil
+}
+
+func (s *ExecutionService) evaluateSameExchangeFundingExitGuard(now time.Time, plan *entity.ExecutionPlan) (executionCloseDecision, bool, error) {
+	if plan == nil || !s.cfg.SameExchangeCloseOnNegativeFunding {
+		return executionCloseDecision{}, false, nil
+	}
+
+	arbitrageMode := normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange))
+	if arbitrageMode != ArbitrageModeSameExchangeSpotPerp {
+		return executionCloseDecision{}, false, nil
+	}
+
+	guardCfg := s.cfg
+	guardCfg.ArbitrageMode = arbitrageMode
+	snapshots, ok := loadPairMarketSnapshot(s.store, guardCfg, plan.Symbol, plan.LongExchange, plan.ShortExchange)
+	if !ok {
+		return executionCloseDecision{}, false, fmt.Errorf("close guard same-exchange funding: missing latest pair snapshot for %s", plan.Symbol)
+	}
+	if isSnapshotStaleForConfig(guardCfg, now, snapshots.LongFunding.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, snapshots.ShortFunding.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, snapshots.LongBook.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, snapshots.ShortBook.EventTimeMs) {
+		return executionCloseDecision{}, false, fmt.Errorf("close guard same-exchange funding: stale market data for %s", plan.Symbol)
+	}
+
+	perpFunding := snapshots.ShortFunding
+	if isPerpetualSymbol(snapshots.LongMeta) && !isPerpetualSymbol(snapshots.ShortMeta) {
+		perpFunding = snapshots.LongFunding
+	}
+	if perpFunding.FundingRate >= 0 {
+		return executionCloseDecision{}, false, nil
+	}
+
+	historyThreshold := s.cfg.SameExchangeHistoryNegativeExitThreshold
+	historySupportsExit := plan.PerpFundingHistorySampleCount == 0 || plan.PerpFundingHistoryNegativeRatio >= historyThreshold
+	if !historySupportsExit {
+		return executionCloseDecision{}, false, nil
+	}
+
+	estimatedClosePNL := sameExchangeEstimatedClosePNL(plan, snapshots.LongBook, snapshots.ShortBook)
+	if s.cfg.SameExchangeExitRequirePositiveClosePNL && estimatedClosePNL < s.cfg.SameExchangeExitMinClosePNL {
+		return executionCloseDecision{}, false, nil
+	}
+
+	reason := fmt.Sprintf(
+		"perp funding turned negative at %.5f%%; history negative ratio %.1f%% over %d samples; estimated close pnl %.4f",
+		perpFunding.FundingRate*100,
+		plan.PerpFundingHistoryNegativeRatio*100,
+		plan.PerpFundingHistorySampleCount,
+		estimatedClosePNL,
+	)
+	return executionCloseDecision{
+		shouldClose: true,
+		trigger:     "auto_negative_funding_exit",
+		reason:      reason,
+	}, true, nil
+}
+
+func (s *ExecutionService) evaluateSameExchangePriceShockGuard(ctx context.Context, now time.Time, plan *entity.ExecutionPlan) (executionCloseDecision, bool, error) {
+	if plan == nil {
+		return executionCloseDecision{}, false, nil
+	}
+	arbitrageMode := normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(s.cfg.ArbitrageMode, ArbitrageModeCrossExchange))
+	if arbitrageMode != ArbitrageModeSameExchangeSpotPerp || s.cfg.SameExchangeMax1hPriceShockRatio <= 0 {
+		return executionCloseDecision{}, false, nil
+	}
+	guardCfg := s.cfg
+	guardCfg.ArbitrageMode = arbitrageMode
+	snapshots, ok := loadPairMarketSnapshot(s.store, guardCfg, plan.Symbol, plan.LongExchange, plan.ShortExchange)
+	if !ok {
+		return executionCloseDecision{}, false, fmt.Errorf("close guard price shock: missing latest pair snapshot for %s", plan.Symbol)
+	}
+	if isSnapshotStaleForConfig(guardCfg, now, snapshots.LongFunding.EventTimeMs) ||
+		isSnapshotStaleForConfig(guardCfg, now, snapshots.ShortFunding.EventTimeMs) {
+		return executionCloseDecision{}, false, fmt.Errorf("close guard price shock: stale funding snapshot for %s", plan.Symbol)
+	}
+
+	perpExchange := plan.ShortExchange
+	perpFunding := snapshots.ShortFunding
+	if isPerpetualSymbol(snapshots.LongMeta) && !isPerpetualSymbol(snapshots.ShortMeta) {
+		perpExchange = plan.LongExchange
+		perpFunding = snapshots.LongFunding
+	}
+	assessment := assessSameExchangePriceRisk(ctx, guardCfg, s.marketRepo, arbitrageMode, perpExchange, plan.Symbol, perpFunding, now)
+	if assessment.Allowed {
+		return executionCloseDecision{}, false, nil
+	}
+	return executionCloseDecision{
+		shouldClose: true,
+		trigger:     "auto_price_shock_guard",
+		reason:      sameExchangePriceRiskRejectReason(guardCfg, assessment),
+	}, true, nil
 }
 
 func projectFundingCarryFromCurrentSnapshots(cfg Config, now time.Time, longFunding, shortFunding entity.FundingSnapshot) (fundingProjection, bool) {
@@ -295,7 +511,7 @@ func projectFundingCarryFromCurrentSnapshots(cfg Config, now time.Time, longFund
 		)
 		return selectPrimaryFundingProjectionForConfig(cfg.normalize(), plan.Projections)
 	}
-	projections := buildFundingProjections(now, cfg.HoldHours, longFunding, longForecast, shortFunding, shortForecast)
+	projections := buildFundingProjectionsForConfig(cfg, now, longFunding, longForecast, shortFunding, shortForecast)
 	return selectPrimaryFundingProjectionForConfig(cfg.normalize(), projections)
 }
 
@@ -314,6 +530,9 @@ func projectFundingCarryFromCurrentSnapshots(cfg Config, now time.Time, longFund
 func projectFundingCarryForPlanRevalidation(cfg Config, now time.Time, plan *entity.ExecutionPlan, longFunding, shortFunding entity.FundingSnapshot) (fundingProjection, bool) {
 	if plan == nil {
 		return fundingProjection{}, false
+	}
+	if projection, ok := sameExchangeHistoricalLongHoldProjectionForPlan(now, plan, shortFunding); ok {
+		return projection, true
 	}
 
 	decay := normalizedContinuationDecay(cfg.FundingRateContinuationDecay)
@@ -352,8 +571,12 @@ func projectFundingCarryForPlanRevalidation(cfg Config, now time.Time, plan *ent
 		).Projections
 		return selectFundingProjectionForPlan(cfg, plan, planProjections)
 	}
-	projections := buildFundingProjections(now, cfg.HoldHours, longFunding, longForecast, shortFunding, shortForecast)
+	projections := buildFundingProjectionsForConfig(cfg, now, longFunding, longForecast, shortFunding, shortForecast)
 	return selectFundingProjectionForPlan(cfg, plan, projections)
+}
+
+func buildFundingProjectionsForConfig(cfg Config, now time.Time, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
+	return buildLegacyFundingProjectionsForConfig(cfg, now, longFunding, longForecast, shortFunding, shortForecast)
 }
 
 func buildFundingProjections(now time.Time, holdHours float64, longFunding entity.FundingSnapshot, longForecast fundingForecast, shortFunding entity.FundingSnapshot, shortForecast fundingForecast) []fundingProjection {
@@ -387,6 +610,60 @@ func selectFundingProjectionForPlan(cfg Config, plan *entity.ExecutionPlan, proj
 	}
 
 	return selectPrimaryFundingProjectionForConfig(cfg.normalize(), projections)
+}
+
+func sameExchangeHistoricalLongHoldProjectionForPlan(now time.Time, plan *entity.ExecutionPlan, perpFunding entity.FundingSnapshot) (fundingProjection, bool) {
+	if plan == nil {
+		return fundingProjection{}, false
+	}
+	if normalizeArbitrageMode(plan.ArbitrageMode, ArbitrageModeCrossExchange) != ArbitrageModeSameExchangeSpotPerp {
+		return fundingProjection{}, false
+	}
+	if !plan.SameExchangeLongHoldUsingHistoryEstimate || plan.SameExchangeLongHoldSuggestedFundingEvents <= 0 {
+		return fundingProjection{}, false
+	}
+	if perpFunding.FundingRate <= 0 {
+		return fundingProjection{}, false
+	}
+	adjustedEventRate := perpFunding.FundingRate
+	if plan.PerpFundingHistorySampleCount > 0 {
+		support := clampFloat(plan.PerpFundingHistoricalSupportRatio, 0, 1)
+		adjustedEventRate = perpFunding.FundingRate*support + plan.PerpFundingHistoryMeanRate*(1-support)
+	}
+	if adjustedEventRate <= 0 {
+		return fundingProjection{}, false
+	}
+	projectedFundingTimeMs := sameExchangeSuggestedFundingTimeMs(
+		now.UnixMilli(),
+		perpFunding.FundingTimeMs,
+		maxInt(perpFunding.FundingIntervalHours, 1),
+		plan.SameExchangeLongHoldSuggestedFundingEvents,
+	)
+	windowHours := sameExchangeSuggestedHoldHours(
+		now.UnixMilli(),
+		projectedFundingTimeMs,
+		maxInt(perpFunding.FundingIntervalHours, 1),
+		plan.SameExchangeLongHoldSuggestedFundingEvents,
+	)
+	carryRate := adjustedEventRate * float64(plan.SameExchangeLongHoldSuggestedFundingEvents)
+	projection := fundingProjection{
+		ProjectedFundingTimeMs:       projectedFundingTimeMs,
+		RequiredEntryByFundingTimeMs: plan.RequiredEntryByFundingTimeMs,
+		LongFundingEventCount:        plan.SameExchangeLongHoldSuggestedFundingEvents,
+		ShortFundingEventCount:       plan.SameExchangeLongHoldSuggestedFundingEvents,
+		FundingWindowHours:           windowHours,
+		CarryRate:                    carryRate,
+		ComputationMode:              "same_exchange_long_hold_history",
+		StrategyMode:                 normalizedPlanStrategyMode(*plan),
+		NextReviewTimeMs:             plan.NextReviewTimeMs,
+		SyncBoundaryTimeMs:           plan.SyncBoundaryTimeMs,
+		IncludedSegmentCount:         plan.EntryPathSegmentCount,
+		PathEndReason:                "same_exchange_long_hold_history",
+	}
+	if windowHours > 0 {
+		projection.CarryRateHourlyEquivalent = carryRate / windowHours
+	}
+	return projection, true
 }
 
 func nearestFundingProjection(targetMs int64, projections []fundingProjection) fundingProjection {
@@ -459,6 +736,12 @@ func markToMarketClosePNL(plan *entity.ExecutionPlan, longBook, shortBook entity
 	longPNL := (longBook.BidPrice - plan.LongEntryPrice) * plan.LongQty
 	shortPNL := (plan.ShortEntryPrice - shortBook.AskPrice) * plan.ShortQty
 	return longPNL + shortPNL
+}
+
+func sameExchangeEstimatedClosePNL(plan *entity.ExecutionPlan, longBook, shortBook entity.BookTopSnapshot) float64 {
+	closePNL := markToMarketClosePNL(plan, longBook, shortBook)
+	exitSlippagePNL := math.Abs(plan.SlippagePNL) * 0.5
+	return closePNL - plan.ExitFeePNL - exitSlippagePNL
 }
 
 func closeSideBasisBps(longBid, shortAsk float64) float64 {

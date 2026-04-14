@@ -275,12 +275,16 @@ func (c *HyperliquidTradeClient) GetPosition(ctx context.Context, canonicalSymbo
 			continue
 		}
 		return Position{
-			Exchange:      c.name,
-			Symbol:        canonicalSymbol,
-			VenueSymbol:   venueSymbol,
-			Quantity:      parseNullableFloat(posMap["szi"]),
-			EntryPrice:    parseNullableFloat(posMap["entryPx"]),
-			MarkPrice:     parseNullableFloat(posMap["markPx"]),
+			Exchange:    c.name,
+			Symbol:      canonicalSymbol,
+			VenueSymbol: venueSymbol,
+			Quantity:    parseNullableFloat(posMap["szi"]),
+			EntryPrice:  parseNullableFloat(posMap["entryPx"]),
+			MarkPrice:   parseNullableFloat(posMap["markPx"]),
+			LiquidationPrice: firstPositive(
+				parseNullableFloat(posMap["liquidationPx"]),
+				parseNullableFloat(posMap["liqPx"]),
+			),
 			UnrealizedPnL: parseNullableFloat(posMap["unrealizedPnl"]),
 		}, nil
 	}

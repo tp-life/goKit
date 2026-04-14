@@ -70,10 +70,13 @@ const (
 	sortByNet sortMode = iota
 	sortByScore
 	sortByEdge
+	sortByFunding
 )
 
 func (s sortMode) String() string {
 	switch s {
+	case sortByFunding:
+		return "永续费率"
 	case sortByScore:
 		return "评分"
 	case sortByEdge:
@@ -89,6 +92,8 @@ func (s sortMode) next() sortMode {
 		return sortByScore
 	case sortByScore:
 		return sortByEdge
+	case sortByEdge:
+		return sortByFunding
 	default:
 		return sortByNet
 	}
@@ -268,8 +273,9 @@ type Model struct {
 	execTab executionListMode
 	sort    sortMode
 
-	loading  bool
-	showHelp bool
+	loading        bool
+	showHelp       bool
+	sortCustomized bool
 
 	lastRefresh time.Time
 	lastError   string
@@ -344,6 +350,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.data.System = msg.System
+		m.normalizeSortMode()
 		m.data.AutoClose = msg.AutoClose
 		m.data.LivePositions = msg.LivePositions
 		m.data.Opportunities = msg.Opportunities
@@ -375,6 +382,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case systemLoadedMsg:
 		m.data.System = msg.System
+		m.normalizeSortMode()
 		m.finishLoading(loadSystem)
 		m.normalizeSelections()
 		return m, tea.Batch(m.postSelectionCmds()...)
@@ -522,7 +530,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.search.Focus()
 		return m, nil
 	case "s":
-		m.sort = m.sort.next()
+		m.sort = m.nextSortMode()
+		m.sortCustomized = true
 		m.opportunityAutoFollow = true
 		m.opportunityOffset = 0
 		m.normalizeSelections()
@@ -1291,9 +1300,46 @@ func (m Model) pairOptions() []string {
 	return out
 }
 
+func (m *Model) normalizeSortMode() {
+	if m.sortCustomized {
+		return
+	}
+	if isSameExchangeArbitrageMode(m.data.System.Strategy.ArbitrageMode) {
+		m.sort = sortByFunding
+		return
+	}
+	m.sort = sortByNet
+}
+
+func (m Model) nextSortMode() sortMode {
+	if isSameExchangeArbitrageMode(m.data.System.Strategy.ArbitrageMode) {
+		switch m.sort {
+		case sortByFunding:
+			return sortByNet
+		case sortByNet:
+			return sortByScore
+		case sortByScore:
+			return sortByEdge
+		default:
+			return sortByFunding
+		}
+	}
+	switch m.sort {
+	case sortByFunding:
+		return sortByNet
+	default:
+		return m.sort.next()
+	}
+}
+
+func (m Model) sortLabel() string {
+	return m.sort.String()
+}
+
 func (m Model) filteredOpportunities() []OpportunityListItem {
 	searchText := strings.ToUpper(strings.TrimSpace(m.search.Value()))
 	pairFilter := strings.TrimSpace(m.pairFilter)
+	arbitrageMode := normalizeArbitrageMode(m.data.System.Strategy.ArbitrageMode, service.ArbitrageModeCrossExchange)
 	items := make([]OpportunityListItem, 0, len(m.data.Opportunities))
 	for _, item := range m.data.Opportunities {
 		if pairFilter != "" && opportunityPair(item) != pairFilter {
@@ -1316,6 +1362,9 @@ func (m Model) filteredOpportunities() []OpportunityListItem {
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool {
+		if isSameExchangeArbitrageMode(arbitrageMode) {
+			return m.lessSameExchangeOpportunity(items[i], items[j])
+		}
 		p1 := m.opportunityPriority(items[i])
 		p2 := m.opportunityPriority(items[j])
 		if p1 != p2 {
@@ -1331,6 +1380,42 @@ func (m Model) filteredOpportunities() []OpportunityListItem {
 		}
 	})
 	return items
+}
+
+func (m Model) lessSameExchangeOpportunity(left, right OpportunityListItem) bool {
+	switch m.sort {
+	case sortByNet:
+		if left.NetExpectedPNL != right.NetExpectedPNL {
+			return left.NetExpectedPNL > right.NetExpectedPNL
+		}
+	case sortByScore:
+		if left.Score != right.Score {
+			return left.Score > right.Score
+		}
+	case sortByEdge:
+		if left.GrossEdgeHourly != right.GrossEdgeHourly {
+			return left.GrossEdgeHourly > right.GrossEdgeHourly
+		}
+	default:
+		if left.ShortFundingRate != right.ShortFundingRate {
+			return left.ShortFundingRate > right.ShortFundingRate
+		}
+	}
+	if left.ShortFundingRate != right.ShortFundingRate {
+		return left.ShortFundingRate > right.ShortFundingRate
+	}
+	if left.ShortFutureFundingRate != right.ShortFutureFundingRate {
+		return left.ShortFutureFundingRate > right.ShortFutureFundingRate
+	}
+	if left.NetExpectedPNL != right.NetExpectedPNL {
+		return left.NetExpectedPNL > right.NetExpectedPNL
+	}
+	p1 := m.opportunityPriority(left)
+	p2 := m.opportunityPriority(right)
+	if p1 != p2 {
+		return p1 > p2
+	}
+	return left.Symbol < right.Symbol
 }
 
 func (m Model) opportunityPriority(item OpportunityListItem) int {
@@ -1723,6 +1808,81 @@ func opportunityPair(item any) string {
 func opportunityDirection(item any) string {
 	_, longExchange, shortExchange, _, _ := opportunityIdentity(item)
 	return fmt.Sprintf("%s long / %s short", longExchange, shortExchange)
+}
+
+func arbitrageModeText(mode string) string {
+	switch normalizeArbitrageMode(mode, service.ArbitrageModeCrossExchange) {
+	case service.ArbitrageModeSameExchangeSpotPerp:
+		return "同所现货对冲"
+	default:
+		return "跨所资金费套利"
+	}
+}
+
+func isSameExchangeArbitrageMode(mode string) bool {
+	return normalizeArbitrageMode(mode, service.ArbitrageModeCrossExchange) == service.ArbitrageModeSameExchangeSpotPerp
+}
+
+func normalizeArbitrageMode(mode, fallback string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case service.ArbitrageModeCrossExchange, service.ArbitrageModeSameExchangeSpotPerp:
+		return mode
+	default:
+		return fallback
+	}
+}
+
+func planArbitrageMode(plan entity.ExecutionPlan, fallback string) string {
+	return normalizeArbitrageMode(plan.ArbitrageMode, normalizeArbitrageMode(fallback, service.ArbitrageModeCrossExchange))
+}
+
+func recordArbitrageMode(rec entity.ExecutionRecord, fallback string) string {
+	return normalizeArbitrageMode(rec.ArbitrageMode, normalizeArbitrageMode(fallback, service.ArbitrageModeCrossExchange))
+}
+
+func opportunityPairDisplay(item any, arbitrageMode string) string {
+	_, longExchange, shortExchange, _, _ := opportunityIdentity(item)
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return fmt.Sprintf("%s(现货) -> %s(永续)", longExchange, shortExchange)
+	}
+	return fmt.Sprintf("%s -> %s", longExchange, shortExchange)
+}
+
+func opportunityDirectionDisplay(item any, arbitrageMode string) string {
+	_, longExchange, shortExchange, _, _ := opportunityIdentity(item)
+	if isSameExchangeArbitrageMode(arbitrageMode) {
+		return fmt.Sprintf("%s 现货多 / %s 永续空", longExchange, shortExchange)
+	}
+	return fmt.Sprintf("%s long / %s short", longExchange, shortExchange)
+}
+
+func fundingRankText(rule entity.OpportunityFundingRule) string {
+	if rule.CurrentFundingRank <= 0 || rule.CurrentFundingRankTotal <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("#%d/%d", rule.CurrentFundingRank, rule.CurrentFundingRankTotal)
+}
+
+func fundingHistoryNegativeText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("%.1f%% / %d", rule.HistoryNegativeRatio*100, rule.HistorySampleCount)
+}
+
+func fundingHistoryPositiveText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("%.1f%% / %d", rule.HistoryPositiveRatio*100, rule.HistorySampleCount)
+}
+
+func fundingHistoricalPercentileText(rule entity.OpportunityFundingRule) string {
+	if rule.HistorySampleCount <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("%.1f%%", rule.CurrentHistoricalPercentile*100)
 }
 
 func opportunityIdentity(item any) (symbol, longExchange, shortExchange, longVenueSymbol, shortVenueSymbol string) {
