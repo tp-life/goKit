@@ -678,7 +678,8 @@ func (r *StrategyRunner) opportunityLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case tickAt := <-ticker.C:
+			now := effectiveOpportunityBatchTime(tickAt.UTC(), time.Now().UTC())
 			batchID := fmt.Sprintf("%d", now.UnixMilli())
 			items := r.computeCandidates(now)
 			if len(items) == 0 {
@@ -696,6 +697,25 @@ func (r *StrategyRunner) opportunityLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// effectiveOpportunityBatchTime 取“本轮真正开始处理机会计算”的时间，而不是机械复用 ticker 发出的时刻。
+//
+// 这样做是为了避免以下场景：
+//  1. opportunity 计算一轮耗时明显超过 `opportunity_calc_interval`；
+//  2. goroutine 下一次从 ticker channel 读到的时间戳，其实已经落后真实墙钟十几秒；
+//  3. 如果继续把这个陈旧 tick 时间写进 `batch_id/as_of_time_ms`，查询层会把刚写入的新 batch
+//     误判成 stale，界面上就会表现成“机会列表一会儿有、一会儿空”。
+//
+// 因此这里统一取“tick 时间”和“实际处理时间”里较新的那个，既保持单调性，也避免新 batch
+// 刚落库就被 freshness gate 清空。
+func effectiveOpportunityBatchTime(tickAt, handledAt time.Time) time.Time {
+	tickAt = tickAt.UTC()
+	handledAt = handledAt.UTC()
+	if handledAt.After(tickAt) {
+		return handledAt
+	}
+	return tickAt
 }
 
 // computeCandidates 是“最终机会精算层”的核心。

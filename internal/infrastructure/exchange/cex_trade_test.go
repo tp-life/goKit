@@ -575,6 +575,94 @@ func TestBinanceTradeUsesV3AccountAndPositionEndpoints(t *testing.T) {
 	}
 }
 
+func TestBinancePortfolioMarginTradeUsesPapiEndpoints(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "binance-key")
+	t.Setenv("BINANCE_API_SECRET", "binance-secret")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-MBX-APIKEY"); got != "binance-key" {
+			t.Fatalf("unexpected api key header %q", got)
+		}
+		assertLegacyAsterSignature(t, r, "binance-secret")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/papi/v1/um/positionRisk":
+			_, _ = io.WriteString(w, `[{
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH",
+				"positionAmt":"0.02",
+				"entryPrice":"60100",
+				"markPrice":"60050",
+				"unRealizedProfit":"1.25"
+			}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/papi/v1/um/order":
+			_, _ = io.WriteString(w, `{
+				"orderId":"pm-order-1",
+				"clientOrderId":"pm-cli-1",
+				"status":"FILLED",
+				"executedQty":"0.01",
+				"avgPrice":"60000"
+			}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/papi/v1/account":
+			_, _ = io.WriteString(w, `{
+				"accountEquity":"1200",
+				"totalAvailableBalance":"850",
+				"accountInitialMargin":"250"
+			}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewBinanceTradeClient(ConfigSet{
+		Binance: ExchangeConfig{
+			Enabled:     true,
+			RestBaseURL: server.URL,
+			Auth: AuthConfig{
+				APIKeyEnv:    "BINANCE_API_KEY",
+				APISecretEnv: "BINANCE_API_SECRET",
+			},
+			AdapterOptions: map[string]string{
+				"account_mode": binanceLikeAccountModePortfolioMargin,
+			},
+		},
+	}, logger).(*CEXTradeClient)
+
+	if client.accountMode != binanceLikeAccountModePortfolioMargin {
+		t.Fatalf("expected portfolio margin mode, got %q", client.accountMode)
+	}
+	if client.orderPath != "/papi/v1/um/order" || client.positionPath != "/papi/v1/um/positionRisk" || client.accountPath != "/papi/v1/account" {
+		t.Fatalf("unexpected PM private routes: order=%s position=%s account=%s", client.orderPath, client.positionPath, client.accountPath)
+	}
+	if client.positionModePath != "/papi/v1/um/positionSide/dual" || client.listenKeyPath != "/papi/v1/listenKey" {
+		t.Fatalf("unexpected PM control routes: position_mode=%s listen_key=%s", client.positionModePath, client.listenKeyPath)
+	}
+
+	result, err := client.PlaceOrder(context.Background(), TradeOrderRequest{
+		CanonicalSymbol: "BTC",
+		VenueSymbol:     "BTCUSDT",
+		Side:            "BUY",
+		OrderType:       "MARKET",
+		Quantity:        0.01,
+		ClientOrderID:   "pm-cli-1",
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder error = %v", err)
+	}
+	if result.VenueOrderID != "pm-order-1" || result.ClientOrderID != "pm-cli-1" || result.Status != "FILLED" {
+		t.Fatalf("unexpected order result %#v", result)
+	}
+
+	account, err := client.GetAccountSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("GetAccountSnapshot error = %v", err)
+	}
+	if account.Equity != 1200 || account.AvailableBalance != 850 || account.MarginUsed != 250 {
+		t.Fatalf("unexpected PM account snapshot %#v", account)
+	}
+}
+
 func assertLegacyAsterSignature(t *testing.T, r *http.Request, secret string) {
 	t.Helper()
 	if r.URL.RawQuery == "" {

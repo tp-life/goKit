@@ -362,6 +362,10 @@ exchanges:
     adapter_options:
       # Binance 当前支持 legacy_hmac 与 rsa 两种私有鉴权方式。
       # 若只配置了 private_key_env 且未提供 api_secret_env，程序会自动推断为 rsa。
+      # 账户模式默认是标准 USD-M futures；若 Binance 已切到 Portfolio Margin / Unified Account，
+      # 打开下面这个开关后，私有交易链路会自动改走 `papi` + `/pm/ws/...`。
+      # account_mode: "standard_futures"
+      # account_mode: "portfolio_margin"
       # trade_auth_mode: "legacy_hmac"
       # trade_auth_mode: "rsa"
 

@@ -44,8 +44,8 @@ type cexUserDataOrder struct {
 // supportsOrderEventStream 明确声明“当前这份 Binance-like 适配器是否真的具备用户订单流能力”。
 //
 // 现在这里同时放开 Binance 与 Aster，原因是两边的官方文档都明确给出了同族的用户流协议：
-// - REST 侧通过 `POST /fapi/v1/listenKey` 创建 listenKey；
-// - websocket 侧订阅 `/ws/<listenKey>`；
+// - REST 侧通过 `POST /fapi/v1/listenKey` 或 `POST /papi/v1/listenKey` 创建 listenKey；
+// - websocket 侧订阅 `/ws/<listenKey>`（Portfolio Margin 会落在 `/pm/ws/<listenKey>`）；
 // - 订单更新使用 `ORDER_TRADE_UPDATE`；
 // - listenKey 过期会收到 `listenKeyExpired`。
 //
@@ -126,7 +126,7 @@ func (c *CEXTradeClient) StartOrderEventStream(ctx context.Context, sink OrderEv
 
 func (c *CEXTradeClient) startUserDataStream(ctx context.Context) (string, error) {
 	var payload cexListenKeyResponse
-	_, err := c.apiKeyRequest(ctx, http.MethodPost, "/fapi/v1/listenKey", &payload)
+	_, err := c.apiKeyRequest(ctx, http.MethodPost, c.listenKeyPath, &payload)
 	if err != nil {
 		return "", err
 	}
@@ -145,7 +145,7 @@ func (c *CEXTradeClient) keepaliveUserDataStreamLoop(ctx context.Context, listen
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := c.apiKeyRequest(ctx, http.MethodPut, "/fapi/v1/listenKey?listenKey="+listenKey, nil); err != nil && c.logger != nil {
+			if _, err := c.apiKeyRequest(ctx, http.MethodPut, c.listenKeyPath+"?listenKey="+listenKey, nil); err != nil && c.logger != nil {
 				c.logger.Warn("cex_user_stream_keepalive_failed", "exchange", c.name, "listen_key", listenKey, "err", err)
 			}
 		}
@@ -156,7 +156,7 @@ func (c *CEXTradeClient) closeUserDataStream(ctx context.Context, listenKey stri
 	if strings.TrimSpace(listenKey) == "" {
 		return nil
 	}
-	_, err := c.apiKeyRequest(ctx, http.MethodDelete, "/fapi/v1/listenKey?listenKey="+listenKey, nil)
+	_, err := c.apiKeyRequest(ctx, http.MethodDelete, c.listenKeyPath+"?listenKey="+listenKey, nil)
 	return err
 }
 

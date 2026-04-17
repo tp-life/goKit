@@ -67,9 +67,12 @@ type CEXTradeClient struct {
 	accountAddr           string
 	signerAddr            string
 	authMode              string
+	accountMode           string
 	orderPath             string
 	positionPath          string
 	accountPath           string
+	positionModePath      string
+	listenKeyPath         string
 	nonceMu               sync.Mutex
 	lastNonce             int64
 	positionModeMu        sync.Mutex
@@ -90,7 +93,7 @@ func NewAsterTradeClient(cfg ConfigSet, logger *slog.Logger) TradeAdapter {
 // NewBinanceLikeTradeAdapter 是 registry 层应该优先使用的交易适配器构造入口。
 //
 // 它的命名刻意强调：这份实现只覆盖 Binance Futures 风格的私有交易协议，
-// 例如 API Key + HMAC 签名、`/fapi/...` 路径、Binance 风格字段名等。
+// 例如 API Key + HMAC/RSA 签名、`/fapi/...` / `/papi/...` 路径、Binance 风格字段名等。
 //
 // 这能帮助后续接入新交易所时更快看清边界：
 // - 如果新交易所真的是 Binance-like，可以复用这份实现；
@@ -105,14 +108,7 @@ func NewBinanceLikeTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Lo
 // 它现在只代表 `binance_like` 协议族。
 func NewCEXTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) TradeAdapter {
 	c := normalizeExchangeConfig(name, cfg)
-	if c.RestBaseURL == "" {
-		switch name {
-		case "aster":
-			c.RestBaseURL = "https://fapi.asterdex.com"
-		default:
-			c.RestBaseURL = "https://fapi.binance.com"
-		}
-	}
+	c.RestBaseURL = resolveBinanceLikeTradeRESTBaseURL(name, c)
 	if c.PublicWSBaseURL == "" {
 		switch name {
 		case "aster":
@@ -121,45 +117,34 @@ func NewCEXTradeAdapter(name string, cfg ExchangeConfig, logger *slog.Logger) Tr
 			c.PublicWSBaseURL = "wss://fstream.binance.com"
 		}
 	}
-	if c.PrivateWSBaseURL == "" {
-		c.PrivateWSBaseURL = c.PublicWSBaseURL
-	}
 	appCfg := loadAppConfig()
-	orderPath := "/fapi/v1/order"
-	positionPath := "/fapi/v2/positionRisk"
-	accountPath := "/fapi/v2/account"
 	authMode := tradeAuthMode(name, c)
-	if name == "binance" {
-		positionPath = "/fapi/v3/positionRisk"
-		accountPath = "/fapi/v3/account"
-	}
-	if name == "aster" && authMode == asterTradeAuthV3Signer {
-		orderPath = "/fapi/v3/order"
-		positionPath = "/fapi/v3/positionRisk"
-		accountPath = "/fapi/v3/account"
-	} else if name == "aster" {
-		accountPath = "/fapi/v4/account"
-	}
+	c.PrivateWSBaseURL = resolveBinanceLikeTradePrivateWSBaseURL(name, c)
+	accountMode := binanceLikeAccountMode(name, c)
+	routes := resolveBinanceLikePrivateRoutes(name, c, authMode)
 	pk, signerAddr := loadAsterSigner(c.Auth)
 	rsaPK := loadRSASigner(c.Auth)
 	apiKey, apiSecret := readCredentialPair(c.Auth.APIKeyEnv, c.Auth.APISecretEnv)
 	accountAddr, _ := readCredentialPair(c.Auth.AccountAddressEnv, c.Auth.PrivateKeyEnv)
 	client := &CEXTradeClient{
-		name:          name,
-		cfg:           c,
-		logger:        logger,
-		httpClient:    newHTTPClient(c, appCfg, logger, name+"-trade"),
-		wsDialer:      newWebSocketDialer(c, appCfg, logger, name+"-trade"),
-		apiKey:        apiKey,
-		apiSecret:     apiSecret,
-		rsaPrivateKey: rsaPK,
-		privateKey:    pk,
-		accountAddr:   strings.TrimSpace(accountAddr),
-		signerAddr:    signerAddr,
-		authMode:      authMode,
-		orderPath:     orderPath,
-		positionPath:  positionPath,
-		accountPath:   accountPath,
+		name:             name,
+		cfg:              c,
+		logger:           logger,
+		httpClient:       newHTTPClient(c, appCfg, logger, name+"-trade"),
+		wsDialer:         newWebSocketDialer(c, appCfg, logger, name+"-trade"),
+		apiKey:           apiKey,
+		apiSecret:        apiSecret,
+		rsaPrivateKey:    rsaPK,
+		privateKey:       pk,
+		accountAddr:      strings.TrimSpace(accountAddr),
+		signerAddr:       signerAddr,
+		authMode:         authMode,
+		accountMode:      accountMode,
+		orderPath:        routes.orderPath,
+		positionPath:     routes.positionPath,
+		accountPath:      routes.accountPath,
+		positionModePath: routes.positionModePath,
+		listenKeyPath:    routes.listenKeyPath,
 	}
 	return client
 }
@@ -343,6 +328,28 @@ func (c *CEXTradeClient) GetAccountSnapshot(ctx context.Context) (AccountSnapsho
 	if err != nil {
 		return AccountSnapshot{}, err
 	}
+	if c.usesBinancePortfolioMargin() {
+		return AccountSnapshot{
+			Exchange: c.name,
+			Equity: firstPositive(
+				parseNullableFloat(payload["accountEquity"]),
+				parseNullableFloat(payload["actualEquity"]),
+				parseNullableFloat(payload["totalMarginBalance"]),
+				parseNullableFloat(payload["totalWalletBalance"]),
+			),
+			AvailableBalance: firstPositive(
+				parseNullableFloat(payload["totalAvailableBalance"]),
+				parseNullableFloat(payload["virtualMaxWithdrawAmount"]),
+				parseNullableFloat(payload["availableBalance"]),
+			),
+			MarginUsed: firstPositive(
+				parseNullableFloat(payload["accountInitialMargin"]),
+				parseNullableFloat(payload["totalInitialMargin"]),
+				parseNullableFloat(payload["accountMaintMargin"]),
+			),
+			RawResponse: raw,
+		}, nil
+	}
 	return AccountSnapshot{
 		Exchange:         c.name,
 		Equity:           firstPositive(parseNullableFloat(payload["totalMarginBalance"]), parseNullableFloat(payload["totalWalletBalance"])),
@@ -496,10 +503,10 @@ func (c *CEXTradeClient) fetchOneWayPositionMode(ctx context.Context, venueSymbo
 	}
 	params := url.Values{}
 	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
-	if _, err := c.signedGET(ctx, "/fapi/v1/positionSide/dual", params, &payload); err != nil {
+	if _, err := c.signedGET(ctx, c.positionModePath, params, &payload); err != nil {
 		return false, "", err
 	}
-	return !payload.DualSidePosition, "/fapi/v1/positionSide/dual", nil
+	return !payload.DualSidePosition, c.positionModePath, nil
 }
 
 // inferOneWayPositionModeFromPositionRisk 借助 positionRisk 的返回形状推断当前账户模式。
@@ -893,6 +900,13 @@ func firstPositive(values ...float64) float64 {
 		}
 	}
 	return 0
+}
+
+func (c *CEXTradeClient) usesBinancePortfolioMargin() bool {
+	if c == nil {
+		return false
+	}
+	return normalizeExchangeName(c.name) == "binance" && c.accountMode == binanceLikeAccountModePortfolioMargin
 }
 
 func firstNonEmpty(values ...string) string {

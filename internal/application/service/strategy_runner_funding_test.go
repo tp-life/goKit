@@ -160,6 +160,26 @@ func TestBuildFundingCandidateTimes_StrictlyRespectsHoldWindow(t *testing.T) {
 	}
 }
 
+func TestEffectiveOpportunityBatchTimePrefersActualHandlingTimeWhenTickerFallsBehind(t *testing.T) {
+	tickAt := time.Date(2026, 4, 17, 9, 33, 20, 0, time.UTC)
+	handledAt := tickAt.Add(14 * time.Second)
+
+	got := effectiveOpportunityBatchTime(tickAt, handledAt)
+	if !got.Equal(handledAt) {
+		t.Fatalf("expected delayed loop to use actual handling time %s, got %s", handledAt, got)
+	}
+}
+
+func TestEffectiveOpportunityBatchTimeKeepsTickerTimeWhenClockHasNotMovedPastIt(t *testing.T) {
+	tickAt := time.Date(2026, 4, 17, 9, 33, 20, 0, time.UTC)
+	handledAt := tickAt.Add(-2 * time.Second)
+
+	got := effectiveOpportunityBatchTime(tickAt, handledAt)
+	if !got.Equal(tickAt) {
+		t.Fatalf("expected helper to keep ticker time %s, got %s", tickAt, got)
+	}
+}
+
 func TestBuildFundingCandidateTimes_IncludesSharedSettlementInsideHoldWindow(t *testing.T) {
 	now := time.Date(2026, 1, 1, 19, 50, 0, 0, time.UTC).UnixMilli()
 	long := entity.FundingSnapshot{FundingTimeMs: time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC).UnixMilli(), FundingIntervalHours: 4}

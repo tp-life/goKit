@@ -28,6 +28,7 @@ type BinanceSignedCheck struct {
 type BinancePreflightResult struct {
 	Exchange          string              `json:"exchange"`
 	AuthMode          string              `json:"auth_mode"`
+	AccountMode       string              `json:"account_mode"`
 	KeyPresent        bool                `json:"key_present"`
 	SecretPresent     bool                `json:"secret_present"`
 	SecretShape       map[string]any      `json:"secret_shape,omitempty"`
@@ -45,11 +46,15 @@ type BinancePreflightResult struct {
 func RunBinancePreflight(ctx context.Context, exchangeName string, cfg ExchangeConfig, logger *slog.Logger) BinancePreflightResult {
 	cfg = normalizeExchangeConfig(exchangeName, cfg)
 	authMode := tradeAuthMode(exchangeName, cfg)
+	accountMode := binanceLikeAccountMode(exchangeName, cfg)
+	tradeBaseURL := resolveBinanceLikeTradeRESTBaseURL(exchangeName, cfg)
+	routes := resolveBinanceLikePrivateRoutes(exchangeName, cfg, authMode)
 	apiKey, apiSecret := readCredentialPair(cfg.Auth.APIKeyEnv, cfg.Auth.APISecretEnv)
 	_, privateKey := readCredentialPair(cfg.Auth.APIKeyEnv, cfg.Auth.PrivateKeyEnv)
 	result := BinancePreflightResult{
 		Exchange:          normalizeExchangeName(exchangeName),
 		AuthMode:          authMode,
+		AccountMode:       accountMode,
 		KeyPresent:        strings.TrimSpace(apiKey) != "",
 		SecretPresent:     strings.TrimSpace(apiSecret) != "",
 		SecretShape:       inspectSecretShape(apiSecret),
@@ -70,7 +75,7 @@ func RunBinancePreflight(ctx context.Context, exchangeName string, cfg ExchangeC
 		restrictions := binanceSignedCheck(ctx, client, cfg, authMode, "api_restrictions", "https://api.binance.com", "/sapi/v1/account/apiRestrictions")
 		result.Restrictions = &restrictions
 	}
-	result.FuturesAccount = binanceSignedCheck(ctx, client, cfg, authMode, "futures_account", strings.TrimRight(cfg.RestBaseURL, "/"), "/fapi/v3/account")
+	result.FuturesAccount = binanceSignedCheck(ctx, client, cfg, authMode, "futures_account", strings.TrimRight(tradeBaseURL, "/"), routes.accountPath)
 	result.LikelyCause, result.Hints = classifyBinancePreflight(result)
 	return result
 }
@@ -169,6 +174,13 @@ func binanceSignedCheck(ctx context.Context, client *http.Client, cfg ExchangeCo
 }
 
 func classifyBinancePreflight(result BinancePreflightResult) (string, []string) {
+	tradingScope := "futures"
+	expectedHost := "fapi.binance.com"
+	if result.AccountMode == binanceLikeAccountModePortfolioMargin {
+		tradingScope = "portfolio margin"
+		expectedHost = "papi.binance.com"
+	}
+
 	if result.AuthMode == binanceLikeTradeAuthRSA {
 		if !result.KeyPresent || !result.PrivateKeyPresent {
 			return "missing Binance API key or RSA private key", []string{
@@ -230,10 +242,11 @@ func classifyBinancePreflight(result BinancePreflightResult) (string, []string) 
 					}
 				}
 			}
-			return "Spot auth works, but the futures account endpoint still rejects this key.", []string{
+			return fmt.Sprintf("Spot auth works, but the Binance %s account endpoint still rejects this key.", tradingScope), []string{
 				"confirm Futures permission is enabled for this key",
 				"confirm the account itself is eligible for USD-M Futures in this region",
-				"confirm you are calling the correct environment: mainnet key with fapi.binance.com",
+				"if this account uses Portfolio Margin / Unified Account, confirm Portfolio Margin is already enabled on the Binance account",
+				fmt.Sprintf("confirm you are calling the correct environment: mainnet key with %s", expectedHost),
 			}
 		}
 		return "Spot auth works, but futures preflight still failed with a non-standard error.", []string{
@@ -241,7 +254,7 @@ func classifyBinancePreflight(result BinancePreflightResult) (string, []string) 
 		}
 	}
 
-	return "Binance spot and futures signed requests both succeeded.", []string{
+	return fmt.Sprintf("Binance spot and %s signed requests both succeeded.", tradingScope), []string{
 		"the key, secret, egress IP, and futures permission all look healthy from this machine",
 	}
 }
