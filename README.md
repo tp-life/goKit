@@ -13,7 +13,7 @@
 
 ## 当前已经包含
 
-- SQLite 持久化
+- MySQL 持久化
 - Binance / Aster / Hyperliquid 公共行情接入
 - Binance Spot 公共行情接入
 - Bybit V5 public websocket 行情接入（`tickers.{symbol}` + `orderbook.1.{symbol}`）
@@ -123,6 +123,14 @@
 
 配置文件见 `configs/config.yaml.example`。
 
+当前默认数据库已经切换为 MySQL，默认 DSN 形如：
+
+```text
+root:password@tcp(127.0.0.1:3306)/funding_arbitrage?charset=utf8mb4&parseTime=True&loc=Local
+```
+
+启动前请先在 MySQL 中创建对应数据库，并按实际账号密码修改 `configs/config.yaml` 里的 `database.dsn`。
+
 重点参数：
 
 - `strategy.arbitrage_mode`：`cross_exchange` 或 `same_exchange_spot_perp`
@@ -202,10 +210,10 @@ TUI 主要交互：
 - `?`：帮助
 - `q`：退出
 
-SQLite 默认文件：
+当前默认数据库：
 
 ```text
-data/arbitrage.db
+MySQL / funding_arbitrage
 ```
 
 ## 当前环境说明

@@ -15,8 +15,8 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Driver:          "sqlite",
-		DSN:             "data/arbitrage.db",
+		Driver:          "mysql",
+		DSN:             "root:password@tcp(127.0.0.1:3306)/funding_arbitrage?charset=utf8mb4&parseTime=True&loc=Local",
 		MaxIdleConns:    2,
 		MaxOpenConns:    4,
 		ConnMaxLifetime: time.Hour,

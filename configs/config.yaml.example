@@ -26,9 +26,10 @@ rpc:
 
 database:
   # 数据库驱动。
-  driver: "sqlite"
-  # 数据库连接串（sqlite 下为文件路径）。
-  dsn: "data/arbitrage.db"
+  driver: "mysql"
+  # 数据库连接串（MySQL DSN）。
+  # 启动前请先手动创建 `funding_arbitrage` 数据库。
+  dsn: "root:password@tcp(127.0.0.1:3306)/funding_arbitrage?charset=utf8mb4&parseTime=True&loc=Local"
   # 空闲连接池大小。
   max_idle_conns: 2
   # 最大打开连接数。
