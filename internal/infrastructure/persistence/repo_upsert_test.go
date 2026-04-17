@@ -234,3 +234,54 @@ func TestExecutionPlanRepo_SaveBatchUpsertsPenaltyFields(t *testing.T) {
 		t.Fatalf("expected entry path metadata to upsert, got count=%d reason=%s", got.EntryPathSegmentCount, got.EntryPathStopReason)
 	}
 }
+
+func TestOpportunityRepo_DeleteOlderThanHonorsLimitAndKeepsLatestBatch(t *testing.T) {
+	ctx := context.Background()
+	client := newTestDBClient(t)
+	repo := &OpportunityRepo{client: client}
+
+	saveBatch := func(batchID string, asOf int64, symbols ...string) {
+		t.Helper()
+		items := make([]entity.Opportunity, 0, len(symbols))
+		for _, symbol := range symbols {
+			items = append(items, entity.Opportunity{
+				Symbol:     symbol,
+				AsOfTimeMs: asOf,
+				Status:     "ready",
+			})
+		}
+		if err := repo.SaveBatch(ctx, batchID, items); err != nil {
+			t.Fatalf("expected save batch %s to succeed, got %v", batchID, err)
+		}
+	}
+
+	saveBatch("batch-1", 100, "BTC", "ETH")
+	saveBatch("batch-2", 200, "SOL", "XRP")
+	saveBatch("batch-3", 300, "DOGE")
+
+	deleted, err := repo.DeleteOlderThan(ctx, 250, 2)
+	if err != nil {
+		t.Fatalf("expected delete older than to succeed, got %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected exactly 2 rows deleted on first pass, got %d", deleted)
+	}
+
+	var remaining []entity.Opportunity
+	if err := client.GetDB(ctx).Order("batch_id asc, id asc").Find(&remaining).Error; err != nil {
+		t.Fatalf("expected remaining rows query to succeed, got %v", err)
+	}
+	if len(remaining) != 3 {
+		t.Fatalf("expected 3 remaining rows after limited delete, got %d", len(remaining))
+	}
+
+	latestBatchCount := 0
+	for _, item := range remaining {
+		if item.BatchID == "batch-3" {
+			latestBatchCount++
+		}
+	}
+	if latestBatchCount != 1 {
+		t.Fatalf("expected latest batch to be preserved, got latestBatchCount=%d", latestBatchCount)
+	}
+}

@@ -2,10 +2,12 @@ package persistence
 
 import (
 	"context"
+	"errors"
 
 	"goKit/internal/domain/entity"
 	"goKit/internal/domain/repository"
 	"goKit/pkg/kit/db"
+	"gorm.io/gorm"
 )
 
 type OpportunityRepo struct {
@@ -79,21 +81,37 @@ func (r *OpportunityRepo) DeleteOlderThan(ctx context.Context, cutoffMs int64, l
 	if limit <= 0 {
 		limit = 5000
 	}
-	latestBatch := r.client.GetDB(ctx).
+
+	dbh := r.client.GetDB(ctx)
+
+	var latest entity.Opportunity
+	if err := dbh.
 		Model(&entity.Opportunity{}).
 		Select("batch_id").
 		Order("as_of_time_ms desc").
-		Limit(1)
-	candidates := r.client.GetDB(ctx).
+		Take(&latest).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	query := dbh.
 		Model(&entity.Opportunity{}).
-		Select("id").
 		Where("as_of_time_ms < ?", cutoffMs).
-		Where("batch_id <> (?)", latestBatch).
+		Where("batch_id <> ?", latest.BatchID).
 		Order("id asc").
 		Limit(limit)
-	result := r.client.GetDB(ctx).
-		Where("id IN (?)", candidates).
-		Delete(&entity.Opportunity{})
+
+	var ids []uint
+	if err := query.Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	result := dbh.Where("id IN ?", ids).Delete(&entity.Opportunity{})
 	return result.RowsAffected, result.Error
 }
 
