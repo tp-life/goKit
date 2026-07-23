@@ -11,6 +11,8 @@ type Config struct {
 	ConnMaxLifetime time.Duration `mapstructure:"conn_max_lifetime"`
 	LogMode         string        `mapstructure:"log_mode"`
 	SlowThreshold   time.Duration `mapstructure:"slow_threshold"`
+	// AutoMigrate 启动时自动迁移表结构（仅限开发/简单部署，生产建议用迁移工具）
+	AutoMigrate bool `mapstructure:"auto_migrate"`
 }
 
 func DefaultConfig() Config {

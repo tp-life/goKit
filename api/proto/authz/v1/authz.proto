@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package authz.v1;
+
+option go_package = "goKit/api/gen/authz/v1;authzv1";
+
+// AuthzService 授权服务：微服务模式下由系统服务提供，业务服务远程调用
+service AuthzService {
+  // CheckPerm 校验用户是否拥有指定权限点
+  rpc CheckPerm(CheckPermRequest) returns (CheckPermResponse);
+  // GetUserPerms 获取用户全部权限点
+  rpc GetUserPerms(GetUserPermsRequest) returns (GetUserPermsResponse);
+}
+
+message CheckPermRequest {
+  uint64 user_id = 1;
+  string perm_code = 2;
+}
+
+message CheckPermResponse {
+  bool allowed = 1;
+}
+
+message GetUserPermsRequest {
+  uint64 user_id = 1;
+}
+
+message GetUserPermsResponse {
+  bool is_super = 1;
+  repeated string perm_codes = 2;
+}

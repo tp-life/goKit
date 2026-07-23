@@ -6,82 +6,143 @@
 ![Fx](https://img.shields.io/badge/uber--fx-v1.20-blueviolet)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-**GoKit** 是一个基于 **Golang 1.21+** 构建的现代化微服务脚手架。它融合了 **领域驱动设计 (DDD)**、**整洁架构 (Clean Architecture)** 与 **依赖注入 (DI)** 的最佳实践。
+**GoKit** 是一个基于 **Golang** 构建的现代化后台服务脚手架。它融合了 **领域驱动设计 (DDD)**、**整洁架构 (Clean Architecture)** 与 **依赖注入 (DI)** 的最佳实践，内置完整的 **RBAC 权限体系**，并支持 **单机 / 微服务双模式部署**。
 
 核心目标：**让基础设施代码标准化，让业务逻辑纯粹化。**
+
+> 📖 详细设计、架构图与技术点见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
 ## ✨ 核心特性
 
-- **🏗 标准 DDD 分层**: 严格隔离 Domain / Application / Infrastructure / Interface。
+- **🏗 标准 DDD 分层**: 模块化设计，`internal/modules/<模块>` 自含 Domain / Application / Infrastructure / Interface 四层。
+- **🔐 完整 RBAC**: JWT 认证 + 用户/角色/菜单(权限点)/部门管理 + 接口级权限校验。
+- **🛡 数据权限**: 基于部门的数据范围（全部 / 自定义 / 本部门及以下 / 本部门 / 仅本人），SQL 级过滤。
+- **🚢 双模式部署**: 单机单二进制开箱即用；改一行配置 (`authz.mode=remote`) 即切换为微服务授权模式。
 - **🧩 依赖注入**: 基于 **Uber Fx** 实现全自动组件装配与生命周期管理。
 - **🚀 极致性能**: **Fiber v2** + **Sonic** (JSON) + **Gorm** (读写分离/预编译) + **gRPC** (KeepAlive)。
-- **🛡 健壮性**: 闭包式事务管理 (`WithTx`)，支持 Context 自动传播。
 - **📝 可观测性**: 基于 **slog** 封装，自动注入 TraceID，支持 Text/JSON 切换。
-- **🔌 插件化**: 为 HTTP/gRPC 预留了基于 Fx Group 的中间件插槽。
 
 ---
 
 ## 🚀 快速开始 (Quick Start)
 
 ### 1. 环境准备
-确保本地已安装：
 - **Go**: 1.21+
-- **MySQL**: 5.7+
-- **Make** (可选，推荐)
+- **MySQL**: 5.7+（或直接使用 docker compose）
 
 ### 2. 初始化配置
-项目默认读取 `configs/local.yaml`。请根据实际情况修改数据库连接：
-
-```yaml
-# configs/local.yaml
-database:
-  driver: "mysql"
-  # 修改为你的账号密码和数据库名
-  dsn: "root:root@tcp(127.0.0.1:3306)/GoKit_db?charset=utf8mb4&parseTime=True&loc=Local"
+```bash
+cp configs/config.yaml.example configs/config.yaml
+# 修改 database.dsn 与 jwt.secret
 ```
 
 ### 3. 启动服务
 
-**方式 A: 使用 Makefile (推荐)**
 ```bash
-# 下载依赖
-make tidy
-
-# 运行服务
-make run
+make tidy && make run
+# 或 docker compose up -d --build
 ```
 
-**方式 B: 使用 Go 命令**
-```bash
-go mod tidy
-go run cmd/server/main.go
-```
+首次启动会自动迁移 `sys_*` 表并播种内置数据：
 
-启动成功后，你将看到以下日志：
-```text
-INFO http_server_start addr=:8080
-INFO grpc_server_start addr=:9090
-```
+| 内置账号 | 密码 | 说明 |
+| :--- | :--- | :--- |
+| `admin` | `Admin@123` | 超级管理员，**请首次登录后立即修改** |
 
 ### 4. 接口测试
 
-项目内置了用户 (User) 模块的 CRUD 示例。
-
-**创建用户 (HTTP)**
+**登录获取 Token**
 ```bash
-curl -X POST http://localhost:8080/api/v1/users \
+curl -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"name": "GoKit Developer", "email": "dev@GoKit.com"}'
+  -d '{"username": "admin", "password": "Admin@123"}'
 ```
-*响应:* `{"id": 1}`
+*响应:* `{"code":0,"message":"success","data":{"token":"eyJhbGc..."}}`
 
-**查询用户 (HTTP)**
+**携带 Token 访问（数据权限自动过滤）**
 ```bash
-curl http://localhost:8080/api/v1/users/1
+curl http://localhost:8080/api/v1/users \
+  -H "Authorization: Bearer <token>"
 ```
-*响应:* `{"id": 1, "name": "GoKit Developer", "email": "dev@GoKit.com"}`
+
+---
+
+## 🔐 权限体系
+
+### 模型
+
+```text
+用户(User) ──< 用户角色(UserRole) >── 角色(Role) ──< 角色菜单(RoleMenu) >── 菜单/权限点(Menu.perm_code)
+                   │                     │
+                   │                     └──< 角色部门(RoleDept) >── 部门(Dept)  ← 数据权限
+                   └── 部门(Dept)
+```
+
+- **功能权限**：权限点挂在菜单树上（如 `system:user:create`），路由中间件逐点校验。
+- **数据权限**：角色携带 `data_scope`，查询时合并用户所有角色的范围（取最宽），翻译成 SQL 条件：
+  - `1` 全部数据 / `2` 自定义部门 / `3` 本部门及以下 / `4` 本部门 / `5` 仅本人
+- **超级管理员** (`is_super=true`) 放行一切。
+
+### API 一览（/api/v1）
+
+| 模块 | 路由 | 权限点 |
+| :--- | :--- | :--- |
+| 认证 | `POST /auth/login` | 公开 |
+| | `GET /auth/profile` / `PUT /auth/password` | 登录即可 |
+| 用户 | `GET/POST /users`，`GET/PUT/DELETE /users/:id` | `system:user:*` |
+| | `PUT /users/:id/roles`（分配角色） | `system:user:assign-role` |
+| | `PUT /users/:id/password`（重置密码） | `system:user:reset-pwd` |
+| 角色 | `GET/POST /roles`，`GET/PUT/DELETE /roles/:id` | `system:role:*` |
+| | `PUT /roles/:id/menus`（分配权限） | `system:role:assign-menu` |
+| | `PUT /roles/:id/users`、`GET /roles/:id/users`（分配用户） | `system:role:assign-user` |
+| 部门 | `GET /depts/tree`，`POST/PUT/DELETE /depts...` | `system:dept:*` |
+| 菜单 | `GET /menus/tree`，`POST/PUT/DELETE /menus...` | `system:menu:*` |
+
+### 给新接口加权限校验
+
+```go
+// 路由注册时标注权限点即可
+secured.Get("/orders", middleware.RequirePerm(az, "order:list"), h.List)
+
+// 查询需要数据权限过滤时，repository 层应用 scope：
+filter, _ := s.scope.Build(ctx)          // 解析当前用户数据范围
+repo.List(ctx, filter, page, pageSize)   // 内部翻译成 SQL WHERE 条件
+```
+
+---
+
+## 🚢 两种部署模式
+
+### 模式一：单机部署（默认）
+
+单二进制 + MySQL，`authz.mode=local`，权限校验在进程内完成（查库 + 内存缓存）：
+
+```bash
+docker compose up -d --build   # 应用 + MySQL 一键启动
+```
+
+### 模式二：微服务部署
+
+将 `internal/modules/system` 整体抽离为独立的**系统服务**（认证 + 授权中心），业务服务通过 gRPC 远程校验权限：
+
+```yaml
+# 业务服务配置
+authz:
+  mode: "remote"
+  addr: "system-service:9090"
+jwt:
+  secret: "<与系统服务共享同一 secret>"   # JWT 在业务服务本地验签
+```
+
+工作原理：
+
+1. 系统服务通过 gRPC 暴露 `AuthzService`（`api/proto/authz/v1/authz.proto`：`CheckPerm` / `GetUserPerms`）。
+2. 业务服务注入 `auth.RemoteAuthorizer`（实现同一个 `auth.Authorizer` 端口），业务代码零改动。
+3. JWT 为无状态验签，各服务共享 secret 即可；权限点数据集中在系统服务侧缓存管理。
+
+重新生成 protobuf 代码：`make proto`（需安装 protoc / protoc-gen-go / protoc-gen-go-grpc）。
 
 ---
 
@@ -89,63 +150,21 @@ curl http://localhost:8080/api/v1/users/1
 
 ```text
 GoKit/
-├── cmd/server/main.go           # 程序入口 (Fx 组装)
+├── cmd/server/main.go           # 程序入口 (Fx 组装，含 local/remote 授权器选择)
+├── api/
+│   ├── proto/authz/v1/          # 授权服务 proto 定义
+│   └── gen/authz/v1/            # 生成的 pb 代码 (make proto)
 ├── configs/                     # 配置文件
-├── internal/                    # 🔒 业务代码
-│   ├── application/             # [应用层] Service, DTO, 事务编排
-│   ├── domain/                  # [领域层] Entity, Repository 接口 (无依赖)
-│   ├── infrastructure/          # [基础设施层] Repository 实现 (Gorm)
-│   └── interface/               # [接入层] HTTP/gRPC Handler
-├── pkg/kit/                     # 🧱 通用底座 (DB, RPC, Web, Log)
-└── Makefile                     # 开发命令
-```
-
----
-
-## 🛠 开发指南
-
-### 如何开发一个新的 API？
-
-遵循 DDD 原则，请按以下步骤操作：
-
-1.  **Domain**: 在 `internal/domain/entity` 定义实体，在 `repository` 定义接口。
-2.  **Infrastructure**: 在 `internal/infrastructure/persistence` 实现接口。
-    > *Tip: 使用 `r.client.GetDB(ctx)` 获取数据库连接，它会自动处理事务。*
-3.  **Application**: 在 `internal/application/service` 编写业务逻辑。
-    > *Tip: 使用 `s.tx.WithTx(ctx, func...)` 包裹事务逻辑。*
-4.  **Interface**: 在 `internal/interface/http` 编写 Handler 并绑定 DTO。
-5.  **Main**: 在 `cmd/server/main.go` 中注册 (Provide) 你的组件。
-
-### 事务使用示例
-
-```go
-func (s *UserService) Create(ctx context.Context, req dto.CreateReq) error {
-    // 自动开启事务，出错自动回滚，成功自动提交
-    return s.tx.WithTx(ctx, func(ctx context.Context) error {
-        user := req.ToEntity()
-        if err := s.repo.Create(ctx, user); err != nil {
-            return err
-        }
-        // ... 其他业务逻辑
-        return nil
-    })
-}
-```
-
-### 注入中间件
-
-无需修改底层代码，在 `main.go` 中注入即可生效：
-
-```go
-// 注入 HTTP 中间件
-fx.Provide(AsMiddleware(func() fiber.Handler {
-    return cors.New()
-})),
-
-// 注入 gRPC 拦截器
-fx.Provide(AsUnaryInterceptor(func(l *slog.Logger) grpc.UnaryServerInterceptor {
-    return myInterceptor(l)
-})),
+├── internal/
+│   ├── interface/http/          # [接入层] 全局路由聚合 / 统一响应 / 错误处理
+│   └── modules/system/          # 🔐 系统模块（可整体抽离为微服务）
+│       ├── domain/              #   [领域层] 实体、仓储接口、数据权限纯逻辑
+│       ├── application/         #   [应用层] Service、DTO、授权器(本地实现)
+│       ├── infrastructure/      #   [基础设施层] Gorm 实现、迁移、播种
+│       └── interface/           #   [接口层] HTTP Handler/中间件、gRPC 授权服务
+├── pkg/kit/                     # 🧱 通用底座 (DB, RPC, Web, Log, Auth, Cache)
+├── Dockerfile
+└── docker-compose.yaml          # 单机一键部署
 ```
 
 ---
@@ -155,28 +174,22 @@ fx.Provide(AsUnaryInterceptor(func(l *slog.Logger) grpc.UnaryServerInterceptor {
 | 模块 | 配置项 | 说明 | 默认值 |
 | :--- | :--- | :--- | :--- |
 | **Web** | `web.port` | HTTP 端口 | `:8080` |
-| | `web.prefork` | 多进程模式 (Linux) | `false` |
 | **RPC** | `rpc.port` | gRPC 端口 | `:9090` |
 | **DB** | `database.dsn` | 主库连接串 | - |
 | | `database.replicas` | 从库连接串列表 | `[]` |
-| **Log** | `log.level` | 日志级别 (debug/info) | `info` |
+| | `database.auto_migrate` | 启动自动迁移表结构 | `false` |
+| **JWT** | `jwt.secret` | 签名密钥（生产必改，微服务间共享） | - |
+| | `jwt.expire_minutes` | 令牌有效期（分钟） | `120` |
+| **Authz** | `authz.mode` | 授权模式：`local` / `remote` | `local` |
+| | `authz.addr` | remote 模式系统服务 gRPC 地址 | - |
+| **Seed** | `seed.enabled` | 首次启动播种内置数据 | `false` |
 
 ---
 
-## 🐳 Docker 构建
+## 🛣 后续扩展点（未内置）
 
-```dockerfile
-FROM golang:1.21-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN go build -o server cmd/server/main.go
-
-FROM alpine:latest
-WORKDIR /app
-COPY --from=builder /app/server .
-COPY configs/ ./configs/
-CMD ["./server"]
-```
+- Redis 权限缓存（替换 `pkg/kit/cache` 内存实现即可）
+- 登录验证码 / 限流、操作日志、在线用户管理
 
 ## 📄 License
 

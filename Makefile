@@ -1,6 +1,6 @@
-.PHONY: all build run test clean tidy docker-build help
+.PHONY: all build run test clean tidy docker-build proto help
 
-PROJECT_NAME := nexus
+PROJECT_NAME := gokit
 APP_NAME := server
 MAIN_FILE := cmd/server/main.go
 
@@ -32,6 +32,12 @@ test:
 ## docker-build: 构建 Docker 镜像
 docker-build:
 	docker build -t $(PROJECT_NAME):latest .
+
+## proto: 重新生成 protobuf 代码（需安装 protoc / protoc-gen-go / protoc-gen-go-grpc）
+proto:
+	protoc --go_out=. --go_opt=module=goKit \
+		--go-grpc_out=. --go-grpc_opt=module=goKit \
+		api/proto/authz/v1/authz.proto
 
 ## clean: 清理编译产物
 clean:

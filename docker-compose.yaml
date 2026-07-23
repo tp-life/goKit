@@ -1,0 +1,32 @@
+# 单机一键部署演示：应用 + MySQL
+# 使用：docker compose up -d --build
+# 默认账号：admin / Admin@123（首次登录后请立即修改）
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: gokit_db
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8080:8080" # HTTP
+      - "9090:9090" # gRPC
+    volumes:
+      # 挂载自己的配置文件，dsn 指向 mysql 容器：
+      # dsn: "root:root@tcp(mysql:3306)/gokit_db?charset=utf8mb4&parseTime=True&loc=Local"
+      - ./configs/config.yaml:/app/configs/config.yaml:ro
+
+volumes:
+  mysql_data:
