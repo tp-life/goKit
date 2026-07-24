@@ -1,6 +1,6 @@
 # GoKit 技术设计文档
 
-> 版本：v1.0 ｜ 适用范围：`cmd/server` + `internal/modules/system` + `pkg/kit`
+> 版本：v1.0 ｜ 适用范围：`cmd/server` + `internal/{app,domain,application,infrastructure,interface}` + `pkg/kit`
 >
 > 本文档描述 GoKit 的整体设计、分层架构、RBAC 权限体系（功能权限 + 数据权限）、双模式部署方案及关键技术点。
 
@@ -31,21 +31,36 @@ GoKit/
 │   └── gen/authz/v1/             # 生成的 pb 代码（make proto）
 ├── configs/                      # 配置（config.yaml）
 ├── internal/
-│   ├── interface/http/           # 全局接入层：路由聚合 / 统一响应 / 错误处理中间件
-│   └── modules/system/           # 系统模块（认证/用户/角色/菜单/部门/数据权限）
-│       ├── domain/               #   领域层：实体、仓储接口、数据权限纯逻辑（零框架依赖）
-│       │   ├── entity/           #   User/Role/Dept/Menu + 三张关联实体
-│       │   ├── repository/       #   仓储接口（端口）
-│       │   └── service/          #   MergeDataScope 纯函数
-│       ├── application/          #   应用层：业务编排、DTO、授权器本地实现、权限缓存
-│       ├── infrastructure/       #   基础设施层：Gorm 仓储实现、AutoMigrate、播种
-│       └── interface/            #   接口层：HTTP Handler/中间件、gRPC AuthzService
+│   ├── app/module.go             # system 业务的 Fx 装配（var Module）
+│   ├── domain/                   # 领域层：按聚合分包，实体 + 仓储接口（端口），零框架依赖
+│   │   ├── user/                 #   User 实体 + UserRepository
+│   │   ├── role/                 #   Role + UserRole/RoleMenu/RoleDept 关联实体 + RoleRepository/AssignRepository
+│   │   ├── dept/                 #   Dept 实体 + DeptRepository
+│   │   ├── menu/                 #   Menu 实体 + MenuRepository
+│   │   └── shared/datascope/     #   MergeDataScope 纯函数
+│   ├── application/              # 应用层：按用例分包，业务编排、DTO、授权器本地实现、权限缓存
+│   │   ├── auth/                 #   登录/个人信息 + PermResolver/LocalAuthorizer/LocalUserProvider
+│   │   ├── user/                 #   用户管理用例
+│   │   ├── role/                 #   角色管理用例
+│   │   ├── dept/                 #   部门管理用例
+│   │   ├── menu/                 #   菜单管理用例
+│   │   └── shared/               #   通用分页 DTO、业务错误、DataScopeHelper
+│   ├── infrastructure/           # 基础设施层：Gorm 仓储实现、AutoMigrate、播种
+│   │   ├── persistence/          #   仓储接口的 Gorm 实现 + AutoMigrate
+│   │   └── seed/                 #   首次启动数据播种
+│   └── interface/                # 接口层：全局接入层与 system 业务接口同树合并
+│       ├── grpc/                 #   gRPC AuthzService 实现
+│       └── http/                 #   routes.go 挂载 system 全部路由（HTTPModule）
+│           ├── handler/          #   system 业务 HTTP Handler（auth/user/role/dept/menu）
+│           ├── middleware/       #   全局错误处理 + JWT 认证/权限点校验中间件
+│           ├── response/         #   统一响应与错误码
+│           └── router/           #   全局路由聚合器（/api/v1 分组、健康检查）
 ├── pkg/kit/                      # 通用底座
 │   ├── db/                       #   Gorm 客户端（读写分离、闭包事务 WithTx）
 │   ├── web/                      #   Fiber 服务（Sonic JSON、中间件插槽、生命周期）
 │   ├── rpc/                      #   gRPC 服务（KeepAlive、拦截器链、AuthFunc 插槽）
 │   ├── log/                      #   slog 封装（TraceID 注入）
-│   ├── auth/                     #   JWT TokenManager、CurrentUser、Authorizer 端口、远程实现
+│   ├── auth/                     #   JWT TokenManager、CurrentUser、Authorizer/UserProvider 端口、远程实现
 │   └── cache/                    #   进程内缓存（版本号批量失效）
 ├── Dockerfile
 └── docker-compose.yaml           # 单机一键部署（app + MySQL）
@@ -53,9 +68,9 @@ GoKit/
 
 **设计要点**
 
-- **模块化边界**：`internal/modules/<模块>` 自含完整的 domain/application/infrastructure/interface 四层。system 模块即是未来的“系统服务”，抽离时整个目录搬走即可。
+- **分层与分包**：代码按 domain/application/infrastructure/interface 四层组织，各层内部按业务聚合（domain 的 user/role/dept/menu）与用例（application 的 auth/user/role/dept/menu）分包。微服务抽离时以 domain/application 的业务包边界为单位拆分。
 - **依赖方向**：interface → application → domain ← infrastructure。领域层不 import 任何框架与基础设施。
-- **依赖注入**：Uber Fx 全自动装配。`kit.Module`（底座）、`system.Module`（业务）各自聚合，main 只做配置绑定与模式选择。
+- **依赖注入**：Uber Fx 全自动装配。`kit.Module`（底座）、`app.Module`（业务）各自聚合，main 只做配置绑定与模式选择。
 - **中间件/拦截器插槽**：`web.AsMiddlewares`、`rpc.AsUnaryInterceptor` 基于 Fx Group，新增横切能力不改底座代码。
 
 ### 2.2 一次请求的处理链路
@@ -138,7 +153,7 @@ DataScopeHelper.Build(ctx)
                   DenyAll  → WHERE 1 = 0
 ```
 
-关键设计：**合并逻辑是纯领域函数**（`domain/service/data_scope.go`，零 IO、完整单测），部门展开等 IO 由应用层预处理后传入；SQL 翻译在持久层完成，三层职责清晰。
+关键设计：**合并逻辑是纯领域函数**（`domain/shared/datascope/data_scope.go`，零 IO、完整单测），部门展开等 IO 由应用层预处理后传入；SQL 翻译在持久层完成，三层职责清晰。
 
 ### 3.4 认证（AuthN）
 
@@ -164,21 +179,27 @@ jwt:
   secret: "<各服务共享>"  # 微服务间共享同一 secret 即可本地验签
 ```
 
-### 4.1 抽象核心：Authorizer 端口
+### 4.1 抽象核心：Authorizer / UserProvider 端口
 
 ```go
 // pkg/kit/auth/authorizer.go
 type Authorizer interface {
     CheckPerm(ctx context.Context, userID uint64, permCode string) (bool, error)
 }
+
+// pkg/kit/auth/user_provider.go
+type UserProvider interface {
+    GetUser(ctx context.Context, id uint64) (*UserInfo, error)          // 不存在返回 (nil, nil)
+    GetUsers(ctx context.Context, ids []uint64) (map[uint64]*UserInfo, error)
+}
 ```
 
-| 模式 | 注入实现 | 行为 |
+| 端口 | 单机 `local` | 微服务 `remote` |
 | :--- | :--- | :--- |
-| 单机 `local` | `LocalAuthorizer`（system 模块应用层） | 进程内查库 + 内存缓存 |
-| 微服务 `remote` | `RemoteAuthorizer`（`pkg/kit/auth`） | gRPC 调用系统服务 `AuthzService` |
+| `Authorizer`（功能权限） | `LocalAuthorizer`（进程内查库 + 缓存） | `RemoteAuthorizer`（gRPC AuthzService） |
+| `UserProvider`（用户信息） | `LocalUserProvider`（进程内查库） | `RemoteUserProvider`（gRPC AuthzService） |
 
-main.go 中按 `authz.mode` 条件注入，业务代码只依赖端口，零改动。
+main.go 中按 `authz.mode` 条件注入，业务代码只依赖端口，零改动。**其他模块需要用户信息时注入 `auth.UserProvider` 即可**，无需 import system 模块内部。
 
 ### 4.2 微服务形态
 
@@ -193,9 +214,9 @@ main.go 中按 `authz.mode` 条件注入，业务代码只依赖端口，零改�
                                       各自数据源
 ```
 
-- 契约：`api/proto/authz/v1/authz.proto`（`CheckPerm` / `GetUserPerms`），`make proto` 重新生成。
+- 契约：`api/proto/authz/v1/authz.proto`（`CheckPerm` / `GetUserPerms` / `GetUser` / `GetUsers`），`make proto` 重新生成。
 - 权限数据与缓存集中在系统服务侧管理；业务服务无需连接权限库。
-- 模块抽离路径：`internal/modules/system` 整体搬出 → 独立 cmd 入口 → 即系统服务。
+- 微服务抽离路径：以 domain/application 的业务包边界拆分（system 相关包整体迁出）→ 独立 cmd 入口 → 即系统服务。
 
 ### 4.3 单机形态
 
@@ -212,7 +233,7 @@ docker compose up -d --build   # app + MySQL，自动迁移 + 播种，开箱即
 | JWT 认证 | `golang-jwt/jwt/v5` HS256，自定义 Claims | `pkg/kit/auth/token.go` |
 | 密码哈希 | `golang.org/x/crypto/bcrypt` | 用户创建/改密/重置 |
 | 权限缓存 | 进程内缓存 + 版本号批量失效（TTL 兜底） | `pkg/kit/cache`、`PermResolver` |
-| 数据权限 | 领域纯函数合并 + 持久层 SQL 翻译 | `domain/service/data_scope.go`、`applyDataScope` |
+| 数据权限 | 领域纯函数合并 + 持久层 SQL 翻译 | `domain/shared/datascope/data_scope.go`、`applyDataScope` |
 | 事务 | 闭包式 `WithTx`，ctx 传播 tx，仓储 `GetDB(ctx)` 自动感知 | `pkg/kit/db/client.go` |
 | 依赖注入 | Uber Fx，Module 聚合 + Group 插槽 | `kit.Module`、`system.Module` |
 | 统一响应 | `{code, message, data}` + `AppError` 业务码（40100/40300…） | `internal/interface/http/response` |

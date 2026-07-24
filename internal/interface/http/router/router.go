@@ -6,8 +6,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/fx"
 
+	"goKit/internal/interface/http"
 	"goKit/internal/interface/http/middleware"
-	"goKit/internal/modules/system/interface/http"
 )
 
 // Router 统管所有 HTTP 路由

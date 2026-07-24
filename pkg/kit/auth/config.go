@@ -15,4 +15,7 @@ type Config struct {
 type AuthzConfig struct {
 	Mode string `mapstructure:"mode"` // local | remote
 	Addr string `mapstructure:"addr"` // remote 模式下系统服务 gRPC 地址，如 "127.0.0.1:9090"
+	// Token 服务间共享密钥：非空时系统服务 gRPC 启用 Bearer 认证，
+	// 各业务服务的远程客户端必须携带同一 token；为空则不启用（仅内网可信环境）
+	Token string `mapstructure:"token"`
 }

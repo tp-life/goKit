@@ -16,7 +16,7 @@
 
 ## ✨ 核心特性
 
-- **🏗 标准 DDD 分层**: 模块化设计，`internal/modules/<模块>` 自含 Domain / Application / Infrastructure / Interface 四层。
+- **🏗 标准 DDD 分层**: Domain / Application / Infrastructure / Interface 四层，层内按业务聚合与用例分包。
 - **🔐 完整 RBAC**: JWT 认证 + 用户/角色/菜单(权限点)/部门管理 + 接口级权限校验。
 - **🛡 数据权限**: 基于部门的数据范围（全部 / 自定义 / 本部门及以下 / 本部门 / 仅本人），SQL 级过滤。
 - **🚢 双模式部署**: 单机单二进制开箱即用；改一行配置 (`authz.mode=remote`) 即切换为微服务授权模式。
@@ -125,7 +125,7 @@ docker compose up -d --build   # 应用 + MySQL 一键启动
 
 ### 模式二：微服务部署
 
-将 `internal/modules/system` 整体抽离为独立的**系统服务**（认证 + 授权中心），业务服务通过 gRPC 远程校验权限：
+将 system 业务（`internal/domain`、`internal/application` 中的 user/role/dept/menu/auth 等包及配套基础设施与接口层）抽离为独立的**系统服务**（认证 + 授权中心），业务服务通过 gRPC 远程校验权限：
 
 ```yaml
 # 业务服务配置
@@ -156,12 +156,11 @@ GoKit/
 │   └── gen/authz/v1/            # 生成的 pb 代码 (make proto)
 ├── configs/                     # 配置文件
 ├── internal/
-│   ├── interface/http/          # [接入层] 全局路由聚合 / 统一响应 / 错误处理
-│   └── modules/system/          # 🔐 系统模块（可整体抽离为微服务）
-│       ├── domain/              #   [领域层] 实体、仓储接口、数据权限纯逻辑
-│       ├── application/         #   [应用层] Service、DTO、授权器(本地实现)
-│       ├── infrastructure/      #   [基础设施层] Gorm 实现、迁移、播种
-│       └── interface/           #   [接口层] HTTP Handler/中间件、gRPC 授权服务
+│   ├── app/                     # system 业务的 Fx 装配 (var Module)
+│   ├── domain/                  # [领域层] 按聚合分包：实体、仓储接口、数据权限纯逻辑
+│   ├── application/             # [应用层] 按用例分包：Service、DTO、授权器(本地实现)
+│   ├── infrastructure/          # [基础设施层] Gorm 实现、迁移、播种
+│   └── interface/               # [接口层] HTTP Handler/中间件/路由聚合、gRPC 授权服务
 ├── pkg/kit/                     # 🧱 通用底座 (DB, RPC, Web, Log, Auth, Cache)
 ├── Dockerfile
 └── docker-compose.yaml          # 单机一键部署
