@@ -21,6 +21,99 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// UserInfo 用户信息（不含密码等敏感字段）
+type UserInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            uint64                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Username      string                 `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
+	Nickname      string                 `protobuf:"bytes,3,opt,name=nickname,proto3" json:"nickname,omitempty"`
+	Email         string                 `protobuf:"bytes,4,opt,name=email,proto3" json:"email,omitempty"`
+	DeptId        uint64                 `protobuf:"varint,5,opt,name=dept_id,json=deptId,proto3" json:"dept_id,omitempty"`
+	Status        int32                  `protobuf:"varint,6,opt,name=status,proto3" json:"status,omitempty"`
+	IsSuper       bool                   `protobuf:"varint,7,opt,name=is_super,json=isSuper,proto3" json:"is_super,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UserInfo) Reset() {
+	*x = UserInfo{}
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UserInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UserInfo) ProtoMessage() {}
+
+func (x *UserInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UserInfo.ProtoReflect.Descriptor instead.
+func (*UserInfo) Descriptor() ([]byte, []int) {
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *UserInfo) GetId() uint64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *UserInfo) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *UserInfo) GetNickname() string {
+	if x != nil {
+		return x.Nickname
+	}
+	return ""
+}
+
+func (x *UserInfo) GetEmail() string {
+	if x != nil {
+		return x.Email
+	}
+	return ""
+}
+
+func (x *UserInfo) GetDeptId() uint64 {
+	if x != nil {
+		return x.DeptId
+	}
+	return 0
+}
+
+func (x *UserInfo) GetStatus() int32 {
+	if x != nil {
+		return x.Status
+	}
+	return 0
+}
+
+func (x *UserInfo) GetIsSuper() bool {
+	if x != nil {
+		return x.IsSuper
+	}
+	return false
+}
+
 type CheckPermRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	UserId        uint64                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
@@ -31,7 +124,7 @@ type CheckPermRequest struct {
 
 func (x *CheckPermRequest) Reset() {
 	*x = CheckPermRequest{}
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[0]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -43,7 +136,7 @@ func (x *CheckPermRequest) String() string {
 func (*CheckPermRequest) ProtoMessage() {}
 
 func (x *CheckPermRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[0]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -56,7 +149,7 @@ func (x *CheckPermRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckPermRequest.ProtoReflect.Descriptor instead.
 func (*CheckPermRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{0}
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *CheckPermRequest) GetUserId() uint64 {
@@ -82,7 +175,7 @@ type CheckPermResponse struct {
 
 func (x *CheckPermResponse) Reset() {
 	*x = CheckPermResponse{}
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[1]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -94,7 +187,7 @@ func (x *CheckPermResponse) String() string {
 func (*CheckPermResponse) ProtoMessage() {}
 
 func (x *CheckPermResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[1]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -107,7 +200,7 @@ func (x *CheckPermResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckPermResponse.ProtoReflect.Descriptor instead.
 func (*CheckPermResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{1}
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *CheckPermResponse) GetAllowed() bool {
@@ -126,7 +219,7 @@ type GetUserPermsRequest struct {
 
 func (x *GetUserPermsRequest) Reset() {
 	*x = GetUserPermsRequest{}
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[2]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -138,7 +231,7 @@ func (x *GetUserPermsRequest) String() string {
 func (*GetUserPermsRequest) ProtoMessage() {}
 
 func (x *GetUserPermsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[2]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -151,7 +244,7 @@ func (x *GetUserPermsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetUserPermsRequest.ProtoReflect.Descriptor instead.
 func (*GetUserPermsRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{2}
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GetUserPermsRequest) GetUserId() uint64 {
@@ -171,7 +264,7 @@ type GetUserPermsResponse struct {
 
 func (x *GetUserPermsResponse) Reset() {
 	*x = GetUserPermsResponse{}
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[3]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -183,7 +276,7 @@ func (x *GetUserPermsResponse) String() string {
 func (*GetUserPermsResponse) ProtoMessage() {}
 
 func (x *GetUserPermsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[3]
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -196,7 +289,7 @@ func (x *GetUserPermsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetUserPermsResponse.ProtoReflect.Descriptor instead.
 func (*GetUserPermsResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{3}
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *GetUserPermsResponse) GetIsSuper() bool {
@@ -213,11 +306,197 @@ func (x *GetUserPermsResponse) GetPermCodes() []string {
 	return nil
 }
 
+type GetUserRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	UserId        uint64                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUserRequest) Reset() {
+	*x = GetUserRequest{}
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUserRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUserRequest) ProtoMessage() {}
+
+func (x *GetUserRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUserRequest.ProtoReflect.Descriptor instead.
+func (*GetUserRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *GetUserRequest) GetUserId() uint64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+// user 为空表示用户不存在
+type GetUserResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	User          *UserInfo              `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUserResponse) Reset() {
+	*x = GetUserResponse{}
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUserResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUserResponse) ProtoMessage() {}
+
+func (x *GetUserResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUserResponse.ProtoReflect.Descriptor instead.
+func (*GetUserResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GetUserResponse) GetUser() *UserInfo {
+	if x != nil {
+		return x.User
+	}
+	return nil
+}
+
+type GetUsersRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	UserIds       []uint64               `protobuf:"varint,1,rep,packed,name=user_ids,json=userIds,proto3" json:"user_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUsersRequest) Reset() {
+	*x = GetUsersRequest{}
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUsersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUsersRequest) ProtoMessage() {}
+
+func (x *GetUsersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUsersRequest.ProtoReflect.Descriptor instead.
+func (*GetUsersRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GetUsersRequest) GetUserIds() []uint64 {
+	if x != nil {
+		return x.UserIds
+	}
+	return nil
+}
+
+// 仅返回存在的用户
+type GetUsersResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Users         []*UserInfo            `protobuf:"bytes,1,rep,name=users,proto3" json:"users,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUsersResponse) Reset() {
+	*x = GetUsersResponse{}
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUsersResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUsersResponse) ProtoMessage() {}
+
+func (x *GetUsersResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_authz_v1_authz_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUsersResponse.ProtoReflect.Descriptor instead.
+func (*GetUsersResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_authz_v1_authz_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetUsersResponse) GetUsers() []*UserInfo {
+	if x != nil {
+		return x.Users
+	}
+	return nil
+}
+
 var File_api_proto_authz_v1_authz_proto protoreflect.FileDescriptor
 
 const file_api_proto_authz_v1_authz_proto_rawDesc = "" +
 	"\n" +
-	"\x1eapi/proto/authz/v1/authz.proto\x12\bauthz.v1\"H\n" +
+	"\x1eapi/proto/authz/v1/authz.proto\x12\bauthz.v1\"\xb4\x01\n" +
+	"\bUserInfo\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x04R\x02id\x12\x1a\n" +
+	"\busername\x18\x02 \x01(\tR\busername\x12\x1a\n" +
+	"\bnickname\x18\x03 \x01(\tR\bnickname\x12\x14\n" +
+	"\x05email\x18\x04 \x01(\tR\x05email\x12\x17\n" +
+	"\adept_id\x18\x05 \x01(\x04R\x06deptId\x12\x16\n" +
+	"\x06status\x18\x06 \x01(\x05R\x06status\x12\x19\n" +
+	"\bis_super\x18\a \x01(\bR\aisSuper\"H\n" +
 	"\x10CheckPermRequest\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\x04R\x06userId\x12\x1b\n" +
 	"\tperm_code\x18\x02 \x01(\tR\bpermCode\"-\n" +
@@ -228,10 +507,20 @@ const file_api_proto_authz_v1_authz_proto_rawDesc = "" +
 	"\x14GetUserPermsResponse\x12\x19\n" +
 	"\bis_super\x18\x01 \x01(\bR\aisSuper\x12\x1d\n" +
 	"\n" +
-	"perm_codes\x18\x02 \x03(\tR\tpermCodes2\xa3\x01\n" +
+	"perm_codes\x18\x02 \x03(\tR\tpermCodes\")\n" +
+	"\x0eGetUserRequest\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\x04R\x06userId\"9\n" +
+	"\x0fGetUserResponse\x12&\n" +
+	"\x04user\x18\x01 \x01(\v2\x12.authz.v1.UserInfoR\x04user\",\n" +
+	"\x0fGetUsersRequest\x12\x19\n" +
+	"\buser_ids\x18\x01 \x03(\x04R\auserIds\"<\n" +
+	"\x10GetUsersResponse\x12(\n" +
+	"\x05users\x18\x01 \x03(\v2\x12.authz.v1.UserInfoR\x05users2\xa6\x02\n" +
 	"\fAuthzService\x12D\n" +
 	"\tCheckPerm\x12\x1a.authz.v1.CheckPermRequest\x1a\x1b.authz.v1.CheckPermResponse\x12M\n" +
-	"\fGetUserPerms\x12\x1d.authz.v1.GetUserPermsRequest\x1a\x1e.authz.v1.GetUserPermsResponseB Z\x1egoKit/api/gen/authz/v1;authzv1b\x06proto3"
+	"\fGetUserPerms\x12\x1d.authz.v1.GetUserPermsRequest\x1a\x1e.authz.v1.GetUserPermsResponse\x12>\n" +
+	"\aGetUser\x12\x18.authz.v1.GetUserRequest\x1a\x19.authz.v1.GetUserResponse\x12A\n" +
+	"\bGetUsers\x12\x19.authz.v1.GetUsersRequest\x1a\x1a.authz.v1.GetUsersResponseB Z\x1egoKit/api/gen/authz/v1;authzv1b\x06proto3"
 
 var (
 	file_api_proto_authz_v1_authz_proto_rawDescOnce sync.Once
@@ -245,23 +534,34 @@ func file_api_proto_authz_v1_authz_proto_rawDescGZIP() []byte {
 	return file_api_proto_authz_v1_authz_proto_rawDescData
 }
 
-var file_api_proto_authz_v1_authz_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_api_proto_authz_v1_authz_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_api_proto_authz_v1_authz_proto_goTypes = []any{
-	(*CheckPermRequest)(nil),     // 0: authz.v1.CheckPermRequest
-	(*CheckPermResponse)(nil),    // 1: authz.v1.CheckPermResponse
-	(*GetUserPermsRequest)(nil),  // 2: authz.v1.GetUserPermsRequest
-	(*GetUserPermsResponse)(nil), // 3: authz.v1.GetUserPermsResponse
+	(*UserInfo)(nil),             // 0: authz.v1.UserInfo
+	(*CheckPermRequest)(nil),     // 1: authz.v1.CheckPermRequest
+	(*CheckPermResponse)(nil),    // 2: authz.v1.CheckPermResponse
+	(*GetUserPermsRequest)(nil),  // 3: authz.v1.GetUserPermsRequest
+	(*GetUserPermsResponse)(nil), // 4: authz.v1.GetUserPermsResponse
+	(*GetUserRequest)(nil),       // 5: authz.v1.GetUserRequest
+	(*GetUserResponse)(nil),      // 6: authz.v1.GetUserResponse
+	(*GetUsersRequest)(nil),      // 7: authz.v1.GetUsersRequest
+	(*GetUsersResponse)(nil),     // 8: authz.v1.GetUsersResponse
 }
 var file_api_proto_authz_v1_authz_proto_depIdxs = []int32{
-	0, // 0: authz.v1.AuthzService.CheckPerm:input_type -> authz.v1.CheckPermRequest
-	2, // 1: authz.v1.AuthzService.GetUserPerms:input_type -> authz.v1.GetUserPermsRequest
-	1, // 2: authz.v1.AuthzService.CheckPerm:output_type -> authz.v1.CheckPermResponse
-	3, // 3: authz.v1.AuthzService.GetUserPerms:output_type -> authz.v1.GetUserPermsResponse
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	0, // 0: authz.v1.GetUserResponse.user:type_name -> authz.v1.UserInfo
+	0, // 1: authz.v1.GetUsersResponse.users:type_name -> authz.v1.UserInfo
+	1, // 2: authz.v1.AuthzService.CheckPerm:input_type -> authz.v1.CheckPermRequest
+	3, // 3: authz.v1.AuthzService.GetUserPerms:input_type -> authz.v1.GetUserPermsRequest
+	5, // 4: authz.v1.AuthzService.GetUser:input_type -> authz.v1.GetUserRequest
+	7, // 5: authz.v1.AuthzService.GetUsers:input_type -> authz.v1.GetUsersRequest
+	2, // 6: authz.v1.AuthzService.CheckPerm:output_type -> authz.v1.CheckPermResponse
+	4, // 7: authz.v1.AuthzService.GetUserPerms:output_type -> authz.v1.GetUserPermsResponse
+	6, // 8: authz.v1.AuthzService.GetUser:output_type -> authz.v1.GetUserResponse
+	8, // 9: authz.v1.AuthzService.GetUsers:output_type -> authz.v1.GetUsersResponse
+	6, // [6:10] is the sub-list for method output_type
+	2, // [2:6] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_authz_v1_authz_proto_init() }
@@ -275,7 +575,7 @@ func file_api_proto_authz_v1_authz_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_authz_v1_authz_proto_rawDesc), len(file_api_proto_authz_v1_authz_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

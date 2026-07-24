@@ -21,6 +21,8 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	AuthzService_CheckPerm_FullMethodName    = "/authz.v1.AuthzService/CheckPerm"
 	AuthzService_GetUserPerms_FullMethodName = "/authz.v1.AuthzService/GetUserPerms"
+	AuthzService_GetUser_FullMethodName      = "/authz.v1.AuthzService/GetUser"
+	AuthzService_GetUsers_FullMethodName     = "/authz.v1.AuthzService/GetUsers"
 )
 
 // AuthzServiceClient is the client API for AuthzService service.
@@ -33,6 +35,10 @@ type AuthzServiceClient interface {
 	CheckPerm(ctx context.Context, in *CheckPermRequest, opts ...grpc.CallOption) (*CheckPermResponse, error)
 	// GetUserPerms 获取用户全部权限点
 	GetUserPerms(ctx context.Context, in *GetUserPermsRequest, opts ...grpc.CallOption) (*GetUserPermsResponse, error)
+	// GetUser 按 ID 查询用户信息
+	GetUser(ctx context.Context, in *GetUserRequest, opts ...grpc.CallOption) (*GetUserResponse, error)
+	// GetUsers 批量查询用户信息
+	GetUsers(ctx context.Context, in *GetUsersRequest, opts ...grpc.CallOption) (*GetUsersResponse, error)
 }
 
 type authzServiceClient struct {
@@ -63,6 +69,26 @@ func (c *authzServiceClient) GetUserPerms(ctx context.Context, in *GetUserPermsR
 	return out, nil
 }
 
+func (c *authzServiceClient) GetUser(ctx context.Context, in *GetUserRequest, opts ...grpc.CallOption) (*GetUserResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetUserResponse)
+	err := c.cc.Invoke(ctx, AuthzService_GetUser_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *authzServiceClient) GetUsers(ctx context.Context, in *GetUsersRequest, opts ...grpc.CallOption) (*GetUsersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetUsersResponse)
+	err := c.cc.Invoke(ctx, AuthzService_GetUsers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AuthzServiceServer is the server API for AuthzService service.
 // All implementations must embed UnimplementedAuthzServiceServer
 // for forward compatibility.
@@ -73,6 +99,10 @@ type AuthzServiceServer interface {
 	CheckPerm(context.Context, *CheckPermRequest) (*CheckPermResponse, error)
 	// GetUserPerms 获取用户全部权限点
 	GetUserPerms(context.Context, *GetUserPermsRequest) (*GetUserPermsResponse, error)
+	// GetUser 按 ID 查询用户信息
+	GetUser(context.Context, *GetUserRequest) (*GetUserResponse, error)
+	// GetUsers 批量查询用户信息
+	GetUsers(context.Context, *GetUsersRequest) (*GetUsersResponse, error)
 	mustEmbedUnimplementedAuthzServiceServer()
 }
 
@@ -88,6 +118,12 @@ func (UnimplementedAuthzServiceServer) CheckPerm(context.Context, *CheckPermRequ
 }
 func (UnimplementedAuthzServiceServer) GetUserPerms(context.Context, *GetUserPermsRequest) (*GetUserPermsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetUserPerms not implemented")
+}
+func (UnimplementedAuthzServiceServer) GetUser(context.Context, *GetUserRequest) (*GetUserResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUser not implemented")
+}
+func (UnimplementedAuthzServiceServer) GetUsers(context.Context, *GetUsersRequest) (*GetUsersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUsers not implemented")
 }
 func (UnimplementedAuthzServiceServer) mustEmbedUnimplementedAuthzServiceServer() {}
 func (UnimplementedAuthzServiceServer) testEmbeddedByValue()                      {}
@@ -146,6 +182,42 @@ func _AuthzService_GetUserPerms_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AuthzService_GetUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetUserRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuthzServiceServer).GetUser(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AuthzService_GetUser_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuthzServiceServer).GetUser(ctx, req.(*GetUserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AuthzService_GetUsers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetUsersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuthzServiceServer).GetUsers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AuthzService_GetUsers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuthzServiceServer).GetUsers(ctx, req.(*GetUsersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AuthzService_ServiceDesc is the grpc.ServiceDesc for AuthzService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -160,6 +232,14 @@ var AuthzService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetUserPerms",
 			Handler:    _AuthzService_GetUserPerms_Handler,
+		},
+		{
+			MethodName: "GetUser",
+			Handler:    _AuthzService_GetUser_Handler,
+		},
+		{
+			MethodName: "GetUsers",
+			Handler:    _AuthzService_GetUsers_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

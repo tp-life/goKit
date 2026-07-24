@@ -7,17 +7,18 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	grpcauth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
 	"google.golang.org/grpc"
 
 	authzv1 "goKit/api/gen/authz/v1"
+	"goKit/internal/app"
+	authapp "goKit/internal/application/auth"
+	"goKit/internal/infrastructure/persistence"
+	"goKit/internal/infrastructure/seed"
+	sysgrpc "goKit/internal/interface/grpc"
 	httpInterface "goKit/internal/interface/http/router"
-	"goKit/internal/modules/system"
-	appsvc "goKit/internal/modules/system/application/service"
-	"goKit/internal/modules/system/infrastructure/persistence"
-	"goKit/internal/modules/system/infrastructure/seed"
-	sysgrpc "goKit/internal/modules/system/interface/grpc"
 
 	"goKit/pkg/kit"
 	"goKit/pkg/kit/auth"
@@ -58,9 +59,18 @@ func LoadConfig() (*AppConfig, error) {
 // ProvideAuthorizer 按配置选择授权器实现：
 // local  → 单机模式，进程内查库+缓存
 // remote → 微服务模式，gRPC 调用系统服务的 AuthzService
-func ProvideAuthorizer(cfg *AppConfig, local *appsvc.LocalAuthorizer) (auth.Authorizer, error) {
+func ProvideAuthorizer(cfg *AppConfig, local *authapp.LocalAuthorizer) (auth.Authorizer, error) {
 	if cfg.Authz.Mode == "remote" {
-		return auth.NewRemoteAuthorizer(cfg.Authz.Addr)
+		return auth.NewRemoteAuthorizer(cfg.Authz.Addr, cfg.Authz.Token)
+	}
+	return local, nil
+}
+
+// ProvideUserProvider 按配置选择用户信息提供者实现，规则同 ProvideAuthorizer。
+// 其他模块需要用户信息时只依赖 auth.UserProvider 端口，无需 import 业务模块内部。
+func ProvideUserProvider(cfg *AppConfig, local *authapp.LocalUserProvider) (auth.UserProvider, error) {
+	if cfg.Authz.Mode == "remote" {
+		return auth.NewRemoteUserProvider(cfg.Authz.Addr, cfg.Authz.Token)
 	}
 	return local, nil
 }
@@ -83,9 +93,14 @@ func main() {
 		fx.Provide(auth.NewTokenManager),
 		fx.Provide(cache.NewMemory),
 		fx.Provide(ProvideAuthorizer),
+		fx.Provide(ProvideUserProvider),
+		// gRPC 服务间认证：authz.token 非空时启用 Bearer 校验（返回 nil 则 rpc.Server 跳过认证）
+		fx.Provide(func(cfg *AppConfig) grpcauth.AuthFunc {
+			return auth.NewServiceTokenAuthFunc(cfg.Authz.Token)
+		}),
 
 		kit.Module,
-		system.Module,
+		app.Module,
 
 		// === 启动钩子：自动迁移 + 首次播种 ===
 		fx.Invoke(func(lc fx.Lifecycle, cfg *AppConfig, client *db.Client, seeder *seed.Seeder, l *slog.Logger) {

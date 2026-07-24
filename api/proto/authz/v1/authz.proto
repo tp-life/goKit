@@ -10,6 +10,21 @@ service AuthzService {
   rpc CheckPerm(CheckPermRequest) returns (CheckPermResponse);
   // GetUserPerms 获取用户全部权限点
   rpc GetUserPerms(GetUserPermsRequest) returns (GetUserPermsResponse);
+  // GetUser 按 ID 查询用户信息
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+  // GetUsers 批量查询用户信息
+  rpc GetUsers(GetUsersRequest) returns (GetUsersResponse);
+}
+
+// UserInfo 用户信息（不含密码等敏感字段）
+message UserInfo {
+  uint64 id = 1;
+  string username = 2;
+  string nickname = 3;
+  string email = 4;
+  uint64 dept_id = 5;
+  int32 status = 6;
+  bool is_super = 7;
 }
 
 message CheckPermRequest {
@@ -28,4 +43,22 @@ message GetUserPermsRequest {
 message GetUserPermsResponse {
   bool is_super = 1;
   repeated string perm_codes = 2;
+}
+
+message GetUserRequest {
+  uint64 user_id = 1;
+}
+
+// user 为空表示用户不存在
+message GetUserResponse {
+  UserInfo user = 1;
+}
+
+message GetUsersRequest {
+  repeated uint64 user_ids = 1;
+}
+
+// 仅返回存在的用户
+message GetUsersResponse {
+  repeated UserInfo users = 1;
 }

@@ -17,9 +17,13 @@ type RemoteAuthorizer struct {
 	conn   *grpc.ClientConn
 }
 
-// NewRemoteAuthorizer 连接系统服务 gRPC 地址（如 "system-service:9090"）
-func NewRemoteAuthorizer(addr string) (*RemoteAuthorizer, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+// NewRemoteAuthorizer 连接系统服务 gRPC 地址（如 "system-service:9090"）。
+// token 为服务间共享密钥，与系统服务 authz.token 一致；为空表示不携带认证。
+func NewRemoteAuthorizer(addr, token string) (*RemoteAuthorizer, error) {
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(bearerTokenCreds{token: token}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("dial authz service %s: %w", addr, err)
 	}
