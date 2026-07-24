@@ -29,6 +29,20 @@ func ErrBadRequest(msg string) *AppError {
 	return &AppError{HTTPCode: 400, BusinessCode: CodeParamError, Message: msg}
 }
 
+func ErrUnauthorized(msg string) *AppError {
+	if msg == "" {
+		msg = "未登录或登录已过期"
+	}
+	return &AppError{HTTPCode: 401, BusinessCode: CodeUnauthorized, Message: msg}
+}
+
+func ErrForbidden(msg string) *AppError {
+	if msg == "" {
+		msg = "没有权限执行该操作"
+	}
+	return &AppError{HTTPCode: 403, BusinessCode: CodeForbidden, Message: msg}
+}
+
 func ErrNotFound(msg string) *AppError {
 	return &AppError{HTTPCode: 404, BusinessCode: CodeNotFound, Message: msg}
 }
