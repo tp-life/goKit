@@ -5,6 +5,7 @@ import (
 
 	"goKit/internal/domain/dept"
 	"goKit/internal/domain/menu"
+	"goKit/internal/domain/oplog"
 	"goKit/internal/domain/role"
 	"goKit/internal/domain/user"
 	"goKit/pkg/kit/db"
@@ -20,5 +21,6 @@ func AutoMigrate(ctx context.Context, client *db.Client) error {
 		&role.UserRole{},
 		&role.RoleMenu{},
 		&role.RoleDept{},
+		&oplog.OperationLog{},
 	)
 }

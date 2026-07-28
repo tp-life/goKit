@@ -20,8 +20,11 @@ database:
   max_idle_conns: 10
   max_open_conns: 100
   log_mode: "info"
-  # 启动时自动迁移 sys_* 表结构（简单部署用，生产建议关闭）
+  # 启动时用 Gorm AutoMigrate 自动同步 sys_* 表结构（仅限开发/简单部署，生产建议关闭）
   auto_migrate: true
+  # 启动时执行 migrations/ 内嵌的版本化迁移（生产推荐）；
+  # 与 auto_migrate 同开时优先生效，auto_migrate 不再执行
+  migrations_enabled: false
 
 jwt:
   # 生产环境务必修改为强随机值；微服务模式下所有服务必须共享同一 secret
@@ -42,3 +45,15 @@ authz:
 seed:
   # 首次启动播种 admin 账号 / 内置角色 / 菜单权限树（admin 已存在则跳过）
   enabled: true
+
+rate_limit:
+  # 登录接口限流（按客户端 IP，进程内计数）
+  login_max: 10      # 窗口内最大尝试次数
+  login_window: 1m   # 限流窗口
+
+trace:
+  # OTLP gRPC 上报地址（如 "otel-collector:4317"），留空则不启用链路追踪
+  endpoint: ""
+  service_name: "gokit"
+  # 采样率 0~1
+  sample_ratio: 1.0
