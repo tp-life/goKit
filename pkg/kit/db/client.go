@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 
@@ -69,6 +70,20 @@ func (c *Client) GetDB(ctx context.Context) *gorm.DB {
 		return tx
 	}
 	return c.db.WithContext(ctx)
+}
+
+// Ping 检查数据库连通性（就绪探针用）
+func (c *Client) Ping(ctx context.Context) error {
+	sqlDB, err := c.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
+}
+
+// SQLDB 暴露底层 *sql.DB，供迁移工具等需要绕过 Gorm 的场景使用
+func (c *Client) SQLDB() (*sql.DB, error) {
+	return c.db.DB()
 }
 
 func (c *Client) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {

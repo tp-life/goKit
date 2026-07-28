@@ -142,5 +142,10 @@ func (s *Seeder) seedMenus(ctx context.Context) ([]uint64, error) {
 			}
 		}
 	}
+
+	// 操作日志：只读，仅有 list 权限点
+	if _, err := create(sysDir, "操作日志", menu.MenuTypeMenu, "/system/logs", "system:log:list", 5); err != nil {
+		return nil, err
+	}
 	return allIDs, nil
 }

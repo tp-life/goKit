@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/bytedance/sonic"
+	"github.com/gofiber/contrib/otelfiber"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
@@ -34,6 +35,11 @@ func NewServer(params ServerParams) *fiber.App {
 	// 1. 内置基础中间件
 	app.Use(recover.New())
 	app.Use(requestid.New(requestid.Config{ContextKey: "requestid"}))
+	app.Use(otelfiber.Middleware()) // OTel 链路追踪（未配置 endpoint 时为 Noop，零开销）
+	app.Use(MetricsMiddleware())    // Prometheus 请求指标
+
+	// 指标暴露端点（Prometheus 拉取）
+	app.Get("/metrics", MetricsHandler())
 
 	// 2. 挂载用户注入的全局中间件 (CORS, Limiter, Auth 等)
 	for _, m := range params.Middlewares {

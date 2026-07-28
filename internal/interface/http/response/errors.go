@@ -3,12 +3,13 @@ package response
 import "fmt"
 
 const (
-	CodeSuccess        = 0
-	CodeParamError     = 40000
-	CodeUnauthorized   = 40100
-	CodeForbidden      = 40300
-	CodeNotFound       = 40400
-	CodeInternalServer = 50000
+	CodeSuccess         = 0
+	CodeParamError      = 40000
+	CodeUnauthorized    = 40100
+	CodeForbidden       = 40300
+	CodeNotFound        = 40400
+	CodeTooManyRequests = 42900
+	CodeInternalServer  = 50000
 )
 
 type AppError struct {
@@ -45,6 +46,13 @@ func ErrForbidden(msg string) *AppError {
 
 func ErrNotFound(msg string) *AppError {
 	return &AppError{HTTPCode: 404, BusinessCode: CodeNotFound, Message: msg}
+}
+
+func ErrTooManyRequests(msg string) *AppError {
+	if msg == "" {
+		msg = "请求过于频繁，请稍后再试"
+	}
+	return &AppError{HTTPCode: 429, BusinessCode: CodeTooManyRequests, Message: msg}
 }
 
 func ErrInternal(err error, msg string) *AppError {

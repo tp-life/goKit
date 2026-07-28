@@ -1,0 +1,1489 @@
+openapi: 3.0.3
+info:
+  title: GoKit HTTP API
+  description: |
+    GoKit system 模块对外 HTTP 接口文档（/api/v1）。
+
+    除 `/auth/login`、`/health`、`/readyz` 为公开接口外，其余接口均需在请求头携带
+    `Authorization: Bearer <token>`（token 由登录接口签发，JWT HS256）。
+
+    业务接口统一响应壳：`{code, message, data}`，其中 `code=0` 表示成功，
+    失败时 `data` 缺省，`code` 为业务错误码（40000 参数错误 / 40100 未认证 /
+    40300 无权限 / 40400 资源不存在 / 50000 服务器内部错误）。
+    `/health`、`/readyz` 两个探针接口不使用统一响应壳，直接返回 `{status}`。
+  version: 1.0.0
+
+servers:
+  - url: /api/v1
+    description: 相对路径（默认 HTTP 端口 :8080）
+
+tags:
+  - name: 认证
+    description: 登录、个人信息、修改密码
+  - name: 用户
+    description: 用户管理（system:user:*）
+  - name: 角色
+    description: 角色管理（system:role:*）
+  - name: 部门
+    description: 部门管理（system:dept:*）
+  - name: 菜单
+    description: 菜单管理（system:menu:*）
+  - name: 日志
+    description: 操作日志（system:log:*）
+  - name: 健康检查
+    description: 存活 / 就绪探针（公开）
+
+paths:
+  /health:
+    get:
+      tags: [健康检查]
+      summary: 存活探针
+      description: 进程存活检查，公开接口，无需认证。直接返回 `{"status":"ok"}`（不使用统一响应壳）。
+      security: []
+      responses:
+        '200':
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /readyz:
+    get:
+      tags: [健康检查]
+      summary: 就绪探针
+      description: 就绪检查，公开接口，无需认证。检查数据库连通性，异常时返回 503。不使用统一响应壳。
+      security: []
+      responses:
+        '200':
+          description: 服务就绪
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: 服务未就绪（数据库不可达）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyStatus'
+
+  /auth/login:
+    post:
+      tags: [认证]
+      summary: 用户登录
+      description: 用户名密码登录（bcrypt 校验），成功后签发 JWT（HS256），公开接口。失败次数过多时触发限流，返回 429。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginReq'
+      responses:
+        '200':
+          description: 登录成功，返回访问令牌
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/profile:
+    get:
+      tags: [认证]
+      summary: 获取当前用户信息
+      description: 返回当前登录用户的基本信息、角色编码列表与功能权限点集合。登录即可访问。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 当前用户信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/password:
+    put:
+      tags: [认证]
+      summary: 修改当前用户密码
+      description: 校验旧密码后修改当前登录用户密码。登录即可访问。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePwdReq'
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users:
+    get:
+      tags: [用户]
+      summary: 分页查询用户列表
+      description: |
+        分页查询用户列表，权限点 `system:user:list`。
+        查询结果已按当前用户数据权限（data_scope）过滤。
+        page<=0 时按 1 处理；page_size<=0 或 >100 时按 20 处理。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 用户分页列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPageResp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [用户]
+      summary: 创建用户
+      description: 创建用户并可同时指定部门与角色，权限点 `system:user:create`。密码以 bcrypt 存储。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserReq'
+      responses:
+        '200':
+          description: 创建成功，返回新用户 ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IDResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /users/{id}:
+    get:
+      tags: [用户]
+      summary: 获取用户详情
+      description: 按 ID 查询单个用户信息（不含密码），权限点 `system:user:list`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 用户信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [用户]
+      summary: 更新用户
+      description: 更新用户昵称、邮箱、部门与状态，权限点 `system:user:update`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserReq'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [用户]
+      summary: 删除用户
+      description: 按 ID 删除用户，权限点 `system:user:delete`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /users/{id}/roles:
+    put:
+      tags: [用户]
+      summary: 给用户分配角色
+      description: 重置用户角色集合为指定列表，权限点 `system:user:assign-role`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignRolesReq'
+      responses:
+        '200':
+          description: 分配成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /users/{id}/password:
+    put:
+      tags: [用户]
+      summary: 重置用户密码
+      description: 管理员重置指定用户密码，权限点 `system:user:reset-pwd`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPwdReq'
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /roles:
+    get:
+      tags: [角色]
+      summary: 分页查询角色列表
+      description: 分页查询角色列表，权限点 `system:role:list`。page<=0 时按 1 处理；page_size<=0 或 >100 时按 20 处理。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 角色分页列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RolePageResp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [角色]
+      summary: 创建角色
+      description: 创建角色并可同时指定菜单权限与自定义部门（data_scope=2 时生效），权限点 `system:role:create`。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoleReq'
+      responses:
+        '200':
+          description: 创建成功，返回新角色 ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IDResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /roles/{id}:
+    get:
+      tags: [角色]
+      summary: 获取角色详情
+      description: 按 ID 查询单个角色信息，权限点 `system:role:list`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 角色信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [角色]
+      summary: 更新角色
+      description: 更新角色名称、编码、数据范围、状态与备注；dept_ids 非 nil 时重置自定义部门，权限点 `system:role:update`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoleReq'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [角色]
+      summary: 删除角色
+      description: 按 ID 删除角色，权限点 `system:role:delete`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /roles/{id}/menus:
+    put:
+      tags: [角色]
+      summary: 给角色分配菜单权限
+      description: 重置角色的菜单（功能权限点）集合，权限点 `system:role:assign-menu`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignMenusReq'
+      responses:
+        '200':
+          description: 分配成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /roles/{id}/users:
+    put:
+      tags: [角色]
+      summary: 给角色分配用户
+      description: 重置拥有该角色的用户集合，权限点 `system:role:assign-user`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignUsersReq'
+      responses:
+        '200':
+          description: 分配成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      tags: [角色]
+      summary: 查询角色下的用户 ID 列表
+      description: 返回拥有指定角色的全部用户 ID，权限点 `system:role:list`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 用户 ID 列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleUserIDsResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /depts/tree:
+    get:
+      tags: [部门]
+      summary: 获取部门树
+      description: 返回完整部门树（含 status=0/1 节点，层级嵌套），权限点 `system:dept:list`。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 部门树
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeptTreeResp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /depts:
+    post:
+      tags: [部门]
+      summary: 创建部门
+      description: 创建部门节点，parent_id 为 0 时表示根部门，权限点 `system:dept:create`。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDeptReq'
+      responses:
+        '200':
+          description: 创建成功，返回新部门 ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IDResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /depts/{id}:
+    put:
+      tags: [部门]
+      summary: 更新部门
+      description: 更新部门名称、父节点、排序与状态，权限点 `system:dept:update`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDeptReq'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [部门]
+      summary: 删除部门
+      description: 按 ID 删除部门，权限点 `system:dept:delete`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /menus/tree:
+    get:
+      tags: [菜单]
+      summary: 获取菜单树
+      description: 返回完整菜单树（目录/菜单/按钮，权限点挂在按钮节点的 perm_code 上），权限点 `system:menu:list`。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 菜单树
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MenuTreeResp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /menus:
+    post:
+      tags: [菜单]
+      summary: 创建菜单
+      description: 创建菜单节点，parent_id 为 0 时表示根节点，权限点 `system:menu:create`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMenuReq'
+      responses:
+        '200':
+          description: 创建成功，返回新菜单 ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IDResp'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /menus/{id}:
+    put:
+      tags: [菜单]
+      summary: 更新菜单
+      description: 更新菜单标题、类型、路径、权限点、排序与状态，权限点 `system:menu:update`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMenuReq'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [菜单]
+      summary: 删除菜单
+      description: 按 ID 删除菜单节点，权限点 `system:menu:delete`。变更后权限缓存批量失效。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /logs:
+    get:
+      tags: [日志]
+      summary: 操作日志列表
+      description: |
+        分页查询操作日志，权限点 `system:log:list`。
+        记录管理端写操作（登录、增删改）的审计信息，包括操作人、请求方法、路径、客户端 IP、HTTP 状态码与耗时。
+        page<=0 时按 1 处理；page_size<=0 或 >100 时按 20 处理。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 操作日志分页列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogPageResp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "登录接口签发的 JWT（HS256），请求头 `Authorization: Bearer <token>`"
+
+  parameters:
+    IdParam:
+      name: id
+      in: path
+      required: true
+      description: 资源 ID
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    PageParam:
+      name: page
+      in: query
+      required: false
+      description: 页码，<=0 时按 1 处理
+      schema:
+        type: integer
+        default: 1
+    PageSizeParam:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数，<=0 或 >100 时按 20 处理
+      schema:
+        type: integer
+        default: 20
+
+  responses:
+    BadRequest:
+      description: 参数错误（JSON 解析失败 / 参数校验失败 / 非法路径参数）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: 40000
+            message: 参数校验失败
+    Unauthorized:
+      description: 未登录或登录已过期（含用户名密码错误）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: 40100
+            message: 未登录或登录已过期
+    Forbidden:
+      description: 已登录但缺少对应功能权限点
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: 40300
+            message: 没有权限执行该操作
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: 40400
+            message: 资源不存在
+    TooManyRequests:
+      description: 请求过于频繁，触发限流
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: 42900
+            message: 登录尝试过于频繁，请稍后再试
+
+  schemas:
+    # ---------- 通用 ----------
+    BaseResponse:
+      type: object
+      description: 统一响应壳；操作类接口成功时 data 缺省
+      properties:
+        code:
+          type: integer
+          description: 业务错误码，0 表示成功
+          example: 0
+        message:
+          type: string
+          example: success
+        data:
+          description: 业务数据，失败或无数据时缺省
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          description: 业务错误码（40000/40100/40300/40400/42900/50000）
+          example: 40000
+        message:
+          type: string
+          example: 参数校验失败
+
+    HealthStatus:
+      type: object
+      description: 探针接口直接返回，不使用统一响应壳
+      properties:
+        status:
+          type: string
+          example: ok
+
+    ReadyStatus:
+      type: object
+      description: 就绪检查失败响应（503）
+      properties:
+        status:
+          type: string
+          example: unavailable
+        error:
+          type: string
+          description: 数据库连通性错误信息
+
+    IDData:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: 新建资源 ID
+
+    IDResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/IDData'
+
+    # ---------- 认证 ----------
+    LoginReq:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          description: 用户名
+        password:
+          type: string
+          description: 密码
+
+    LoginData:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT 访问令牌
+
+    LoginResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/LoginData'
+
+    ProfileData:
+      type: object
+      description: 当前用户信息
+      properties:
+        id:
+          type: integer
+          format: int64
+        username:
+          type: string
+        nickname:
+          type: string
+        email:
+          type: string
+        dept_id:
+          type: integer
+          format: int64
+        is_super:
+          type: boolean
+          description: 是否超级管理员
+        roles:
+          type: array
+          items:
+            type: string
+          description: 角色编码列表
+        perms:
+          type: array
+          items:
+            type: string
+          description: 功能权限点集合（如 system:user:list）
+
+    ProfileResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/ProfileData'
+
+    ChangePwdReq:
+      type: object
+      required: [old_password, new_password]
+      properties:
+        old_password:
+          type: string
+          description: 旧密码
+        new_password:
+          type: string
+          minLength: 8
+          description: 新密码，最少 8 位
+
+    # ---------- 用户 ----------
+    CreateUserReq:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+          description: 用户名（唯一）
+        password:
+          type: string
+          minLength: 8
+          description: 初始密码，最少 8 位
+        nickname:
+          type: string
+        email:
+          type: string
+          format: email
+          description: 可选，非空时须为合法邮箱
+        dept_id:
+          type: integer
+          format: int64
+          description: 所属部门 ID
+        role_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 角色 ID 列表
+
+    UpdateUserReq:
+      type: object
+      properties:
+        nickname:
+          type: string
+        email:
+          type: string
+          format: email
+          description: 可选，非空时须为合法邮箱
+        dept_id:
+          type: integer
+          format: int64
+        status:
+          type: integer
+          format: int8
+          enum: [0, 1]
+          description: 状态（0 禁用 / 1 启用）
+
+    UserData:
+      type: object
+      description: 用户信息（不含密码）
+      properties:
+        id:
+          type: integer
+          format: int64
+        username:
+          type: string
+        nickname:
+          type: string
+        email:
+          type: string
+        dept_id:
+          type: integer
+          format: int64
+        status:
+          type: integer
+          format: int8
+          description: 状态（0 禁用 / 1 启用）
+        is_super:
+          type: boolean
+        role_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 角色 ID 列表，为空时缺省
+        created_at:
+          type: string
+          format: date-time
+
+    UserPageData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserData'
+        total:
+          type: integer
+          format: int64
+          description: 总条数
+
+    UserResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/UserData'
+
+    UserPageResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/UserPageData'
+
+    AssignRolesReq:
+      type: object
+      required: [role_ids]
+      properties:
+        role_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 角色 ID 列表（重置式全量替换）
+
+    ResetPwdReq:
+      type: object
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 8
+          description: 新密码，最少 8 位
+
+    # ---------- 角色 ----------
+    CreateRoleReq:
+      type: object
+      required: [name, code]
+      properties:
+        name:
+          type: string
+          description: 角色名称
+        code:
+          type: string
+          description: 角色编码（唯一）
+        data_scope:
+          type: integer
+          format: int8
+          enum: [1, 2, 3, 4, 5]
+          description: 数据范围（1 全部 / 2 自定义部门 / 3 本部门及以下 / 4 本部门 / 5 仅本人）
+        remark:
+          type: string
+        menu_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 菜单（权限点）ID 列表
+        dept_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 自定义部门 ID 列表，data_scope=2 时生效
+
+    UpdateRoleReq:
+      type: object
+      required: [name, code]
+      properties:
+        name:
+          type: string
+        code:
+          type: string
+        data_scope:
+          type: integer
+          format: int8
+          enum: [1, 2, 3, 4, 5]
+          description: 数据范围（1 全部 / 2 自定义部门 / 3 本部门及以下 / 4 本部门 / 5 仅本人）
+        status:
+          type: integer
+          format: int8
+          enum: [0, 1]
+          description: 状态（0 禁用 / 1 启用）
+        remark:
+          type: string
+        dept_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 非 nil 时重置自定义部门
+
+    RoleData:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        code:
+          type: string
+        data_scope:
+          type: integer
+          format: int8
+          description: 数据范围（1 全部 / 2 自定义部门 / 3 本部门及以下 / 4 本部门 / 5 仅本人）
+        status:
+          type: integer
+          format: int8
+          description: 状态（0 禁用 / 1 启用）
+        remark:
+          type: string
+        menu_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 菜单 ID 列表，为空时缺省
+        dept_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 自定义部门 ID 列表，为空时缺省
+        created_at:
+          type: string
+          format: date-time
+
+    RolePageData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleData'
+        total:
+          type: integer
+          format: int64
+
+    RoleResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/RoleData'
+
+    RolePageResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/RolePageData'
+
+    AssignMenusReq:
+      type: object
+      required: [menu_ids]
+      properties:
+        menu_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 菜单（权限点）ID 列表（重置式全量替换）
+
+    AssignUsersReq:
+      type: object
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: 用户 ID 列表（重置式全量替换）
+
+    RoleUserIDsData:
+      type: object
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+
+    RoleUserIDsResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/RoleUserIDsData'
+
+    # ---------- 部门 ----------
+    CreateDeptReq:
+      type: object
+      required: [name]
+      properties:
+        parent_id:
+          type: integer
+          format: int64
+          description: 父部门 ID，0 表示根部门
+        name:
+          type: string
+          description: 部门名称
+        sort:
+          type: integer
+          description: 排序值
+
+    UpdateDeptReq:
+      type: object
+      required: [name]
+      properties:
+        parent_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        sort:
+          type: integer
+        status:
+          type: integer
+          format: int8
+          enum: [0, 1]
+          description: 状态（0 禁用 / 1 启用）
+
+    DeptNode:
+      type: object
+      description: 部门树节点
+      properties:
+        id:
+          type: integer
+          format: int64
+        parent_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        sort:
+          type: integer
+        status:
+          type: integer
+          format: int8
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeptNode'
+          description: 子部门，为空时缺省
+
+    DeptTreeResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/DeptNode'
+
+    # ---------- 菜单 ----------
+    CreateMenuReq:
+      type: object
+      required: [title]
+      properties:
+        parent_id:
+          type: integer
+          format: int64
+          description: 父菜单 ID，0 表示根节点
+        title:
+          type: string
+          description: 菜单标题
+        type:
+          type: integer
+          format: int8
+          enum: [1, 2, 3]
+          description: 类型（1 目录 / 2 菜单 / 3 按钮）
+        path:
+          type: string
+          description: 路由路径
+        perm_code:
+          type: string
+          description: 功能权限点（如 system:user:list），挂在按钮节点
+        sort:
+          type: integer
+
+    UpdateMenuReq:
+      type: object
+      required: [title]
+      properties:
+        parent_id:
+          type: integer
+          format: int64
+        title:
+          type: string
+        type:
+          type: integer
+          format: int8
+          enum: [1, 2, 3]
+          description: 类型（1 目录 / 2 菜单 / 3 按钮）
+        path:
+          type: string
+        perm_code:
+          type: string
+          description: 功能权限点（如 system:user:list）
+        sort:
+          type: integer
+        status:
+          type: integer
+          format: int8
+          enum: [0, 1]
+          description: 状态（0 禁用 / 1 启用）
+
+    MenuNode:
+      type: object
+      description: 菜单树节点
+      properties:
+        id:
+          type: integer
+          format: int64
+        parent_id:
+          type: integer
+          format: int64
+        title:
+          type: string
+        type:
+          type: integer
+          format: int8
+          description: 类型（1 目录 / 2 菜单 / 3 按钮）
+        path:
+          type: string
+        perm_code:
+          type: string
+        sort:
+          type: integer
+        status:
+          type: integer
+          format: int8
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/MenuNode'
+          description: 子菜单，为空时缺省
+
+    MenuTreeResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/MenuNode'
+
+    # ---------- 日志 ----------
+    LogData:
+      type: object
+      description: 操作日志记录
+      required: [id, user_id, username, method, path, ip, status, latency_ms, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: 日志 ID
+        user_id:
+          type: integer
+          format: int64
+          description: 操作人用户 ID
+        username:
+          type: string
+          description: 操作人用户名
+        method:
+          type: string
+          description: HTTP 请求方法
+        path:
+          type: string
+          description: 请求路径
+        ip:
+          type: string
+          description: 客户端 IP
+        status:
+          type: integer
+          format: int32
+          description: HTTP 响应状态码
+        latency_ms:
+          type: integer
+          format: int64
+          description: 请求耗时（毫秒）
+        created_at:
+          type: string
+          format: date-time
+          description: 记录时间
+
+    LogPageData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogData'
+        total:
+          type: integer
+          format: int64
+          description: 总条数
+
+    LogPageResp:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/LogPageData'

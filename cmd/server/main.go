@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -18,12 +19,15 @@ import (
 	"goKit/internal/infrastructure/persistence"
 	"goKit/internal/infrastructure/seed"
 	sysgrpc "goKit/internal/interface/grpc"
+	"goKit/internal/interface/http/middleware"
 	httpInterface "goKit/internal/interface/http/router"
+	"goKit/migrations"
 
 	"goKit/pkg/kit"
 	"goKit/pkg/kit/auth"
 	"goKit/pkg/kit/cache"
 	"goKit/pkg/kit/db"
+	"goKit/pkg/kit/obs"
 	"goKit/pkg/kit/rpc"
 	"goKit/pkg/kit/web"
 )
@@ -32,13 +36,21 @@ type SeedConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 }
 
+// RateLimitConfig 限流配置
+type RateLimitConfig struct {
+	LoginMax    int           `mapstructure:"login_max"`    // 登录窗口内最大次数，默认 10
+	LoginWindow time.Duration `mapstructure:"login_window"` // 登录限流窗口，默认 1m
+}
+
 type AppConfig struct {
-	Web      web.Config       `mapstructure:"web"`
-	RPC      rpc.Config       `mapstructure:"rpc"`
-	Database db.Config        `mapstructure:"database"`
-	JWT      auth.Config      `mapstructure:"jwt"`
-	Authz    auth.AuthzConfig `mapstructure:"authz"`
-	Seed     SeedConfig       `mapstructure:"seed"`
+	Web       web.Config       `mapstructure:"web"`
+	RPC       rpc.Config       `mapstructure:"rpc"`
+	Database  db.Config        `mapstructure:"database"`
+	JWT       auth.Config      `mapstructure:"jwt"`
+	Authz     auth.AuthzConfig `mapstructure:"authz"`
+	Trace     obs.TraceConfig  `mapstructure:"trace"`
+	RateLimit RateLimitConfig  `mapstructure:"rate_limit"`
+	Seed      SeedConfig       `mapstructure:"seed"`
 }
 
 func LoadConfig() (*AppConfig, error) {
@@ -90,6 +102,7 @@ func main() {
 		fx.Provide(func(cfg *AppConfig) rpc.Config { return cfg.RPC }),
 		fx.Provide(func(cfg *AppConfig) db.Config { return cfg.Database }),
 		fx.Provide(func(cfg *AppConfig) auth.Config { return cfg.JWT }),
+		fx.Provide(func(cfg *AppConfig) obs.TraceConfig { return cfg.Trace }),
 		fx.Provide(auth.NewTokenManager),
 		fx.Provide(cache.NewMemory),
 		fx.Provide(ProvideAuthorizer),
@@ -97,6 +110,12 @@ func main() {
 		// gRPC 服务间认证：authz.token 非空时启用 Bearer 校验（返回 nil 则 rpc.Server 跳过认证）
 		fx.Provide(func(cfg *AppConfig) grpcauth.AuthFunc {
 			return auth.NewServiceTokenAuthFunc(cfg.Authz.Token)
+		}),
+		// OTel 链路追踪：trace.endpoint 非空时启用 OTLP 上报
+		fx.Invoke(obs.InitTracing),
+		// 登录接口限流（按 IP，进程内计数）
+		fx.Provide(func(cfg *AppConfig) fiber.Handler {
+			return middleware.LoginRateLimiter(cfg.RateLimit.LoginMax, cfg.RateLimit.LoginWindow)
 		}),
 
 		kit.Module,
@@ -106,7 +125,15 @@ func main() {
 		fx.Invoke(func(lc fx.Lifecycle, cfg *AppConfig, client *db.Client, seeder *seed.Seeder, l *slog.Logger) {
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
-					if cfg.Database.AutoMigrate {
+					if cfg.Database.MigrationsEnabled {
+						if cfg.Database.AutoMigrate {
+							l.Warn("auto_migrate_and_migrations_both_enabled_prefer_versioned_migrations")
+						}
+						l.Info("migrations_start")
+						if err := db.RunMigrations(client, migrations.FS); err != nil {
+							return err
+						}
+					} else if cfg.Database.AutoMigrate {
 						l.Info("auto_migrate_start")
 						if err := persistence.AutoMigrate(ctx, client); err != nil {
 							return err

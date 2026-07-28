@@ -76,7 +76,7 @@ GoKit/
 ### 2.2 一次请求的处理链路
 
 ```text
-请求 ──▶ recover → requestid → CORS（全局中间件，Fx Group 注入）
+请求 ──▶ recover → requestid → otel tracing → metrics → CORS（全局中间件，Fx Group 注入）
      ──▶ ErrorHandler（统一错误 → {code, message, data}）
      ──▶ ① JWTAuth        解析 Bearer Token → CurrentUser 注入 ctx
      ──▶ ② RequirePerm    功能权限校验（超管短路 → Authorizer.CheckPerm）
@@ -120,6 +120,7 @@ GoKit/
 | `sys_user_roles` | (user_id, role_id) 联合主键 | 用户-角色 |
 | `sys_role_menus` | (role_id, menu_id) 联合主键 | 角色-权限点 |
 | `sys_role_depts` | (role_id, dept_id) 联合主键 | 角色-自定义部门（data_scope=2） |
+| `sys_operation_logs` | user_id, method, path, ip, status, latency_ms | 操作日志（审计），写操作自动记录 |
 
 ### 3.2 功能权限（AuthZ）
 
@@ -175,6 +176,7 @@ DataScopeHelper.Build(ctx)
 authz:
   mode: "local"          # local=单机（默认） | remote=微服务
   addr: "system:9090"    # remote 模式系统服务 gRPC 地址
+  token: "<各服务共享>"   # 服务间共享密钥，非空时系统服务 gRPC 启用 Bearer 认证
 jwt:
   secret: "<各服务共享>"  # 微服务间共享同一 secret 即可本地验签
 ```
@@ -216,6 +218,7 @@ main.go 中按 `authz.mode` 条件注入，业务代码只依赖端口，零改�
 
 - 契约：`api/proto/authz/v1/authz.proto`（`CheckPerm` / `GetUserPerms` / `GetUser` / `GetUsers`），`make proto` 重新生成。
 - 权限数据与缓存集中在系统服务侧管理；业务服务无需连接权限库。
+- **服务间认证**：`authz.token` 非空时，系统服务 gRPC 通过 `AuthFunc` 拦截器校验 `Bearer <token>`（`auth.NewServiceTokenAuthFunc`），远程客户端（`RemoteAuthorizer` / `RemoteUserProvider`）自动携带同一 token；为空则不启用（仅限内网可信环境）。跨不可信网络部署时应叠加 TLS/mTLS。
 - 微服务抽离路径：以 domain/application 的业务包边界拆分（system 相关包整体迁出）→ 独立 cmd 入口 → 即系统服务。
 
 ### 4.3 单机形态
@@ -235,19 +238,29 @@ docker compose up -d --build   # app + MySQL，自动迁移 + 播种，开箱即
 | 权限缓存 | 进程内缓存 + 版本号批量失效（TTL 兜底） | `pkg/kit/cache`、`PermResolver` |
 | 数据权限 | 领域纯函数合并 + 持久层 SQL 翻译 | `domain/shared/datascope/data_scope.go`、`applyDataScope` |
 | 事务 | 闭包式 `WithTx`，ctx 传播 tx，仓储 `GetDB(ctx)` 自动感知 | `pkg/kit/db/client.go` |
-| 依赖注入 | Uber Fx，Module 聚合 + Group 插槽 | `kit.Module`、`system.Module` |
+| 依赖注入 | Uber Fx，Module 聚合 + Group 插槽 | `kit.Module`、`app.Module` |
+| 输入校验 | `go-playground/validator/v10`，DTO validate tag + 统一 400 映射 | `internal/interface/http/handler/validate.go` |
+| 服务间认证 | 共享密钥 Bearer 校验（AuthFunc 插槽），客户端 PerRPCCredentials 携带 | `pkg/kit/auth/service_token.go` |
 | 统一响应 | `{code, message, data}` + `AppError` 业务码（40100/40300…） | `internal/interface/http/response` |
 | 错误处理 | `ErrorHandler` 中间件集中映射 AppError/fiber.Error/未知错误 | `internal/interface/http/middleware` |
-| gRPC | KeepAlive + Recovery/Validator/Auth 拦截器链 + Fx Group 插槽 | `pkg/kit/rpc` |
+| gRPC | KeepAlive + Recovery/Metrics/Validator/Auth 拦截器链 + Fx Group 插槽 | `pkg/kit/rpc` |
+| 指标 | Prometheus `/metrics` 端点 + HTTP/gRPC 请求计数与耗时直方图（路径取路由模板防基数爆炸） | `pkg/kit/web/metrics.go`、`pkg/kit/rpc/metrics.go` |
+| 链路追踪 | OTel SDK + OTLP gRPC 导出；HTTP（otelfiber）/gRPC（otelgrpc）自动埋点，`trace.endpoint` 为空时全局 Noop 零开销 | `pkg/kit/obs` |
+| 探针 | `/api/v1/health`（liveness）/ `/api/v1/readyz`（readiness，探 DB 连通性） | `internal/interface/http/router` |
+| 登录限流 | fiber limiter 按 IP 进程内计数（默认 10 次/分钟），超限返回 429/42900 | `internal/interface/http/middleware/ratelimit.go` |
+| 操作日志 | 写操作（POST/PUT/DELETE）旁路异步落库审计，登录接口取请求体账号；`GET /logs` 查询 | `internal/interface/http/middleware/operation_log.go` |
 | 读写分离 | Gorm dbresolver（replicas 配置即启用） | `pkg/kit/db` |
+| 版本化迁移 | golang-migrate | `migrations/` + `pkg/kit/db/migrate.go` |
 | JSON | Sonic 编解码 | `pkg/kit/web` |
 | 服务间契约 | protobuf + gRPC（授权服务） | `api/proto/authz/v1` |
 
-**新增依赖控制**：本次仅引入 `golang-jwt/jwt/v5` 与 `golang.org/x/crypto`；sonic 因 Go 1.26 兼容性升级至 v1.15.2。
+**新增依赖控制**：在 `golang-jwt/jwt/v5`、`golang.org/x/crypto` 基础上，本轮引入 `go-playground/validator/v10`（输入校验）；sonic 因 Go 1.26 兼容性升级至 v1.15.2。
 
 ---
 
 ## 6. API 一览（/api/v1）
+
+> 完整的 OpenAPI 3.0 接口文档（请求/响应 schema、错误码、鉴权方式）见 [`api/openapi.yaml`](../api/openapi.yaml)。
 
 | 模块 | 路由 | 权限点 |
 | :--- | :--- | :--- |
@@ -261,6 +274,7 @@ docker compose up -d --build   # app + MySQL，自动迁移 + 播种，开箱即
 | | `PUT/GET /roles/:id/users` | `system:role:assign-user` / `system:role:list` |
 | 部门 | `GET /depts/tree`，`POST/PUT/DELETE /depts...` | `system:dept:*` |
 | 菜单 | `GET /menus/tree`，`POST/PUT/DELETE /menus...` | `system:menu:*` |
+| 日志 | `GET /logs` | `system:log:list` |
 
 用户列表查询已接入数据权限过滤，其他业务查询按 §3.3 的 `DataScopeHelper → Filter → applyDataScope` 三步接入。
 
@@ -273,15 +287,21 @@ docker compose up -d --build   # app + MySQL，自动迁移 + 播种，开箱即
 | `web.port` / `rpc.port` | HTTP / gRPC 端口 | `:8080` / `:9090` |
 | `database.dsn` / `replicas` | 主库 / 从库连接串 | - |
 | `database.auto_migrate` | 启动自动迁移 sys_* 表 | `false` |
+| `database.migrations_enabled` | 启动执行 `migrations/` 版本化迁移（生产推荐，与 auto_migrate 同开时优先） | `false` |
 | `jwt.secret` / `expire_minutes` | 签名密钥（生产必改）/ 有效期（分钟） | - / `120` |
-| `authz.mode` / `addr` | 授权模式 local/remote / 系统服务地址 | `local` |
+| `authz.mode` / `addr` / `token` | 授权模式 local/remote / 系统服务地址 / 服务间共享密钥 | `local` / - / 空（不启用） |
+| `trace.endpoint` / `service_name` / `sample_ratio` | OTLP 上报地址（空=不启用）/ 服务名 / 采样率 | 空 / `gokit` / `1.0` |
+| `rate_limit.login_max` / `login_window` | 登录接口限流次数 / 窗口（按 IP，进程内） | `10` / `1m` |
 | `seed.enabled` | 首次启动播种内置数据 | `false` |
 
 ---
 
 ## 8. 测试与质量
 
-- 单测：`MergeDataScope` 七个分支（超管/全部/并集/仅本人/叠加/无角色/空自定义）、`PermSet.Has`、JWT 签发/解析/过期/错签/空令牌。
+- 单测：`MergeDataScope` 七个分支、`PermSet.Has`、JWT 签发/解析/过期/错签/空令牌、`NewServiceTokenAuthFunc` 服务间认证。
+- 应用层：`AuthService` 登录/改密/Profile、`LocalUserProvider`、`DataScopeHelper` 全分支、`UserService` 非事务路径（fake 仓储，`WithTx` 路径需真实 DB，留给集成测试）。
+- 请求级：fiber `app.Test()` 覆盖登录/401/403/400/404 及正常链路（统一响应结构断言）。
+- 校验：`Validate` 单测 + handler 层校验失败 400 用例。
 - 校验命令：`go build ./...`、`go vet ./...`、`go test ./...`。
 - 冒烟路径（需 MySQL）：登录拿 token → 无 token 401 → 无权限 403 → 建角色/分权限/分用户 → 数据权限过滤生效。
 
@@ -293,6 +313,6 @@ docker compose up -d --build   # app + MySQL，自动迁移 + 播种，开箱即
 | :--- | :--- |
 | Redis 权限缓存 | 替换 `pkg/kit/cache` 实现，`PermResolver` 不动 |
 | 远程授权本地缓存 | 在 `RemoteAuthorizer` 外包短 TTL 缓存，降低 gRPC 调用频次 |
-| 登录验证码 / 限流 | 新增全局中间件，`web.AsMiddlewares` 注入 |
-| 操作日志 | Handler 旁路 + Fx Group 中间件 |
+| 全局限流（多实例） | 进程内限流换 Redis 存储，替换 `LoginRateLimiter` 的 Storage |
+| 登录验证码 | 新增全局中间件，`web.AsMiddlewares` 注入 |
 | 在线用户 / 踢出 | 用户表加 token_version，JWT 校验时比对 |

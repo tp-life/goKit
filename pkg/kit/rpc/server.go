@@ -9,6 +9,7 @@ import (
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/validator"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.uber.org/fx"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -47,7 +48,9 @@ func NewServer(params ServerParams) *grpc.Server {
 	unaryChain := []grpc.UnaryServerInterceptor{
 		// 1. Panic 恢复 (最外层，兜底)
 		RecoverInterceptor(params.Logger),
-		// 2. 参数校验 (依赖 proto 生成的 Validate 方法)
+		// 2. 指标埋点（统计全部请求，含认证失败）
+		MetricsUnaryInterceptor(),
+		// 3. 参数校验 (依赖 proto 生成的 Validate 方法)
 		validator.UnaryServerInterceptor(),
 	}
 
@@ -81,6 +84,8 @@ func NewServer(params ServerParams) *grpc.Server {
 		kaParams,
 		grpc.ChainUnaryInterceptor(unaryChain...),
 		grpc.ChainStreamInterceptor(streamChain...),
+		// OTel 链路追踪（未配置 endpoint 时为 Noop，零开销）
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	}
 
 	return grpc.NewServer(opts...)

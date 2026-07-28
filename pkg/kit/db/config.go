@@ -13,6 +13,9 @@ type Config struct {
 	SlowThreshold   time.Duration `mapstructure:"slow_threshold"`
 	// AutoMigrate 启动时自动迁移表结构（仅限开发/简单部署，生产建议用迁移工具）
 	AutoMigrate bool `mapstructure:"auto_migrate"`
+	// MigrationsEnabled 启动时执行 migrations/ 内嵌的版本化迁移（生产推荐；
+	// 与 AutoMigrate 同开时优先生效，AutoMigrate 不再执行）
+	MigrationsEnabled bool `mapstructure:"migrations_enabled"`
 }
 
 func DefaultConfig() Config {

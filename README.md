@@ -1,5 +1,6 @@
 # GoKit - High Performance Go DDD Scaffolding
 
+[![CI](https://github.com/tp-life/goKit/actions/workflows/ci.yml/badge.svg)](https://github.com/tp-life/goKit/actions/workflows/ci.yml)
 ![Go Version](https://img.shields.io/badge/go-1.21+-00ADD8.svg)
 ![Fiber](https://img.shields.io/badge/fiber-v2.52-green)
 ![Gorm](https://img.shields.io/badge/gorm-v1.25-red)

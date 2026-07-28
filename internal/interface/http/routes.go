@@ -2,8 +2,11 @@
 package http
 
 import (
+	"log/slog"
+
 	"github.com/gofiber/fiber/v2"
 
+	"goKit/internal/application/oplog"
 	"goKit/internal/interface/http/handler"
 	"goKit/internal/interface/http/middleware"
 	"goKit/pkg/kit/auth"
@@ -11,13 +14,17 @@ import (
 
 // HTTPModule 聚合 system 模块全部 Handler 与依赖
 type HTTPModule struct {
-	auth   *handler.AuthHandler
-	user   *handler.UserHandler
-	role   *handler.RoleHandler
-	dept   *handler.DeptHandler
-	menu   *handler.MenuHandler
-	tokens *auth.TokenManager
-	az     auth.Authorizer
+	auth         *handler.AuthHandler
+	user         *handler.UserHandler
+	role         *handler.RoleHandler
+	dept         *handler.DeptHandler
+	menu         *handler.MenuHandler
+	oplog        *handler.OplogHandler
+	oplogSvc     *oplog.OplogService
+	tokens       *auth.TokenManager
+	az           auth.Authorizer
+	loginLimiter fiber.Handler
+	logger       *slog.Logger
 }
 
 func NewHTTPModule(
@@ -26,20 +33,24 @@ func NewHTTPModule(
 	roleH *handler.RoleHandler,
 	deptH *handler.DeptHandler,
 	menuH *handler.MenuHandler,
+	oplogH *handler.OplogHandler,
+	oplogSvc *oplog.OplogService,
 	tokens *auth.TokenManager,
 	az auth.Authorizer,
+	loginLimiter fiber.Handler,
+	logger *slog.Logger,
 ) *HTTPModule {
-	return &HTTPModule{auth: authH, user: userH, role: roleH, dept: deptH, menu: menuH, tokens: tokens, az: az}
+	return &HTTPModule{authH, userH, roleH, deptH, menuH, oplogH, oplogSvc, tokens, az, loginLimiter, logger}
 }
 
 // RegisterRoutes 将 system 模块路由挂载到 /api/v1 分组。
-// /auth/login 公开，其余全部经过 JWT 认证，并按权限点逐一授权。
+// /auth/login 公开（限流 + 操作日志），其余全部经过 JWT 认证，并按权限点逐一授权。
 func (m *HTTPModule) RegisterRoutes(v1 fiber.Router) {
 	// 公开接口
-	v1.Post("/auth/login", m.auth.Login)
+	v1.Post("/auth/login", m.loginLimiter, middleware.OperationLog(m.oplogSvc, m.logger), m.auth.Login)
 
-	// 需登录接口
-	secured := v1.Group("", middleware.JWTAuth(m.tokens))
+	// 需登录接口（JWT 之后记录操作日志，可拿到操作人）
+	secured := v1.Group("", middleware.JWTAuth(m.tokens), middleware.OperationLog(m.oplogSvc, m.logger))
 	secured.Get("/auth/profile", m.auth.Profile)
 	secured.Put("/auth/password", m.auth.ChangePassword)
 
@@ -79,4 +90,7 @@ func (m *HTTPModule) RegisterRoutes(v1 fiber.Router) {
 	menus.Post("", perm(m.az, "system:menu:create"), m.menu.Create)
 	menus.Put("/:id", perm(m.az, "system:menu:update"), m.menu.Update)
 	menus.Delete("/:id", perm(m.az, "system:menu:delete"), m.menu.Delete)
+
+	// 操作日志
+	secured.Get("/logs", perm(m.az, "system:log:list"), m.oplog.List)
 }

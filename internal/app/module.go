@@ -9,6 +9,7 @@ import (
 	"goKit/internal/application/auth"
 	"goKit/internal/application/dept"
 	"goKit/internal/application/menu"
+	"goKit/internal/application/oplog"
 	"goKit/internal/application/role"
 	"goKit/internal/application/shared"
 	"goKit/internal/application/user"
@@ -28,6 +29,7 @@ var Module = fx.Options(
 		persistence.NewDeptRepository,
 		persistence.NewMenuRepository,
 		persistence.NewAssignRepository,
+		persistence.NewOplogRepository,
 		seed.NewSeeder,
 	),
 	// 应用层
@@ -41,6 +43,7 @@ var Module = fx.Options(
 		role.NewRoleService,
 		menu.NewMenuService,
 		dept.NewDeptService,
+		oplog.NewOplogService,
 	),
 	// 接口层
 	fx.Provide(
@@ -49,6 +52,7 @@ var Module = fx.Options(
 		handler.NewRoleHandler,
 		handler.NewDeptHandler,
 		handler.NewMenuHandler,
+		handler.NewOplogHandler,
 		syshttp.NewHTTPModule,
 		sysgrpc.NewAuthzServer,
 	),
