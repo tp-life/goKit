@@ -11,7 +11,7 @@
 
 核心目标：**让基础设施代码标准化，让业务逻辑纯粹化。**
 
-> 📖 详细设计、架构图与技术点见 [docs/architecture.md](docs/architecture.md)。
+> 📖 详细设计、架构图与技术点见 [docs/architecture.md](docs/architecture.md)；运行架构、流转图与部署手册（单机/微服务）见 [docs/deployment.md](docs/deployment.md)。
 
 ---
 
@@ -133,15 +133,18 @@ docker compose up -d --build   # 应用 + MySQL 一键启动
 authz:
   mode: "remote"
   addr: "system-service:9090"
+  token: "<与系统服务共享的服务间密钥>"     # 生产必填，保护 gRPC 授权接口
 jwt:
   secret: "<与系统服务共享同一 secret>"   # JWT 在业务服务本地验签
 ```
 
 工作原理：
 
-1. 系统服务通过 gRPC 暴露 `AuthzService`（`api/proto/authz/v1/authz.proto`：`CheckPerm` / `GetUserPerms`）。
-2. 业务服务注入 `auth.RemoteAuthorizer`（实现同一个 `auth.Authorizer` 端口），业务代码零改动。
+1. 系统服务通过 gRPC 暴露 `AuthzService`（`api/proto/authz/v1/authz.proto`：`CheckPerm` / `GetUserPerms` / `GetUser` / `GetUsers`），`authz.token` 非空时启用 Bearer 服务间认证。
+2. 业务服务注入 `auth.RemoteAuthorizer` / `auth.RemoteUserProvider`（实现同一组端口），业务代码零改动。
 3. JWT 为无状态验签，各服务共享 secret 即可；权限点数据集中在系统服务侧缓存管理。
+
+部署拓扑、配置样例与 K8s 要点详见 [docs/deployment.md](docs/deployment.md) §5。
 
 重新生成 protobuf 代码：`make proto`（需安装 protoc / protoc-gen-go / protoc-gen-go-grpc）。
 
