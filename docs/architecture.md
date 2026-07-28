@@ -170,6 +170,8 @@ DataScopeHelper.Build(ctx)
 
 ## 4. 双模式部署
 
+> 详细的架构图、请求/授权流转图、单机与微服务部署步骤（Compose / 二进制 / K8s / 可观测性 / 检查清单）见 [deployment.md](deployment.md)。
+
 同一份代码、两种形态，切换只改配置：
 
 ```yaml
