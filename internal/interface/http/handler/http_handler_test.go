@@ -50,7 +50,7 @@ func (r *fakeUserRepo) FindByUsername(ctx context.Context, username string) (*do
 func (r *fakeUserRepo) FindByIDs(ctx context.Context, ids []uint64) ([]domainuser.User, error) {
 	return nil, nil
 }
-func (r *fakeUserRepo) List(ctx context.Context, filter datascope.Filter, page, pageSize int) ([]domainuser.User, int64, error) {
+func (r *fakeUserRepo) List(ctx context.Context, filter datascope.Filter, q domainuser.Query, page, pageSize int) ([]domainuser.User, int64, error) {
 	return nil, 0, nil
 }
 func (r *fakeUserRepo) UpdatePassword(ctx context.Context, id uint64, hashedPwd string) error {
@@ -67,7 +67,7 @@ func (r *fakeRoleRepo) Delete(ctx context.Context, id uint64) error             
 func (r *fakeRoleRepo) FindByID(ctx context.Context, id uint64) (*domainrole.Role, error) {
 	return nil, nil
 }
-func (r *fakeRoleRepo) List(ctx context.Context, page, pageSize int) ([]domainrole.Role, int64, error) {
+func (r *fakeRoleRepo) List(ctx context.Context, q domainrole.Query, page, pageSize int) ([]domainrole.Role, int64, error) {
 	return nil, 0, nil
 }
 func (r *fakeRoleRepo) FindByUserID(ctx context.Context, userID uint64) ([]domainrole.Role, error) {
@@ -114,6 +114,10 @@ func (r *fakeMenuRepo) FindByID(ctx context.Context, id uint64) (*domainmenu.Men
 func (r *fakeMenuRepo) List(ctx context.Context) ([]domainmenu.Menu, error) { return nil, nil }
 func (r *fakeMenuRepo) FindPermCodesByRoleIDs(ctx context.Context, roleIDs []uint64) ([]string, error) {
 	return r.permCodes, nil
+}
+
+func (r *fakeMenuRepo) FindIDsByRoleIDs(ctx context.Context, roleIDs []uint64) ([]uint64, error) {
+	return nil, nil
 }
 
 type fakeAuthorizer struct {

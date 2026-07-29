@@ -2,13 +2,19 @@ package role
 
 import "context"
 
+// Query 角色列表过滤条件（零值表示不过滤）
+type Query struct {
+	Keyword string // 名称/编码模糊匹配
+	Status  *int8  // 状态精确匹配
+}
+
 // RoleRepository 角色仓储
 type RoleRepository interface {
 	Create(ctx context.Context, role *Role) error
 	Update(ctx context.Context, role *Role) error
 	Delete(ctx context.Context, id uint64) error
 	FindByID(ctx context.Context, id uint64) (*Role, error)
-	List(ctx context.Context, page, pageSize int) ([]Role, int64, error)
+	List(ctx context.Context, q Query, page, pageSize int) ([]Role, int64, error)
 	// FindByUserID 查询用户拥有的全部角色
 	FindByUserID(ctx context.Context, userID uint64) ([]Role, error)
 }

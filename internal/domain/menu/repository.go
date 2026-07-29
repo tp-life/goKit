@@ -11,4 +11,6 @@ type MenuRepository interface {
 	List(ctx context.Context) ([]Menu, error)
 	// FindPermCodesByRoleIDs 查询角色集合拥有的全部权限点（去重，空权限码已过滤）
 	FindPermCodesByRoleIDs(ctx context.Context, roleIDs []uint64) ([]string, error)
+	// FindIDsByRoleIDs 查询角色集合关联的全部菜单 ID（去重）
+	FindIDsByRoleIDs(ctx context.Context, roleIDs []uint64) ([]uint64, error)
 }

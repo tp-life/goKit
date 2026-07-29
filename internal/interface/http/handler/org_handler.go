@@ -127,3 +127,12 @@ func (h *MenuHandler) Tree(c *fiber.Ctx) error {
 	}
 	return response.Success(c, tree)
 }
+
+// Mine GET /menus/mine 当前用户可见菜单树（登录即可，无需额外权限点）
+func (h *MenuHandler) Mine(c *fiber.Ctx) error {
+	tree, err := h.svc.Mine(c.UserContext())
+	if err != nil {
+		return mapErr(err)
+	}
+	return response.Success(c, tree)
+}

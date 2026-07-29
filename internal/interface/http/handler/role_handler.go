@@ -4,6 +4,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"goKit/internal/application/role"
+	domainrole "goKit/internal/domain/role"
 	"goKit/internal/interface/http/response"
 )
 
@@ -72,7 +73,11 @@ func (h *RoleHandler) Get(c *fiber.Ctx) error {
 }
 
 func (h *RoleHandler) List(c *fiber.Ctx) error {
-	resp, err := h.svc.List(c.UserContext(), parsePage(c))
+	q := domainrole.Query{
+		Keyword: c.Query("keyword"),
+		Status:  parseOptStatus(c),
+	}
+	resp, err := h.svc.List(c.UserContext(), parsePage(c), q)
 	if err != nil {
 		return mapErr(err)
 	}

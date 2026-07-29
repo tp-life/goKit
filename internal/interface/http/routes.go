@@ -85,6 +85,7 @@ func (m *HTTPModule) RegisterRoutes(v1 fiber.Router) {
 	depts.Delete("/:id", perm(m.az, "system:dept:delete"), m.dept.Delete)
 
 	// 菜单管理
+	secured.Get("/menus/mine", m.menu.Mine) // 当前用户可见菜单，登录即可
 	menus := secured.Group("/menus")
 	menus.Get("/tree", perm(m.az, "system:menu:list"), m.menu.Tree)
 	menus.Post("", perm(m.az, "system:menu:create"), m.menu.Create)

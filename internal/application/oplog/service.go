@@ -36,9 +36,9 @@ func (s *OplogService) Record(ctx context.Context, entry *oplog.OperationLog) er
 }
 
 // List 操作日志分页列表（仅按权限点控制，不叠加数据权限）
-func (s *OplogService) List(ctx context.Context, page shared.PageReq) (*shared.PageResp[*OplogResp], error) {
+func (s *OplogService) List(ctx context.Context, page shared.PageReq, q oplog.Query) (*shared.PageResp[*OplogResp], error) {
 	page.Normalize()
-	logs, total, err := s.repo.List(ctx, page.Page, page.PageSize)
+	logs, total, err := s.repo.List(ctx, q, page.Page, page.PageSize)
 	if err != nil {
 		return nil, err
 	}

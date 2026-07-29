@@ -40,8 +40,15 @@ func (r *roleRepo) FindByID(ctx context.Context, id uint64) (*role.Role, error) 
 	return &role, err
 }
 
-func (r *roleRepo) List(ctx context.Context, page, pageSize int) ([]role.Role, int64, error) {
+func (r *roleRepo) List(ctx context.Context, q role.Query, page, pageSize int) ([]role.Role, int64, error) {
 	tx := r.client.GetDB(ctx).Model(&role.Role{})
+	if q.Keyword != "" {
+		like := "%" + q.Keyword + "%"
+		tx = tx.Where("name LIKE ? OR code LIKE ?", like, like)
+	}
+	if q.Status != nil {
+		tx = tx.Where("status = ?", *q.Status)
+	}
 	var total int64
 	if err := tx.Count(&total).Error; err != nil {
 		return nil, 0, err

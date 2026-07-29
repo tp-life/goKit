@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="matrix" style="background:#0D0208">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GoKit 控制台</title>
+    <style>
+      html,
+      body {
+        background: #0d0208;
+      }
+      html[data-theme='enterprise'],
+      html[data-theme='enterprise'] body {
+        background: #f3f5f9;
+      }
+      html[data-theme='midnight'],
+      html[data-theme='midnight'] body {
+        background: #0f172a;
+      }
+      html[data-theme='aurora'],
+      html[data-theme='aurora'] body {
+        background: #120a1f;
+      }
+    </style>
+    <script>
+      // 首屏防闪烁：在 React 挂载前恢复用户选择的主题
+      try {
+        var t = localStorage.getItem('gk-theme');
+        if (t) document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

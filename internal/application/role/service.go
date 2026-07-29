@@ -122,9 +122,9 @@ func (s *RoleService) Get(ctx context.Context, id uint64) (*RoleResp, error) {
 	return resp, nil
 }
 
-func (s *RoleService) List(ctx context.Context, page shared.PageReq) (*shared.PageResp[*RoleResp], error) {
+func (s *RoleService) List(ctx context.Context, page shared.PageReq, q domainrole.Query) (*shared.PageResp[*RoleResp], error) {
 	page.Normalize()
-	roles, total, err := s.roleRepo.List(ctx, page.Page, page.PageSize)
+	roles, total, err := s.roleRepo.List(ctx, q, page.Page, page.PageSize)
 	if err != nil {
 		return nil, err
 	}
