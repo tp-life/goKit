@@ -32,6 +32,11 @@ jwt:
   issuer: "gokit"
   expire_minutes: 120
 
+log:
+  level: "info"     # debug, info, warn, error
+  format: "json"    # json, text
+  source: false     # 是否打印文件行号（生产建议关闭提升性能）
+
 authz:
   # local  → 单机模式：进程内直接校验权限（默认）
   # remote → 微服务模式：通过 gRPC 调用系统服务做权限校验

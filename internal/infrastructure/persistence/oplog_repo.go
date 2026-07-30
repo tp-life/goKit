@@ -19,8 +19,20 @@ func (r *oplogRepo) Create(ctx context.Context, log *oplog.OperationLog) error {
 	return r.client.GetDB(ctx).Create(log).Error
 }
 
-func (r *oplogRepo) List(ctx context.Context, page, pageSize int) ([]oplog.OperationLog, int64, error) {
+func (r *oplogRepo) List(ctx context.Context, q oplog.Query, page, pageSize int) ([]oplog.OperationLog, int64, error) {
 	tx := r.client.GetDB(ctx).Model(&oplog.OperationLog{})
+	if q.Username != "" {
+		tx = tx.Where("username LIKE ?", "%"+q.Username+"%")
+	}
+	if q.Method != "" {
+		tx = tx.Where("method = ?", q.Method)
+	}
+	if q.Path != "" {
+		tx = tx.Where("path LIKE ?", "%"+q.Path+"%")
+	}
+	if q.Status != nil {
+		tx = tx.Where("status = ?", *q.Status)
+	}
 
 	var total int64
 	if err := tx.Count(&total).Error; err != nil {

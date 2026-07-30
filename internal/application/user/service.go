@@ -119,13 +119,13 @@ func (s *UserService) Get(ctx context.Context, id uint64) (*UserResp, error) {
 }
 
 // List 用户分页列表，自动应用数据权限
-func (s *UserService) List(ctx context.Context, page shared.PageReq) (*shared.PageResp[*UserResp], error) {
+func (s *UserService) List(ctx context.Context, page shared.PageReq, q domainuser.Query) (*shared.PageResp[*UserResp], error) {
 	page.Normalize()
 	filter, err := s.scope.Build(ctx)
 	if err != nil {
 		return nil, err
 	}
-	users, total, err := s.userRepo.List(ctx, filter, page.Page, page.PageSize)
+	users, total, err := s.userRepo.List(ctx, filter, q, page.Page, page.PageSize)
 	if err != nil {
 		return nil, err
 	}

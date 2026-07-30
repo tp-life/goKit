@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -27,6 +26,7 @@ import (
 	"goKit/pkg/kit/auth"
 	"goKit/pkg/kit/cache"
 	"goKit/pkg/kit/db"
+	"goKit/pkg/kit/log"
 	"goKit/pkg/kit/obs"
 	"goKit/pkg/kit/rpc"
 	"goKit/pkg/kit/web"
@@ -46,6 +46,7 @@ type AppConfig struct {
 	Web       web.Config       `mapstructure:"web"`
 	RPC       rpc.Config       `mapstructure:"rpc"`
 	Database  db.Config        `mapstructure:"database"`
+	Log       log.Config       `mapstructure:"log"`
 	JWT       auth.Config      `mapstructure:"jwt"`
 	Authz     auth.AuthzConfig `mapstructure:"authz"`
 	Trace     obs.TraceConfig  `mapstructure:"trace"`
@@ -89,9 +90,6 @@ func ProvideUserProvider(cfg *AppConfig, local *authapp.LocalUserProvider) (auth
 
 func main() {
 	fx.New(
-		fx.Provide(func() *slog.Logger {
-			return slog.New(slog.NewJSONHandler(os.Stdout, nil))
-		}),
 		fx.Provide(LoadConfig),
 		fx.Provide(
 			web.AsMiddlewares(func() fiber.Handler {
@@ -101,6 +99,7 @@ func main() {
 		fx.Provide(func(cfg *AppConfig) web.Config { return cfg.Web }),
 		fx.Provide(func(cfg *AppConfig) rpc.Config { return cfg.RPC }),
 		fx.Provide(func(cfg *AppConfig) db.Config { return cfg.Database }),
+		fx.Provide(func(cfg *AppConfig) log.Config { return cfg.Log }),
 		fx.Provide(func(cfg *AppConfig) auth.Config { return cfg.JWT }),
 		fx.Provide(func(cfg *AppConfig) obs.TraceConfig { return cfg.Trace }),
 		fx.Provide(auth.NewTokenManager),
@@ -118,10 +117,9 @@ func main() {
 			return middleware.LoginRateLimiter(cfg.RateLimit.LoginMax, cfg.RateLimit.LoginWindow)
 		}),
 
-		kit.Module,
-		app.Module,
-
 		// === 启动钩子：自动迁移 + 首次播种 ===
+		// 注意：fx 按注册顺序执行 OnStart，本 Invoke 必须放在 kit.Module 之前，
+		// 保证迁移/播种完成后 HTTP/gRPC 端口才开始监听，否则启动窗口内的请求会打到未建表的库上。
 		fx.Invoke(func(lc fx.Lifecycle, cfg *AppConfig, client *db.Client, seeder *seed.Seeder, l *slog.Logger) {
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
@@ -148,6 +146,9 @@ func main() {
 				},
 			})
 		}),
+
+		kit.Module,
+		app.Module,
 
 		// === gRPC 服务注册（微服务模式下对外提供授权接口）===
 		fx.Invoke(func(s *grpc.Server, authzServer *sysgrpc.AuthzServer) {

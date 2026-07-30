@@ -59,9 +59,16 @@ func (r *userRepo) FindByIDs(ctx context.Context, ids []uint64) ([]user.User, er
 	return users, err
 }
 
-func (r *userRepo) List(ctx context.Context, filter datascope.Filter, page, pageSize int) ([]user.User, int64, error) {
+func (r *userRepo) List(ctx context.Context, filter datascope.Filter, q user.Query, page, pageSize int) ([]user.User, int64, error) {
 	tx := r.client.GetDB(ctx).Model(&user.User{})
 	tx = applyDataScope(tx, filter, "dept_id", "id")
+	if q.Keyword != "" {
+		like := "%" + q.Keyword + "%"
+		tx = tx.Where("username LIKE ? OR nickname LIKE ?", like, like)
+	}
+	if q.Status != nil {
+		tx = tx.Where("status = ?", *q.Status)
+	}
 
 	var total int64
 	if err := tx.Count(&total).Error; err != nil {

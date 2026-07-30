@@ -7,6 +7,7 @@ import (
 
 	"goKit/internal/application/shared"
 	"goKit/internal/application/user"
+	domainuser "goKit/internal/domain/user"
 	"goKit/internal/interface/http/response"
 )
 
@@ -24,6 +25,20 @@ func parsePage(c *fiber.Ctx) shared.PageReq {
 	var page shared.PageReq
 	_ = c.QueryParser(&page)
 	return page
+}
+
+// parseOptStatus 解析可选的 status 查询参数（0/1），未传或非法返回 nil
+func parseOptStatus(c *fiber.Ctx) *int8 {
+	s := c.Query("status")
+	if s == "" {
+		return nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return nil
+	}
+	v8 := int8(v)
+	return &v8
 }
 
 type UserHandler struct {
@@ -91,7 +106,11 @@ func (h *UserHandler) Get(c *fiber.Ctx) error {
 }
 
 func (h *UserHandler) List(c *fiber.Ctx) error {
-	resp, err := h.svc.List(c.UserContext(), parsePage(c))
+	q := domainuser.Query{
+		Keyword: c.Query("keyword"),
+		Status:  parseOptStatus(c),
+	}
+	resp, err := h.svc.List(c.UserContext(), parsePage(c), q)
 	if err != nil {
 		return mapErr(err)
 	}

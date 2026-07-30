@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"strconv"
+
 	"github.com/gofiber/fiber/v2"
 
 	"goKit/internal/application/oplog"
+	domainoplog "goKit/internal/domain/oplog"
 	"goKit/internal/interface/http/response"
 )
 
@@ -17,7 +20,17 @@ func NewOplogHandler(svc *oplog.OplogService) *OplogHandler {
 
 // List GET /logs
 func (h *OplogHandler) List(c *fiber.Ctx) error {
-	resp, err := h.svc.List(c.UserContext(), parsePage(c))
+	q := domainoplog.Query{
+		Username: c.Query("username"),
+		Method:   c.Query("method"),
+		Path:     c.Query("path"),
+	}
+	if s := c.Query("status"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			q.Status = &v
+		}
+	}
+	resp, err := h.svc.List(c.UserContext(), parsePage(c), q)
 	if err != nil {
 		return mapErr(err)
 	}

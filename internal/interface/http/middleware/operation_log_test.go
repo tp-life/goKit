@@ -30,7 +30,7 @@ func (f *fakeOplogRepo) Create(_ context.Context, l *domain.OperationLog) error 
 	return nil
 }
 
-func (f *fakeOplogRepo) List(_ context.Context, _, _ int) ([]domain.OperationLog, int64, error) {
+func (f *fakeOplogRepo) List(_ context.Context, _ domain.Query, _, _ int) ([]domain.OperationLog, int64, error) {
 	return nil, 0, nil
 }
 

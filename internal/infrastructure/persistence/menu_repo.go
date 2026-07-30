@@ -46,6 +46,18 @@ func (r *menuRepo) List(ctx context.Context) ([]menu.Menu, error) {
 	return menus, err
 }
 
+func (r *menuRepo) FindIDsByRoleIDs(ctx context.Context, roleIDs []uint64) ([]uint64, error) {
+	if len(roleIDs) == 0 {
+		return nil, nil
+	}
+	var ids []uint64
+	err := r.client.GetDB(ctx).Table("sys_role_menus").
+		Distinct("menu_id").
+		Where("role_id IN ?", roleIDs).
+		Pluck("menu_id", &ids).Error
+	return ids, err
+}
+
 func (r *menuRepo) FindPermCodesByRoleIDs(ctx context.Context, roleIDs []uint64) ([]string, error) {
 	if len(roleIDs) == 0 {
 		return nil, nil
